@@ -9,16 +9,17 @@ git clone https://github.com/navbytes/gh-pulse && cd gh-pulse
 cargo run -- -R owner/repo          # needs `gh auth login`
 ```
 
-Rust 1.88+ (edition 2024). Read [docs/architecture.md](docs/architecture.md) first; it is short.
+Rust 1.89+ (edition 2024; that is the oldest toolchain the project is tested on). Read [docs/architecture.md](docs/architecture.md) first; it is short.
 
 ## Checks before a PR
 
 ```sh
 cargo fmt --check
+# the default build includes syntax highlighting; check the small plain build too
 cargo clippy --all-targets -- -D warnings
-cargo clippy --all-targets --features syntax -- -D warnings
+cargo clippy --all-targets --no-default-features -- -D warnings
 cargo test
-cargo test --features syntax
+cargo test --no-default-features
 ```
 
 Optional live tests (they call `gh`, read-only) take their target from the environment:

@@ -43,6 +43,56 @@ pub fn slice_spans(spans: &[Span<'static>], s: usize, e: usize) -> Vec<Span<'sta
     out
 }
 
+/// Splits text into (is_url, piece) runs. A URL ends at whitespace or `<>"`; trailing punctuation and
+/// unbalanced closing brackets are not part of it ("see https://x.io/a)." links https://x.io/a).
+fn split_urls(t: &str) -> Vec<(bool, &str)> {
+    let (mut out, mut rest) = (vec![], t);
+    while let Some(i) = ["https://", "http://"]
+        .iter()
+        .filter_map(|p| rest.find(p))
+        .min()
+    {
+        let tail = &rest[i..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || "<>\"`".contains(c))
+            .unwrap_or(tail.len());
+        let mut url = &tail[..end];
+        loop {
+            let Some(last) = url.chars().last() else {
+                break;
+            };
+            let unbalanced =
+                |open: char, close: char| url.matches(close).count() > url.matches(open).count();
+            let trim = match last {
+                '.' | ',' | ';' | ':' | '!' | '?' | '\'' => true,
+                ')' => unbalanced('(', ')'),
+                ']' => unbalanced('[', ']'),
+                '}' => unbalanced('{', '}'),
+                _ => false,
+            };
+            if !trim {
+                break;
+            }
+            url = &url[..url.len() - last.len_utf8()];
+        }
+        // "http://" alone is not a link
+        if url.len() <= "http://".len() && url.ends_with("//") {
+            out.push((false, &rest[..i + url.len().max(1)]));
+            rest = &rest[i + url.len().max(1)..];
+            continue;
+        }
+        if i > 0 {
+            out.push((false, &rest[..i]));
+        }
+        out.push((true, url));
+        rest = &rest[i + url.len()..];
+    }
+    if !rest.is_empty() || out.is_empty() {
+        out.push((false, rest));
+    }
+    out
+}
+
 fn strip_comments(src: &str) -> String {
     let (mut out, mut rest) = (String::new(), src);
     while let Some(i) = rest.find("<!--") {
@@ -148,6 +198,8 @@ struct R<'a> {
     link_text: Vec<String>,
     code: Option<(String, String)>,
     table: Option<Table>,
+    /// Adjacent Text events, joined so a URL the parser split in pieces is still one link.
+    pend: String,
 }
 
 impl R<'_> {
@@ -237,22 +289,35 @@ impl R<'_> {
             lt.push_str(t);
         }
         let st = self.style();
-        let shortened: Vec<String> = t
-            .split(' ')
-            .map(|w| {
-                let n = w.chars().count();
-                if n > LONG_TOKEN {
-                    format!(
-                        "{}\u{2026}(+{} chars)",
-                        w.chars().take(48).collect::<String>(),
-                        n - 48
-                    )
-                } else {
-                    w.to_string()
-                }
-            })
-            .collect();
-        self.cur.push(Span::styled(shortened.join(" "), st));
+        // bare URLs become links (unless this text is already inside an explicit link)
+        let segs = if self.links.is_empty() {
+            split_urls(t)
+        } else {
+            vec![(false, t)]
+        };
+        for (is_url, seg) in segs {
+            if is_url {
+                let ls = st.patch(Style::new().fg(self.th.link).underlined());
+                self.cur.push(Span::styled(seg.to_string(), ls));
+                continue;
+            }
+            let shortened: Vec<String> = seg
+                .split(' ')
+                .map(|w| {
+                    let n = w.chars().count();
+                    if n > LONG_TOKEN {
+                        format!(
+                            "{}\u{2026}(+{} chars)",
+                            w.chars().take(48).collect::<String>(),
+                            n - 48
+                        )
+                    } else {
+                        w.to_string()
+                    }
+                })
+                .collect();
+            self.cur.push(Span::styled(shortened.join(" "), st));
+        }
     }
 
     fn code_block(&mut self, lang: &str, code: &str) {
@@ -409,8 +474,18 @@ impl R<'_> {
         }
     }
 
+    fn flush_text(&mut self) {
+        if !self.pend.is_empty() {
+            let t = std::mem::take(&mut self.pend);
+            self.text(&t);
+        }
+    }
+
     fn event(&mut self, ev: Event<'_>) {
         let th = self.th;
+        if !matches!(ev, Event::Text(_)) {
+            self.flush_text();
+        }
         match ev {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => self.gap(),
@@ -552,7 +627,13 @@ impl R<'_> {
                 }
                 _ => {}
             },
-            Event::Text(t) => self.text(&t),
+            Event::Text(t) => {
+                if self.code.is_some() || self.table.as_ref().is_some_and(|tb| tb.cell.is_some()) {
+                    self.text(&t);
+                } else {
+                    self.pend.push_str(&t);
+                }
+            }
             Event::Code(c) => {
                 if let Some(cell) = self.table.as_mut().and_then(|tb| tb.cell.as_mut()) {
                     cell.push_str(&c);
@@ -613,11 +694,13 @@ pub fn render(src: &str, th: &Theme, o: &Opts) -> Rendered {
         link_text: vec![],
         code: None,
         table: None,
+        pend: String::new(),
     };
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     for ev in Parser::new_ext(&text, opts) {
         r.event(ev);
     }
+    r.flush_text();
     r.flush();
     while r.lines.last().is_some_and(|l| l.spans.is_empty()) {
         r.lines.pop();
@@ -963,5 +1046,56 @@ mod tests {
                 assert!(flat.contains(&want), "width {w}: lost {word:?}\n{t:#?}");
             }
         }
+    }
+
+    #[test]
+    fn bare_urls_become_links_without_trailing_punctuation() {
+        let t = th();
+        let all = "see https://example.com/a/b?x=1, and (https://en.wikipedia.org/wiki/Rust_(language)). Also http://plain.io!";
+        let r = render(
+            all,
+            &t,
+            &Opts {
+                width: 200,
+                expanded: false,
+                hl: None,
+            },
+        );
+        assert_eq!(text(&r)[0], all);
+        for url in [
+            "https://example.com/a/b?x=1",
+            "https://en.wikipedia.org/wiki/Rust_(language)",
+            "http://plain.io",
+        ] {
+            let sp = span_with(&r, url);
+            assert_eq!(
+                sp.content, url,
+                "trailing punctuation stays out of the link"
+            );
+            assert_eq!(
+                (
+                    sp.style.fg,
+                    sp.style.add_modifier.contains(Modifier::UNDERLINED)
+                ),
+                (Some(t.link), true)
+            );
+        }
+        // inside code and explicit links nothing is added; a long URL is never truncated
+        let r = styled("`https://in.code/x` and [txt](https://t.co/y)");
+        assert!(
+            !r.lines[0]
+                .spans
+                .iter()
+                .any(|s| s.content == "https://in.code/x"
+                    && s.style.add_modifier.contains(Modifier::UNDERLINED))
+        );
+        assert!(text(&r)[0].contains("txt (https://t.co/y)"));
+        let long = format!("https://example.com/{}", "a/".repeat(80));
+        let l = lines(&format!("go {long} now"), 40);
+        assert!(l.concat().replace(' ', "").contains(&long), "{l:?}");
+        assert!(
+            split_urls("no links http:// here").iter().all(|(u, _)| !u),
+            "a lone scheme stays text"
+        );
     }
 }

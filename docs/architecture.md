@@ -13,10 +13,12 @@ gh-pulse is a single binary: a synchronous ratatui event loop that talks to GitH
 | `src/gh.rs` | Everything that runs `gh`: list/detail fetchers, JSON models and parsers, command log, `shell()` quoting |
 | `src/act.rs` | Mutations as data: `Action` = label + optional prompt + `build(text) -> argv` |
 | `src/diff.rs` | Unified-diff parser, split-row builder, word-partner pairing, `wrap_ranges`, layout mode |
-| `src/syn.rs` | Optional syntect highlighter (feature `syntax`); a no-op stub otherwise |
+| `src/syn.rs` | syntect highlighter (cargo feature `syntax`, on by default); a no-op stub with `--no-default-features` |
 | `src/config.rs` | `config.toml` model, validation with line numbers, atomic save, the named-action `Keymap` |
 | `src/browse.rs` | Repo browser: GraphQL page parser, filter/sort/favorite/hide logic, browser key handling |
 | `src/md.rs` | Markdown to styled, wrapped lines (pulldown-cmark): headings, code, quotes, lists, tables, folding of `<details>` and long comments |
+| `src/sanitize.rs` | Makes bidi/zero-width/control characters visible (`<U+202E>`) in everything GitHub-sourced and in confirm-popup commands |
+| `src/state.rs` | Persistent viewed marks (`viewed.json`), keyed by repo + PR + head sha |
 | `src/theme.rs` | Palettes, icon sets, color depth fallback, locale/truecolor detection |
 
 ## Data flow
@@ -35,6 +37,26 @@ key/mouse event -> App (state change) -> spawn thread -> gh subprocess
   in `App.cache` keyed by `(item key, tab)`.
 - Files, Checks and Comments are *derived panels*: their rows are rebuilt from that cache for the selected (or
   drilled-into) PR by `sync_derived`, so they never fetch on their own.
+
+## Paged data
+
+Comments are fetched one GraphQL page at a time. `gh::detail` returns the first page with the cursors left over
+(`Pending`); the fetch thread then keeps paging with `gh::more_pages` and sends each page as `Msg::More`, which is
+merged into the cached `CommentsData` (`apply`) so the UI never blocks. At most `AUTO_PAGES` (5) extra pages load by
+themselves, at least 300 ms apart; the rest load on demand, one page at a time: when the view is within 20 rows of the
+loaded end, or on `m`. Every message carries the cursors still to fetch, so loading can pause and resume. A rate limit
+(GraphQL "rate limit", HTTP 403, secondary limit, or a later page suddenly "not found") shows "GitHub rate limit - retry
+in Ns" and is never retried automatically. The tab shows "loading more... (n/total)", the drill-in list ends with an
+"N more" row, and a failed page says why (`m` retries).
+
+## Hardening
+
+Variation selectors (U+FE0E/FE0F) are dropped on the way in too: terminals and width tables disagree on whether
+`\u26a0\ufe0f` is 1 or 2 cells, which desynchronizes the screen diff and leaves ghost text from the previous frame.
+
+Everything fetched from GitHub passes `sanitize::clean` once on the way in (`gh::list`/`detail` wrappers, the diff
+parser, the repo browser), and `gh::shell` cleans the command shown in confirm popups and the command log. Bidi
+overrides, zero-width characters and control characters (terminal escape injection) are shown as `<U+XXXX>`.
 
 ## Staleness: generation counters
 

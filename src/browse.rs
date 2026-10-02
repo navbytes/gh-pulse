@@ -37,10 +37,8 @@ pub fn parse_page(json: &str) -> Result<Page, String> {
     }
     let repos = &v["data"]["viewer"]["repositories"];
     let s = |n: &Value, p: &str| {
-        n.pointer(p)
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
+        let t = n.pointer(p).and_then(Value::as_str).unwrap_or("");
+        crate::sanitize::clean(t).into_owned()
     };
     let rows = repos["nodes"]
         .as_array()

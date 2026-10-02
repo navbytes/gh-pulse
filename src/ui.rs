@@ -28,8 +28,9 @@ Panels (Status, Pull requests, Files, Issues, Actions, Branches, Releases, Notif
   {browser}  repo browser: all your repos (search, sort, favorite, hide, Enter switches)
 Pull requests
   Files panel follows the selected PR; j/k there changes the file shown in the diff
-  Enter on a PR drills in: Files / Checks / Comments of that PR (Esc returns)
-  [ ]  detail tab (Overview/Checks/Comments/Diff); in a PR drill-in: next/prev panel
+  Enter on a PR drills in: Files / Commits / Checks / Comments of that PR (Esc returns)
+  Commits: j/k picks a commit, the right pane shows its diff (n/p file, t/w/{zoom} as in Diff)
+  [ ]  detail tab (Overview/Checks/Comments/Diff/Commits); in a PR drill-in: next/prev panel
 Diff
   j/k line   Ctrl-d/u half page   g/G first/last row   n/p file   t unified/split/auto
   w wrap/clip   v mark file viewed   {zoom} zoom
@@ -213,6 +214,28 @@ fn help_popup(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// `sha7 subject        +a -d` for the Commits panel.
+fn commit_label(app: &App, it: &Item, w: usize) -> Line<'static> {
+    use unicode_width::UnicodeWidthStr;
+    let th = &app.theme;
+    let (adds, dels, _) = it.fm;
+    let right = vec![
+        Span::styled(format!(" +{adds}"), Style::new().fg(th.ok)),
+        Span::styled(format!(" -{dels}"), Style::new().fg(th.err)),
+    ];
+    let rw = Line::from(right.clone()).width();
+    let budget = w.saturating_sub(it.state.width() + 1 + rw + 1);
+    let subject = mid_ellipsis(&it.title, budget, th.ic.ell);
+    let mut v = vec![
+        Span::styled(format!("{} ", it.state), Style::new().fg(th.accent)),
+        Span::raw(subject),
+    ];
+    let used = Line::from(v.clone()).width();
+    v.push(Span::raw(" ".repeat(w.saturating_sub(used + rw))));
+    v.extend(right);
+    Line::from(v)
+}
+
 /// `M  name  dir/   +a -d ◆threads ✓` with the name kept whole and the directory squeezed first.
 fn file_label(app: &App, it: &Item, w: usize) -> Line<'static> {
     use unicode_width::UnicodeWidthStr;
@@ -224,7 +247,7 @@ fn file_label(app: &App, it: &Item, w: usize) -> Line<'static> {
         "R" => th.merged,
         _ => th.warn,
     };
-    let viewed = app.viewed.contains(&(app.pr_key(), it.title.clone()));
+    let viewed = app.is_viewed(&it.title);
     // Thread and viewed slots are fixed-width so the +N -M column never shifts between rows.
     let thread = if threads > 0 {
         format!(" {}{threads}", th.ic.thread)
@@ -464,6 +487,9 @@ fn hints(app: &App) -> String {
             PK::Files => format!(
                 "j/k file  l/Enter diff  v viewed  {zoom} zoom  {back}[ ] panel  {actions} actions"
             ),
+            PK::Commits => format!(
+                "j/k commit  l/Enter diff  n/p file  t mode  w wrap  {zoom} zoom  {back}[ ] panel"
+            ),
             _ => format!("j/k move  l/Enter focus  {back}[ ] panel  {actions} actions"),
         }
     } else if app.detail_focus {
@@ -605,6 +631,7 @@ fn label(app: &App, it: &Item, show_repo: bool, w: usize) -> Line<'static> {
             v.push(Span::styled(it.title.clone(), Style::new().fg(col)));
         }
         Kind::File => return file_label(app, it, w),
+        Kind::Commit => return commit_label(app, it, w),
         Kind::Other | Kind::Status => v.push(Span::raw(it.title.clone())),
     }
     Line::from(v)
@@ -641,9 +668,14 @@ fn panel(f: &mut Frame, app: &App, i: usize, area: Rect, compact: bool) {
         .get(p.tab)
         .map(|t| format!(" {} {t}", th.ic.dot))
         .unwrap_or_default();
-    let count = match (p.kind, items.len()) {
+    // a trailing "N more" row is not an item; the count says "n+" while more are still coming
+    let more = items.last().is_some_and(|i| i.state == "more");
+    let count = match (p.kind, items.len() - usize::from(more)) {
         (PK::Status, _) => String::new(),
-        (_, n) if p.items.len() >= LIMIT => format!(" ({n}+)"),
+        // list panels are capped at LIMIT; Files/Checks/... are complete, except Files at GitHub's
+        // 3000-file API ceiling and Comments that are still paging in
+        (PK::Files, n) if n >= 3000 => format!(" ({n}+)"),
+        (k, n) if (!k.derived() && p.items.len() >= LIMIT) || more => format!(" ({n}+)"),
         (_, n) => format!(" ({n})"),
     };
     let title = format!(" [{}] {}{tab}{count} ", i + 1, p.title);
@@ -667,6 +699,7 @@ fn panel(f: &mut Frame, app: &App, i: usize, area: Rect, compact: bool) {
             }
             None => Note::Empty(match p.kind {
                 PK::Files => "no files",
+                PK::Commits => "no commits",
                 PK::Checks => "no checks",
                 PK::Comments => "no comments",
                 _ => "nothing here",
@@ -755,6 +788,8 @@ fn derived_detail(f: &mut Frame, app: &App, area: Rect, k: PK) {
     let title = match (k, it) {
         (PK::Checks, Some(i)) => format!(" Log: {} ", i.title),
         (PK::Checks, None) => " Log ".to_string(),
+        (PK::Commits, Some(i)) => format!(" Commit {} {} ", i.state, i.title),
+        (PK::Commits, None) => " Commit ".to_string(),
         _ => " Thread ".to_string(),
     };
     let block = bordered(app, title, app.detail_focus);
@@ -767,7 +802,17 @@ fn derived_detail(f: &mut Frame, app: &App, area: Rect, k: PK) {
             inner,
         );
     };
-    if k == PK::Checks {
+    if k == PK::Commits {
+        match (app.data_of(it, Tab::Diff), app.diff_data()) {
+            (_, Some((fd, fi))) => {
+                diff_view(f, app, fd, inner, fi, &format!("commit|{}", it.meta), false)
+            }
+            (Some(Load::Done(Err(e))), _) => {
+                f.render_widget(Paragraph::new(note(app, Note::Err(e.clone()))), inner)
+            }
+            _ => f.render_widget(Paragraph::new(note(app, Note::Loading)), inner),
+        }
+    } else if k == PK::Checks {
         match app.data_of(it, Tab::Logs) {
             Some(Load::Done(Ok(Data::Text(t)))) => {
                 let lines = t.iter().map(|s| Line::raw(s.clone())).collect();
@@ -805,7 +850,7 @@ fn detail(f: &mut Frame, app: &App, area: Rect) {
         let lines = l.lines.iter().map(|s| Line::raw(s.as_str())).collect();
         return pane(f, app, inner, lines, None);
     }
-    if let Some(k @ (PK::Checks | PK::Comments)) = app.dk() {
+    if let Some(k @ (PK::Checks | PK::Comments | PK::Commits)) = app.dk() {
         return derived_detail(f, app, area, k);
     }
     let Some(it) = app.selected() else {
@@ -883,7 +928,8 @@ fn detail(f: &mut Frame, app: &App, area: Rect) {
             }
             pane(f, app, inner, lines, Some((app.row, app.row)))
         }
-        (Tab::Comments, Some(Data::Comments(e))) => {
+        (Tab::Comments, Some(Data::Comments(cd))) => {
+            let e = &cd.entries;
             let (mut lines, mut sel, mut starts) = (vec![], (0, 0), vec![]);
             for (i, en) in e.iter().enumerate() {
                 let start = lines.len();
@@ -898,10 +944,84 @@ fn detail(f: &mut Frame, app: &App, area: Rect) {
             if lines.is_empty() {
                 lines.push(note(app, Note::Empty("no comments")));
             }
+            // Paging status goes on top where it is seen: the rest of the thread loads in the background.
+            let status = if cd.loading {
+                Some(Line::from(vec![
+                    Span::styled(spinner(app), Style::new().fg(th.accent)),
+                    Span::styled(
+                        format!(
+                            " loading more\u{2026} ({}/{})  {} more",
+                            cd.loaded,
+                            cd.total,
+                            cd.remaining()
+                        ),
+                        Style::new().fg(th.muted),
+                    ),
+                ]))
+            } else if let Some(e) = &cd.error {
+                let wait = cd.wait_secs();
+                let text = if wait > 0 {
+                    format!(
+                        "{} GitHub rate limit \u{2014} retry in {wait}s (m retries)",
+                        th.ic.fail
+                    )
+                } else {
+                    format!(
+                        "{} {} more not loaded: {e}  (m to retry)",
+                        th.ic.fail,
+                        cd.remaining()
+                    )
+                };
+                Some(Line::styled(text, Style::new().fg(th.err)))
+            } else if cd.paused() {
+                Some(Line::styled(
+                    format!(
+                        "{} more not loaded yet ({}/{}): scroll down or press m",
+                        cd.remaining(),
+                        cd.loaded,
+                        cd.total
+                    ),
+                    Style::new().fg(th.muted),
+                ))
+            } else {
+                None
+            };
+            if let Some(l) = status {
+                lines.insert(0, l);
+                sel = (sel.0 + 1, sel.1 + 1);
+                starts.iter_mut().for_each(|s| *s += 1);
+            }
             *app.row_starts.borrow_mut() = starts;
             pane(f, app, inner, lines, Some(sel))
         }
-        (Tab::Diff, Some(Data::Files(fd))) => diff_view(f, app, fd, inner),
+        (Tab::Diff, Some(Data::Files(fd))) => {
+            diff_view(f, app, fd, inner, app.file(), &app.pr_key(), true)
+        }
+        (Tab::Commits, Some(Data::Commits(c))) => {
+            let now = now_secs();
+            let lines = c
+                .iter()
+                .map(|c| {
+                    let sha: String = c.sha.chars().take(7).collect();
+                    Line::from(vec![
+                        Span::styled(format!("{sha} "), Style::new().fg(th.accent)),
+                        Span::raw(c.subject.clone()),
+                        Span::styled(
+                            format!(
+                                "  {} {} {} ago ",
+                                c.author,
+                                th.ic.dot,
+                                crate::browse::ago(&c.when, now)
+                            ),
+                            Style::new().fg(th.muted),
+                        ),
+                        Span::styled(format!("+{}", c.adds), Style::new().fg(th.ok)),
+                        Span::styled(format!(" -{}", c.dels), Style::new().fg(th.err)),
+                    ])
+                })
+                .collect();
+            pane(f, app, inner, lines, None)
+        }
         (t, Some(Data::Text(txt))) => {
             let lines = txt
                 .iter()
@@ -976,7 +1096,13 @@ fn md_highlighter<'a>(app: &'a App) -> impl Fn(&str, &[String]) -> Option<Segs> 
         let mut h = std::collections::hash_map::DefaultHasher::new();
         code.hash(&mut h);
         let key = format!("md|{lang}|{:x}", h.finish());
-        hl.ensure(&key, &format!("x.{}", lang_ext(lang)), &lines, lines.len());
+        hl.ensure(
+            &key,
+            &format!("x.{}", lang_ext(lang)),
+            &lines,
+            0,
+            lines.len(),
+        );
         (0..lines.len()).map(|i| hl.get(&key, i).cloned()).collect()
     }
 }
@@ -1591,10 +1717,19 @@ fn text_h(s: &str, tw: usize, wrap: bool) -> usize {
     }
 }
 
-fn diff_view(f: &mut Frame, app: &App, fd: &FilesData, area: Rect) {
+/// `fi` picks the file; `scope` namespaces the highlight cache; `track_viewed` is for PR files only.
+fn diff_view(
+    f: &mut Frame,
+    app: &App,
+    fd: &FilesData,
+    area: Rect,
+    fi: usize,
+    scope: &str,
+    track_viewed: bool,
+) {
     let th = &app.theme;
     let files = &fd.files;
-    let fi = app.file().min(files.len().saturating_sub(1));
+    let fi = fi.min(files.len().saturating_sub(1));
     let [head, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     app.hit.borrow_mut().body = body;
     let Some(file) = files.get(fi) else {
@@ -1609,7 +1744,7 @@ fn diff_view(f: &mut Frame, app: &App, fd: &FilesData, area: Rect) {
         (DiffMode::Unified, _) => "unified".into(),
         (DiffMode::Split, _) => "split".into(),
     };
-    let viewed = app.viewed.contains(&(app.pr_key(), file.path.clone()));
+    let viewed = track_viewed && app.is_viewed(&file.path);
     let mut hdr = vec![
         Span::styled(file.path.clone(), Style::new().bold()),
         Span::styled(
@@ -1628,8 +1763,9 @@ fn diff_view(f: &mut Frame, app: &App, fd: &FilesData, area: Rect) {
     }
     hdr.push(Span::styled(
         format!(
-            "  [{mode}, {}]  t mode  w wrap  v viewed",
-            if app.wrap { "wrap" } else { "clip" }
+            "  [{mode}, {}]  t mode  w wrap{}",
+            if app.wrap { "wrap" } else { "clip" },
+            if track_viewed { "  v viewed" } else { "" }
         ),
         Style::new().fg(th.muted),
     ));
@@ -1685,13 +1821,57 @@ fn diff_view(f: &mut Frame, app: &App, fd: &FilesData, area: Rect) {
     }
     let cur = app.row.min(heights.len().saturating_sub(1));
     let sel = starts.get(cur).map(|s| (*s, s + heights[cur] - 1));
-    let h = body.height as usize;
-    let top = window(app, h, total, sel);
+    let mut h = body.height as usize;
+    let mut top = window(app, h, total, sel);
+    // Sticky hunk bar: once a hunk's header has scrolled off the top, pin it in the first row.
+    let hunk_rows: Vec<usize> = match &rows {
+        None => file
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.op == Op::Hunk)
+            .map(|(i, _)| i)
+            .collect(),
+        Some(rs) => rs
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(r, Row::Full(_)))
+            .map(|(i, _)| i)
+            .collect(),
+    };
+    let sticky = |top: usize| {
+        let r0 = starts.partition_point(|&s| s <= top).saturating_sub(1);
+        hunk_rows
+            .iter()
+            .rev()
+            .find(|&&hr| hr <= r0 && starts[hr] < top)
+            .copied()
+    };
+    let mut pin = None;
+    if sticky(top).is_some() && h > 2 {
+        // the pinned row costs one body row, which can move the window: re-check with it
+        let top2 = window(app, h - 1, total, sel);
+        match sticky(top2) {
+            Some(p) => (pin, top, h) = (Some(p), top2, h - 1),
+            None => top = window(app, h, total, sel),
+        }
+    }
     let r0 = starts.partition_point(|&s| s <= top).saturating_sub(1);
     let mut r1 = r0;
     while r1 + 1 < starts.len() && starts[r1 + 1] < top + h {
         r1 += 1;
     }
+    let from = match &rows {
+        None => r0,
+        Some(r) => r[r0..=r1.min(r.len().saturating_sub(1))]
+            .iter()
+            .map(|row| match row {
+                Row::Full(i) => *i,
+                Row::Pair(a, b) => a.iter().chain(b.iter()).copied().min().unwrap_or(0),
+            })
+            .min()
+            .unwrap_or(0),
+    };
     let upto = match &rows {
         None => r1 + 1,
         Some(r) => r[r0..=r1.min(r.len().saturating_sub(1))]
@@ -1705,10 +1885,10 @@ fn diff_view(f: &mut Frame, app: &App, fd: &FilesData, area: Rect) {
     };
     *app.row_starts.borrow_mut() = starts.clone();
 
-    let key = format!("{}|{}", app.pr_key(), file.path);
+    let key = format!("{scope}|{}", file.path);
     let mut guard = app.hl.borrow_mut();
     let hl = guard.get_or_insert_with(|| Hl::new(th.syntect_theme(), th.rgb_fn()));
-    hl.ensure(&key, &file.path, &file.lines, upto);
+    hl.ensure(&key, &file.path, &file.lines, from, upto);
     let paint = Paint { th, hl, key: &key };
 
     let mut lines: Vec<Line> = vec![];
@@ -1727,7 +1907,29 @@ fn diff_view(f: &mut Frame, app: &App, fd: &FilesData, area: Rect) {
         lines.extend(rl.into_iter().skip(skip));
     }
     lines.truncate(h);
-    f.render_widget(Paragraph::new(lines), body);
+    let mut content = body;
+    if let Some(p) = pin {
+        let (bar, rest) = (
+            Rect { height: 1, ..body },
+            Rect {
+                y: body.y + 1,
+                height: body.height - 1,
+                ..body
+            },
+        );
+        let hi = match &rows {
+            None => p,
+            Some(rs) => match &rs[p] {
+                Row::Full(i) => *i,
+                Row::Pair(..) => p,
+            },
+        };
+        let bar_lines = paint.hunk(&file.lines[hi].text, g.w, false, false);
+        f.render_widget(Paragraph::new(bar_lines), bar);
+        content = rest;
+        app.hit.borrow_mut().body = rest;
+    }
+    f.render_widget(Paragraph::new(lines), content);
 }
 
 fn popup(f: &mut Frame, app: &App, w: u16, h: u16, title: &str) -> Rect {
@@ -1850,6 +2052,14 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
         );
         let files = crate::diff::parse(&diff);
         let threads = [("src/main.rs".to_string(), 2u32)].into();
+        let commits = vec![crate::gh::CommitRow {
+            sha: "abc1234def5678".into(),
+            subject: "Add the notes file".into(),
+            author: "octocat".into(),
+            when: "2026-01-02T00:00:00Z".into(),
+            adds: 3,
+            dels: 1,
+        }];
         let checks = vec![Check {
             name: "build".into(),
             bucket: "pass".into(),
@@ -1894,9 +2104,11 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
                     }),
                 ),
                 (Tab::Checks, Data::Checks(checks)),
-                (Tab::Comments, Data::Comments(comments)),
+                (Tab::Comments, Data::Comments(comments.into())),
+                (Tab::Commits, Data::Commits(commits.clone())),
             ],
         );
+        a.seed_commit_diffs(&commits, "diff --git a/c.rs b/c.rs\n--- a/c.rs\n+++ b/c.rs\n@@ -1 +1 @@\n-old commit line\n+new commit line\ndiff --git a/d.rs b/d.rs\n--- a/d.rs\n+++ b/d.rs\n@@ -1 +1 @@\n-x\n+second file of the commit\n");
         key(&mut a, KeyCode::Char('2'));
         a
     }
@@ -1977,11 +2189,19 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
             let mut a = seeded();
             key(&mut a, KeyCode::Enter); // PR list focus: drill in
             let s = render_app(&a, w, h);
-            for want in ["› PR #7", "[1] Files", "[2] Checks", "[3] Comments"] {
+            for want in [
+                "› PR #7",
+                "[1] Files",
+                "[2] Commits",
+                "[3] Checks",
+                "[4] Comments",
+            ] {
                 assert!(s.contains(want), "{w}x{h} missing {want:?}\n{s}");
             }
             assert!(!s.contains("[2] Pull requests"));
-            key(&mut a, KeyCode::Char(']')); // next panel: Checks
+            key(&mut a, KeyCode::Char(']')); // next panel: Commits
+            assert!(render_app(&a, w, h).contains("Commit abc1234"));
+            key(&mut a, KeyCode::Char(']')); // Checks
             assert!(render_app(&a, w, h).contains("Log: build"));
             key(&mut a, KeyCode::Char(']')); // Comments: thread text
             assert!(render_app(&a, w, h).contains("please rename"));
@@ -2049,7 +2269,8 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
         let mut a = seeded();
         key(&mut a, KeyCode::Char('3'));
         assert!(render_app(&a, 120, 40).contains("auto:unified")); // Diff by default
-        key(&mut a, KeyCode::Char(']'));
+        key(&mut a, KeyCode::Char(']')); // Commits tab
+        key(&mut a, KeyCode::Char(']')); // wraps to Overview
         let s = render_app(&a, 120, 40);
         assert!(s.contains("[open]") && !s.contains("auto:unified"), "{s}");
     }
@@ -2176,8 +2397,9 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
             thread: None,
             card,
         };
-        a.seed(pr, vec![(Tab::Comments, Data::Comments(vec![e]))]);
+        a.seed(pr, vec![(Tab::Comments, Data::Comments(vec![e].into()))]);
         key(&mut a, KeyCode::Enter); // drill in
+        key(&mut a, KeyCode::Char(']')); // Commits
         key(&mut a, KeyCode::Char(']')); // Checks
         key(&mut a, KeyCode::Char(']')); // Comments panel: the thread pane
         let s = render_app(&a, 100, 40);
@@ -2212,7 +2434,7 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
             thread: None,
             card,
         };
-        a.seed(pr, vec![(Tab::Comments, Data::Comments(vec![e]))]);
+        a.seed(pr, vec![(Tab::Comments, Data::Comments(vec![e].into()))]);
         key(&mut a, KeyCode::Char(']'));
         key(&mut a, KeyCode::Char(']')); // Comments tab
         key(&mut a, KeyCode::Char('l'));
@@ -2276,7 +2498,7 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
             thread: None,
             card,
         };
-        a.seed(pr, vec![(Tab::Comments, Data::Comments(vec![e]))]);
+        a.seed(pr, vec![(Tab::Comments, Data::Comments(vec![e].into()))]);
         key(&mut a, KeyCode::Char(']'));
         key(&mut a, KeyCode::Char(']'));
         let words: Vec<&str> = body
@@ -2363,7 +2585,7 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
             thread: Some("T".into()),
             card,
         };
-        a.seed(pr, vec![(Tab::Comments, Data::Comments(vec![e]))]);
+        a.seed(pr, vec![(Tab::Comments, Data::Comments(vec![e].into()))]);
         key(&mut a, KeyCode::Char(']'));
         key(&mut a, KeyCode::Char(']'));
         let s = render_app(&a, 80, 24);
@@ -2378,6 +2600,278 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
         ] {
             assert!(s.contains(want), "missing {want:?}\n{s}");
         }
+    }
+
+    /// The current hunk's header stays pinned under the file header while its body scrolls.
+    #[test]
+    fn sticky_hunk_bar_pins_the_current_hunk() {
+        let mut d = String::from(
+            "diff --git a/m.txt b/m.txt\n--- a/m.txt\n+++ b/m.txt\n@@ -1,40 +1,40 @@ first hunk\n",
+        );
+        for i in 1..=40 {
+            d += &format!(" first body line {i}\n");
+        }
+        d += "@@ -100,40 +100,40 @@ second hunk\n";
+        for i in 1..=40 {
+            d += &format!(" second body line {i}\n");
+        }
+        for width in [80u16, 220] {
+            let mut a = seeded();
+            let pr = a.pr_item().cloned().unwrap();
+            let files = crate::diff::parse(&d);
+            a.seed(
+                pr,
+                vec![(
+                    Tab::Diff,
+                    Data::Files(FilesData {
+                        sha: "x".into(),
+                        files,
+                        threads: Default::default(),
+                    }),
+                )],
+            );
+            key(&mut a, KeyCode::Char('3'));
+            key(&mut a, KeyCode::Char('l'));
+            key(&mut a, KeyCode::Char('t')); // auto -> unified
+            if width == 220 {
+                key(&mut a, KeyCode::Char('t')); // unified -> split
+            }
+            let body_rows = |s: &str| -> Vec<String> {
+                s.lines()
+                    .skip(3)
+                    .map(|l| {
+                        l.chars()
+                            .skip(if width == 80 { 31 } else { 91 })
+                            .collect::<String>()
+                    })
+                    .collect()
+            };
+            let s = render_app(&a, width, 24);
+            let count = |s: &str, needle: &str| s.matches(needle).count();
+            assert_eq!(
+                count(&s, "first hunk"),
+                1,
+                "not pinned while its own header is on screen\n{s}"
+            );
+            key(&mut a, KeyCode::Char('G')); // cursor and view to the end of the file
+            render_app(&a, width, 24);
+            let s = render_app(&a, width, 24);
+            let rows = body_rows(&s);
+            assert!(
+                rows[0].contains("second hunk"),
+                "{width}: pinned bar is the first body row\n{s}"
+            );
+            assert_eq!(count(&s, "second hunk"), 1, "{width}: not duplicated\n{s}");
+            assert!(!s.contains("first hunk"), "{s}");
+            assert!(rows.iter().any(|r| r.contains("second body line 40")));
+        }
+    }
+
+    #[test]
+    fn commits_panel_lists_commits_and_shows_the_selected_commits_diff() {
+        for (w, h) in [(80, 24), (120, 40)] {
+            let mut a = seeded();
+            key(&mut a, KeyCode::Enter); // drill in
+            let s = render_app(&a, w, h);
+            assert!(s.contains("[2] Commits (1)"), "{w}x{h}\n{s}");
+            if w >= 100 {
+                // (short terminals collapse unfocused panels to their title)
+                for want in ["abc1234", "Add the notes", "+3 -1"] {
+                    assert!(s.contains(want), "{w}x{h} missing {want:?}\n{s}");
+                }
+            }
+            key(&mut a, KeyCode::Char('2')); // focus Commits: its diff, not the PR's
+            let s = render_app(&a, w, h);
+            for want in [
+                "Commit abc1234 Add the notes file",
+                "c.rs",
+                "1/2",
+                "new commit line",
+                "auto:",
+            ] {
+                assert!(s.contains(want), "{w}x{h} missing {want:?}\n{s}");
+            }
+            assert!(
+                !s.contains("viewed"),
+                "viewed marks are for PR files only\n{s}"
+            );
+            key(&mut a, KeyCode::Char('n')); // next file of the commit
+            let s = render_app(&a, w, h);
+            assert!(
+                s.contains("d.rs") && s.contains("second file of the commit") && s.contains("2/2"),
+                "{s}"
+            );
+            key(&mut a, KeyCode::Char('l')); // Enter/l focuses the diff; j moves its line cursor
+            key(&mut a, KeyCode::Char('j'));
+            assert!(a.row > 0, "row cursor moves in the commit diff");
+            key(&mut a, KeyCode::Char('t'));
+            key(&mut a, KeyCode::Char('w'));
+            assert!(render_app(&a, w, h).contains("clip"));
+        }
+    }
+
+    #[test]
+    fn pr_commits_tab_lists_commits() {
+        let mut a = seeded();
+        key(&mut a, KeyCode::Char(']')); // Checks
+        key(&mut a, KeyCode::Char(']')); // Comments
+        key(&mut a, KeyCode::Char(']')); // Diff
+        key(&mut a, KeyCode::Char(']')); // Commits
+        let s = render_app(&a, 120, 30);
+        assert!(
+            s.contains("abc1234 Add the notes file")
+                && s.contains("octocat")
+                && s.contains("+3 -1"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn paged_comments_show_progress_and_a_more_row() {
+        let mut cd =
+            crate::gh::parse_comments(include_str!("../tests/comments_p1.json"), true).unwrap();
+        cd.loading = true;
+        let mut a = seeded();
+        let pr = a.pr_item().cloned().unwrap();
+        a.seed(pr.clone(), vec![(Tab::Comments, Data::Comments(cd))]);
+        key(&mut a, KeyCode::Char(']'));
+        key(&mut a, KeyCode::Char(']')); // Comments tab
+        let s = render_app(&a, 120, 40);
+        assert!(
+            s.contains("loading more\u{2026} (6/10)") && s.contains("4 more"),
+            "{s}"
+        );
+        // drill-in list: count says "n+" and the last row is the "N more" placeholder
+        key(&mut a, KeyCode::Enter);
+        key(&mut a, KeyCode::Char('4')); // Comments panel
+        let s = render_app(&a, 120, 40);
+        assert!(
+            s.contains("[4] Comments (4+)") && s.contains("4 more (loading)"),
+            "{s}"
+        );
+        // a failed page says why and how to retry
+        let mut cd =
+            crate::gh::parse_comments(include_str!("../tests/comments_p1.json"), true).unwrap();
+        cd.apply(crate::gh::More::Failed(
+            "rate limited".into(),
+            crate::gh::Pending::default(),
+        ));
+        let mut a = seeded();
+        a.seed(pr, vec![(Tab::Comments, Data::Comments(cd))]);
+        key(&mut a, KeyCode::Char(']'));
+        key(&mut a, KeyCode::Char(']'));
+        let s = render_app(&a, 120, 40);
+        assert!(
+            s.contains("4 more not loaded: rate limited") && s.contains("m to retry"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn paused_and_rate_limited_comment_paging_say_so() {
+        let first =
+            || crate::gh::parse_comments(include_str!("../tests/comments_p1.json"), true).unwrap();
+        // automatic budget used up: nothing loading, cursors kept -> an on-demand hint
+        let mut cd = first();
+        let rest = cd.pend.clone();
+        cd.apply(crate::gh::More::Paused(rest));
+        assert!(cd.paused());
+        let mut a = seeded();
+        let pr = a.pr_item().cloned().unwrap();
+        a.seed(pr.clone(), vec![(Tab::Comments, Data::Comments(cd))]);
+        key(&mut a, KeyCode::Char(']'));
+        key(&mut a, KeyCode::Char(']'));
+        let s = render_app(&a, 120, 40);
+        assert!(
+            s.contains("4 more not loaded yet (6/10): scroll down or press m"),
+            "{s}"
+        );
+        // a rate limit says when to retry, not "repo not found", and `m` refuses until then
+        let mut cd = first();
+        let rest = cd.pend.clone();
+        cd.apply(crate::gh::More::RateLimited(90, rest));
+        let mut a = seeded();
+        a.seed(pr, vec![(Tab::Comments, Data::Comments(cd))]);
+        key(&mut a, KeyCode::Char(']'));
+        key(&mut a, KeyCode::Char(']'));
+        let s = render_app(&a, 120, 40);
+        assert!(
+            s.contains("GitHub rate limit \u{2014} retry in 9") && !s.contains("not found"),
+            "{s}"
+        );
+        key(&mut a, KeyCode::Char('m')); // would normally open the merge menu; here it is "load more"
+        assert!(
+            a.modal.is_none() && a.status.contains("GitHub rate limit \u{2014} retry in"),
+            "{}",
+            a.status
+        );
+    }
+
+    /// Regression (ghost text in the detail pane): emoji with a variation selector ("\u{26a0}\u{fe0f}") are 2
+    /// cells to ratatui but 1 to many terminals, which shifted later cells and left leftovers of the
+    /// previous PR's text. Selectors are dropped on the way in, and a frame drawn over a longer one
+    /// must equal the same frame drawn fresh.
+    #[test]
+    fn no_ghost_cells_after_a_longer_frame_and_no_variation_selectors() {
+        let json = r#"[{"number":1,"title":"A","url":"u","state":"open","body":"\u26a0\ufe0f   Heads up \u26a0\ufe0f","author":{"login":"a"},"labels":[{"name":"dependencies"},{"name":"github_actions"}]},
+                        {"number":2,"title":"B","url":"u","state":"open","body":"short","author":{"login":"a"},"labels":[{"name":"javascript"}]}]"#;
+        let items = crate::gh::parse_items(json, Kind::Pr, "o/r").unwrap();
+        let mut a = app(false, IconSet::Unicode);
+        let i = a.panel_idx_for_test(crate::app::PK::Prs);
+        a.panels[i].items = items;
+        key(&mut a, KeyCode::Char('2'));
+        let mut t = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let dump = |t: &Terminal<TestBackend>| -> Vec<String> {
+            let b = t.backend().buffer();
+            (0..30)
+                .map(|y| {
+                    (0..120)
+                        .map(|x| b[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect()
+        };
+        t.draw(|f| draw(f, &a)).unwrap();
+        let first = dump(&t);
+        assert!(
+            first.iter().all(|r| !r.contains('\u{fe0f}')),
+            "no variation selectors on screen"
+        );
+        assert!(
+            first.iter().any(|r| r.contains("github_actions"))
+                && first.iter().any(|r| r.contains("\u{26a0} "))
+        );
+        key(&mut a, KeyCode::Char('j')); // the shorter PR
+        t.draw(|f| draw(f, &a)).unwrap();
+        let over_old = dump(&t);
+        let fresh = render_app(&a, 120, 30);
+        assert_eq!(
+            over_old.join("\n"),
+            fresh,
+            "stale cells left over from the previous frame"
+        );
+        assert!(!fresh.contains("github_actions") && !fresh.contains("Heads up"));
+    }
+
+    #[test]
+    fn files_panel_shows_the_exact_count() {
+        let mut a = seeded();
+        let pr = a.pr_item().cloned().unwrap();
+        let diff: String = (0..252).map(|i| format!("diff --git a/f{i}.txt b/f{i}.txt\n--- a/f{i}.txt\n+++ b/f{i}.txt\n@@ -1 +1 @@\n-a\n+b\n")).collect();
+        let files = crate::diff::parse(&diff);
+        a.seed(
+            pr,
+            vec![(
+                Tab::Diff,
+                Data::Files(FilesData {
+                    sha: "x".into(),
+                    files,
+                    threads: Default::default(),
+                }),
+            )],
+        );
+        let s = render_app(&a, 120, 40);
+        assert!(s.contains("[3] Files (252)") && !s.contains("252+"), "{s}");
     }
 
     #[test]
@@ -2452,11 +2946,18 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
             key(&mut a, KeyCode::Char('G')); // cursor to the last row: worst case for offsets
         }
         for (w, mode) in [(120u16, "unified/wrap"), (220, "split/wrap")] {
+            // the first frame also pays the one-time syntax highlighting of everything up to the cursor
+            let t = std::time::Instant::now();
+            render_app(&a, w, 40);
+            let cold = t.elapsed();
             let t = std::time::Instant::now();
             for _ in 0..10 {
                 render_app(&a, w, 40);
             }
-            println!("{mode}: {:?} per frame", t.elapsed() / 10);
+            println!(
+                "{mode}: cold first frame {cold:?}, then {:?} per frame",
+                t.elapsed() / 10
+            );
         }
     }
 }

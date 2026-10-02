@@ -224,7 +224,7 @@ pub fn actions(it: Option<&Item>, panel: usize, repo: &str, sel: &Sel) -> Vec<Ac
             if let Some((sha, path, line, side)) = sel.inline.clone() {
                 let (r1, n1) = (r.clone(), n.clone());
                 v.push(act(
-                    format!("Comment on {path}:{line}"),
+                    format!("Comment on {}:{line}", crate::sanitize::clean(&path)),
                     Some(("Inline comment", true)),
                     move |b| {
                         cmd![
@@ -289,9 +289,9 @@ pub fn actions(it: Option<&Item>, panel: usize, repo: &str, sel: &Sel) -> Vec<Ac
                 }
             }
         }
-        Kind::Branch if it.title.starts_with('-') => {}
+        Kind::Branch if it.cmd_name().starts_with('-') => {}
         Kind::Branch => {
-            let name = it.title.clone();
+            let name = it.cmd_name().to_string();
             let name1 = name.clone();
             let mut sw = act("Switch to branch (git, in cwd)", None, move |_| {
                 cmd!["git", "switch", &name1]
@@ -315,13 +315,13 @@ pub fn actions(it: Option<&Item>, panel: usize, repo: &str, sel: &Sel) -> Vec<Ac
             }));
         }
         Kind::Release => {
-            let (r1, tag) = (r.clone(), it.meta.clone());
+            let (r1, tag) = (r.clone(), it.cmd_name().to_string());
             v.push(act("Download assets to cwd", None, move |_| {
                 cmd![
                     "gh", "release", "download", "-R", &r1, "-D", ".", "--", &tag
                 ]
             }));
-            let tag = it.meta.clone();
+            let tag = it.cmd_name().to_string();
             v.push(act("Delete release", None, move |_| {
                 cmd!["gh", "release", "delete", "-R", &r, "-y", "--", &tag]
             }));
@@ -351,6 +351,62 @@ mod tests {
             .find(|a| a.label.starts_with(label))
             .unwrap_or_else(|| panic!("no {label}"));
         (a.build)("hello")
+    }
+
+    /// Displayed names have look-alike characters neutralized; commands must still carry the real
+    /// name, and the confirm popup (gh::shell) shows it neutralized.
+    #[test]
+    fn commands_use_raw_names_and_the_popup_shows_them_neutralized() {
+        let tag = "v1\u{200b}.0";
+        let rel = Item {
+            title: "v1<U+200B>.0".into(),
+            meta: "v1<U+200B>.0".into(),
+            cmd: tag.into(),
+            repo: "o/r".into(),
+            kind: Kind::Release,
+            ..Default::default()
+        };
+        let v = actions(Some(&rel), 5, "o/r", &Sel::default());
+        let del = find(&v, "Delete release");
+        assert_eq!(
+            del.last().map(String::as_str),
+            Some(tag),
+            "the real tag reaches gh"
+        );
+        assert_eq!(
+            crate::gh::shell(&del),
+            "gh release delete -R o/r -y -- 'v1<U+200B>.0'"
+        );
+        let br = Item {
+            title: "feat/a<U+202E>b".into(),
+            cmd: "feat/a\u{202e}b".into(),
+            repo: "o/r".into(),
+            kind: Kind::Branch,
+            ..Default::default()
+        };
+        let v = actions(Some(&br), 4, "o/r", &Sel::default());
+        assert_eq!(find(&v, "Switch")[2], "feat/a\u{202e}b");
+        assert!(
+            find(&v, "Delete remote")[4].ends_with("feat/a%E2%80%AEb"),
+            "path is percent-encoded from the raw name"
+        );
+        // inline comments carry the real file path (Sel is filled from diff::File::raw_path)
+        let sel = Sel {
+            inline: Some(("abc".into(), "dir/we\u{200b}ird.rs".into(), 3, "RIGHT")),
+            ..Default::default()
+        };
+        let pr = Item {
+            number: 7,
+            state: "OPEN".into(),
+            repo: "o/r".into(),
+            kind: Kind::Pr,
+            ..Default::default()
+        };
+        let v = actions(Some(&pr), 1, "o/r", &sel);
+        assert!(
+            find(&v, "Comment on dir/we<U+200B>ird.rs:3")
+                .contains(&"path=dir/we\u{200b}ird.rs".to_string())
+        );
     }
 
     #[test]

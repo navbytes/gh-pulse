@@ -1,0 +1,4 @@
+{"data":{"repository":{"pullRequest":{"commits":{"pageInfo":{"hasNextPage":true,"endCursor":"C2"},"nodes":[
+{"commit":{"oid":"1111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","messageHeadline":"Add the thing","committedDate":"2026-09-01T10:00:00Z","additions":12,"deletions":3,"author":{"name":"The Octocat","user":{"login":"octocat"}}}},
+{"commit":{"oid":"2222222bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","messageHeadline":"Fix typo","committedDate":"2026-09-02T10:00:00Z","additions":1,"deletions":1,"author":{"name":"Mona Lisa","user":null}}}
+]}}}}}

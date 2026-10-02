@@ -45,13 +45,15 @@ The Files panel (3) has no filter and follows the selected PR; the Checks and Co
 
 ## PR drill-in (after `Enter` on a PR)
 
+Panels: `1` Files, `2` Commits, `3` Checks, `4` Comments.
+
 | Key | Action |
 |---|---|
 | `[` `]` | Previous / next panel (Files, Checks, Comments) |
 | `1`-`3`, `Tab` | Focus a panel |
 | `Esc` | Back to the normal panels, cursor preserved |
 
-Right pane: Files shows the diff of the selected file, Checks the failed-step log of the selected check, Comments the full thread.
+Right pane: Files shows the diff of the selected file, Commits the diff of the selected commit (`n`/`p` pick its file, `t` `w` `f` as in Diff), Checks the failed-step log of the selected check, Comments the full thread.
 
 ## Detail pane
 
@@ -70,6 +72,7 @@ Right pane: Files shows the diff of the selected file, Checks the failed-step lo
 | `Ctrl-d` `Ctrl-u` | Half a page: scrolls inside a comment taller than the pane first, then moves to the next/previous comment |
 | `Enter` | Expand / collapse the comment (long bodies, `<details>`) |
 | `e` | Show / hide who reacted |
+| `m` | Load the next page of comments (shadows the merge shortcut on this tab; merge stays in `x`). The next page also loads by itself when you scroll within 20 rows of the end |
 | `x` | Menu: reply to / resolve the thread, comment |
 
 ## Diff (Diff tab or Files panel)
@@ -80,7 +83,7 @@ Right pane: Files shows the diff of the selected file, Checks the failed-step lo
 | `j` `k`, `Ctrl-d` `Ctrl-u`, `g` `G` | Move the line cursor / half page / first and last row (the cursor line is what inline comments attach to) |
 | `t` | Cycle layout: auto, unified, split. Auto goes side-by-side when each half has at least 60 columns |
 | `w` | Toggle soft-wrap / clip |
-| `v` | Mark the file viewed (in memory) |
+| `v` | Mark the file viewed (saved to `$XDG_STATE_HOME/gh-pulse/viewed.json`, per PR head commit; PR files only) |
 | `f` | Zoom |
 | `x` | Menu, including "Comment on file:line" for the cursor line |
 

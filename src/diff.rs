@@ -17,7 +17,10 @@ pub struct DLine {
 }
 
 pub struct File {
+    /// Display path (look-alike characters neutralized).
     pub path: String,
+    /// The real path, for API calls such as inline comments.
+    pub raw_path: String,
     /// M(odified), A(dded), D(eleted) or R(enamed).
     pub status: char,
     pub adds: u32,
@@ -54,7 +57,8 @@ pub fn parse(diff: &str) -> Vec<File> {
             // Fallback only: ambiguous when the path contains " b/"; ---/+++ lines override it.
             let path = rest.rsplit_once(" b/").map_or(rest, |(_, p)| p);
             files.push(File {
-                path: path.into(),
+                path: crate::sanitize::clean(path).into_owned(),
+                raw_path: path.to_string(),
                 lines: vec![],
                 note: None,
                 status: 'M',
@@ -97,14 +101,20 @@ pub fn parse(diff: &str) -> Vec<File> {
         }
         if let Some(p) = l.strip_prefix("--- ").filter(|_| !in_hunk) {
             match header_path(p, "a/") {
-                Some(p) => f.path = p,
+                Some(p) => {
+                    f.path = crate::sanitize::clean(&p).into_owned();
+                    f.raw_path = p;
+                }
                 None => f.status = 'A',
             }
             continue;
         }
         if let Some(p) = l.strip_prefix("+++ ").filter(|_| !in_hunk) {
             match header_path(p, "b/") {
-                Some(p) => f.path = p,
+                Some(p) => {
+                    f.path = crate::sanitize::clean(&p).into_owned();
+                    f.raw_path = p;
+                }
                 None => f.status = 'D',
             }
             continue;
@@ -112,7 +122,8 @@ pub fn parse(diff: &str) -> Vec<File> {
         if let Some(p) = l.strip_prefix("rename to ").filter(|_| !in_hunk) {
             f.status = 'R';
             f.note = Some(format!("renamed to {}", unquote(p)));
-            f.path = unquote(p);
+            f.raw_path = unquote(p);
+            f.path = crate::sanitize::clean(&f.raw_path).into_owned();
             continue;
         }
         if l.starts_with("Binary files ") && !in_hunk {
@@ -129,7 +140,7 @@ pub fn parse(diff: &str) -> Vec<File> {
             Some('\\') => continue,
             _ => (Op::Ctx, l.get(1..).unwrap_or("")),
         };
-        let text = text.replace('\t', "    ");
+        let text = crate::sanitize::clean(&text.replace('\t', "    ")).into_owned();
         let (o, n) = match op {
             Op::Add => (None, Some(new)),
             Op::Del => (Some(old), None),
@@ -421,5 +432,14 @@ diff --git a/o.txt b/p.txt\nsimilarity index 100%\nrename from o.txt\nrename to 
         assert_eq!(m[0].partner[2], Some(4)); // -old1 pairs with +new1
         assert_eq!(m[0].partner[4], Some(2));
         assert_eq!(m[0].partner[3], None);
+    }
+
+    #[test]
+    fn display_path_is_neutralized_but_the_real_path_is_kept() {
+        let f = parse(
+            "diff --git a/x b/x\n--- a/we\u{200b}ird.rs\n+++ b/we\u{200b}ird.rs\n@@ -1 +1 @@\n-a\n+b\n",
+        );
+        assert_eq!(f[0].path, "we<U+200B>ird.rs");
+        assert_eq!(f[0].raw_path, "we\u{200b}ird.rs");
     }
 }

@@ -5,6 +5,8 @@ mod config;
 mod diff;
 mod gh;
 mod md;
+mod sanitize;
+mod state;
 mod syn;
 mod theme;
 mod ui;

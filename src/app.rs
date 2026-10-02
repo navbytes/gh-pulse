@@ -2,7 +2,8 @@ use crate::act::{self, Action, Sel};
 use crate::browse::{self, Browser, Out, RepoRow};
 use crate::config::{self, Act, Config, Keymap};
 use crate::diff::{self, DiffMode};
-use crate::gh::{self, Data, Item, Kind, Tab};
+use crate::gh::{self, Data, FilesData, Item, Kind, Tab};
+use crate::state::Viewed;
 use crate::syn::Hl;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -21,6 +22,7 @@ pub enum PK {
     Status,
     Prs,
     Files,
+    Commits,
     Checks,
     Comments,
     Issues,
@@ -85,6 +87,8 @@ impl Panel {
     }
 }
 
+// A cache entry is built once per fetch; boxing the comment data would only add indirection.
+#[allow(clippy::large_enum_variant)]
 pub enum Load {
     Loading,
     Done(Result<Data, String>),
@@ -149,6 +153,8 @@ enum Msg {
     // Results carry the generation they were requested in; stale ones are dropped.
     List(PK, usize, u64, Result<Vec<Item>, String>),
     Detail(String, Tab, u64, Result<Data, String>),
+    /// A later page of comments for the item with this key.
+    More(String, u64, gh::More),
     Log(String, String, u64, Result<String, String>),
     Status(Result<String, String>),
     Done(Result<String, String>),
@@ -185,11 +191,15 @@ pub struct App {
     pub row: usize,
     pub ctx: Option<Ctx>,
     pub zoom: bool,
+    /// File shown from the selected commit (Commits panel).
+    pub cfile: usize,
+    /// When the last comments page was requested (pages are at least PAGE_GAP apart).
+    last_more: Option<std::time::Instant>,
     /// Comments the user expanded (long ones, details blocks) / whose reaction names are shown, per item and row.
     pub expanded: HashSet<(String, usize)>,
     pub react_open: HashSet<(String, usize)>,
-    /// (PR key, path) pairs the user marked viewed; in-memory only.
-    pub viewed: HashSet<(String, String)>,
+    /// Files marked viewed, persisted per repo + PR + head sha (see state.rs).
+    pub viewed: Viewed,
     pub mode: DiffMode,
     pub wrap: bool,
     /// Whether the last diff render was side-by-side (row counts depend on it).
@@ -231,6 +241,21 @@ fn derive_items(kind: PK, pr: &Item, d: &Data) -> Vec<Item> {
                 ..base(f.path.clone())
             })
             .collect(),
+        (PK::Commits, Data::Commits(c)) => c
+            .iter()
+            .map(|c| Item {
+                kind: Kind::Commit,
+                state: c.sha.chars().take(7).collect(),
+                meta: c.sha.clone(),
+                url: format!("https://github.com/{}/commit/{}", pr.repo, c.sha),
+                body: c.when.clone(),
+                author: gh::Author {
+                    login: c.author.clone(),
+                },
+                fm: (c.adds, c.dels, 0),
+                ..base(c.subject.clone())
+            })
+            .collect(),
         (PK::Checks, Data::Checks(c)) => c
             .iter()
             .map(|c| {
@@ -245,19 +270,51 @@ fn derive_items(kind: PK, pr: &Item, d: &Data) -> Vec<Item> {
                 }
             })
             .collect(),
-        (PK::Comments, Data::Comments(e)) => e
-            .iter()
-            .map(|e| Item {
-                kind: Kind::Comment,
-                state: if e.resolved {
-                    "resolved".into()
-                } else {
-                    String::new()
-                },
-                body: e.body.clone(),
-                ..base(e.head.clone())
-            })
-            .collect(),
+        (PK::Comments, Data::Comments(cd)) => {
+            let mut v: Vec<Item> = cd
+                .iter()
+                .map(|e| Item {
+                    kind: Kind::Comment,
+                    state: if e.resolved {
+                        "resolved".into()
+                    } else {
+                        String::new()
+                    },
+                    body: e.body.clone(),
+                    ..base(e.head.clone())
+                })
+                .collect();
+            // a last, non-comment row says that more are coming (or why they didn't)
+            if cd.loading || cd.error.is_some() || cd.paused() {
+                let n = cd.remaining();
+                let wait = cd.wait_secs();
+                let (title, body) = match (&cd.error, cd.loading) {
+                    (Some(_), _) if wait > 0 => (
+                        format!("\u{2026} {n} more (rate limited)"),
+                        format!("GitHub rate limit \u{2014} retry in {wait}s (press m)."),
+                    ),
+                    (Some(e), _) => (
+                        format!("\u{2026} {n} more not loaded"),
+                        format!("{n} more comments were not loaded: {e}\nPress m to retry."),
+                    ),
+                    (None, true) => (
+                        format!("\u{2026} {n} more (loading)"),
+                        format!("Loading more comments... ({}/{})", cd.loaded, cd.total),
+                    ),
+                    (None, false) => (
+                        format!("\u{2026} {n} more (m to load)"),
+                        "More comments are not loaded yet: scroll down or press m.".to_string(),
+                    ),
+                };
+                v.push(Item {
+                    kind: Kind::Comment,
+                    state: "more".into(),
+                    body,
+                    ..base(title)
+                });
+            }
+            v
+        }
         _ => vec![],
     }
 }
@@ -275,6 +332,9 @@ impl App {
     pub fn from_config(repo: String, theme: Theme, cfg: Config, keys: Keymap) -> Self {
         let mut app = Self::new(repo, theme);
         (app.cfg, app.keys, app.cfg_path) = (cfg, keys, config::path());
+        let (viewed, warn) = Viewed::load(crate::state::path());
+        app.viewed = viewed;
+        app.status = warn.unwrap_or_default();
         app
     }
 
@@ -322,9 +382,11 @@ impl App {
             row: 0,
             ctx: None,
             zoom: false,
+            cfile: 0,
+            last_more: None,
             expanded: HashSet::new(),
             react_open: HashSet::new(),
-            viewed: HashSet::new(),
+            viewed: Viewed::default(),
             mode: DiffMode::Auto,
             wrap: true,
             eff_split: Cell::new(false),
@@ -405,6 +467,11 @@ impl App {
             .find(|p| p.kind == k)
     }
 
+    #[cfg(test)]
+    pub fn panel_idx_for_test(&self, k: PK) -> usize {
+        self.panel_idx(k).unwrap()
+    }
+
     fn panel_idx(&self, k: PK) -> Option<usize> {
         self.panels.iter().position(|p| p.kind == k)
     }
@@ -441,10 +508,21 @@ impl App {
                         self.cache.insert((key, tab), Load::Done(res));
                     }
                 }
+                Msg::More(key, g, m) => {
+                    if g == self.dgen
+                        && let Some(Load::Done(Ok(Data::Comments(cd)))) =
+                            self.cache.get_mut(&(key, Tab::Comments))
+                    {
+                        cd.apply(m);
+                    }
+                }
                 Msg::Log(_, key, g, _)
                     if g != self.dgen || self.selected().map(Item::key) != Some(key.clone()) => {}
                 Msg::Log(title, _, _, Ok(text)) => {
-                    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+                    let mut lines: Vec<String> = text
+                        .lines()
+                        .map(|l| crate::sanitize::clean(l).into_owned())
+                        .collect();
                     lines.drain(..lines.len().saturating_sub(5000));
                     self.log = Some(Log { title, lines });
                     self.scroll.set(usize::MAX); // failures are at the end
@@ -470,7 +548,7 @@ impl App {
                         (b.loading, b.error) = (false, Some(e));
                     }
                 }
-                Msg::Header(h) => self.header = h,
+                Msg::Header(h) => self.header = crate::sanitize::clean(&h).into_owned(),
             }
         }
         self.sync_derived();
@@ -487,6 +565,84 @@ impl App {
         self.sync_derived();
     }
 
+    /// Test helper: cache the same commit diff (parsed from `diff`) for every commit row.
+    #[cfg(test)]
+    pub fn seed_commit_diffs(&mut self, rows: &[crate::gh::CommitRow], diff: &str) {
+        let pr = self.pr_item().cloned().unwrap();
+        for it in derive_items(PK::Commits, &pr, &Data::Commits(rows.to_vec())) {
+            let fd = FilesData {
+                sha: it.meta.clone(),
+                files: diff::parse(diff),
+                threads: Default::default(),
+            };
+            self.cache
+                .insert((it.key(), Tab::Diff), Load::Done(Ok(Data::Files(fd))));
+        }
+    }
+
+    fn comments_data(&self) -> Option<&gh::CommentsData> {
+        let it = self.selected()?;
+        match self.cache.get(&(it.key(), Tab::Comments))? {
+            Load::Done(Ok(Data::Comments(cd))) => Some(cd),
+            _ => None,
+        }
+    }
+
+    /// Looking at comments whose later pages are still to be fetched.
+    fn comments_pending(&self) -> bool {
+        self.cur_tab() == Tab::Comments
+            && self.comments_data().is_some_and(|cd| !cd.pend.is_empty())
+    }
+
+    /// The viewport is within 20 rows of the last loaded comment.
+    fn near_comments_end(&self) -> bool {
+        match self.dk() {
+            Some(PK::Comments) => {
+                self.panels[self.focus].cursor + 20 >= self.panels[self.focus].items.len()
+            }
+            _ => self.scroll.get() + self.view_h.get() + 20 >= self.view_len.get(),
+        }
+    }
+
+    /// Fetch one more page of comments, never faster than PAGE_GAP and never during a rate-limit wait.
+    /// `manual` (key `m`) also retries after errors and explains refusals.
+    fn load_more(&mut self, manual: bool) {
+        if self.last_more.is_some_and(|t| t.elapsed() < gh::PAGE_GAP) {
+            return;
+        }
+        let Some(it) = self.selected().cloned() else {
+            return;
+        };
+        let key = (it.key(), Tab::Comments);
+        let Some(Load::Done(Ok(Data::Comments(cd)))) = self.cache.get_mut(&key) else {
+            return;
+        };
+        if cd.loading || cd.pend.is_empty() || (!manual && cd.error.is_some()) {
+            return;
+        }
+        if cd.wait_secs() > 0 {
+            if manual {
+                self.status = format!("GitHub rate limit \u{2014} retry in {}s", cd.wait_secs());
+            }
+            return;
+        }
+        (cd.loading, cd.error, cd.blocked_until) = (true, None, None);
+        let pend = cd.pend.clone();
+        self.last_more = Some(std::time::Instant::now());
+        let (tx, g) = (self.tx.clone(), self.dgen);
+        let repo = if it.repo.is_empty() {
+            self.repo.clone()
+        } else {
+            it.repo.clone()
+        };
+        thread::spawn(move || {
+            let pr = it.kind == Kind::Pr;
+            gh::more_pages(&repo, &it.number.to_string(), pr, pend, 1, &mut |m| {
+                tx.send(Msg::More(key.0.clone(), g, m)).is_ok()
+            });
+        });
+    }
+
     fn fetch(&mut self, it: Item, tab: Tab) {
         if !gh::needs_fetch(it.kind, tab) {
             return;
@@ -498,12 +654,38 @@ impl App {
         self.cache.insert(key.clone(), Load::Loading);
         let (tx, repo, g) = (self.tx.clone(), self.repo.clone(), self.dgen);
         thread::spawn(move || {
-            let _ = tx.send(Msg::Detail(key.0, tab, g, gh::detail(&repo, &it, tab)));
+            let res = gh::detail(&repo, &it, tab);
+            // Comments arrive in pages: show the first at once, keep paging in this thread.
+            let more = match &res {
+                Ok(Data::Comments(cd)) if !cd.pend.is_empty() => Some(cd.pend.clone()),
+                _ => None,
+            };
+            let _ = tx.send(Msg::Detail(key.0.clone(), tab, g, res));
+            if let Some(pend) = more {
+                let repo = if it.repo.is_empty() {
+                    repo
+                } else {
+                    it.repo.clone()
+                };
+                let pr = it.kind == Kind::Pr;
+                gh::more_pages(
+                    &repo,
+                    &it.number.to_string(),
+                    pr,
+                    pend,
+                    gh::AUTO_PAGES,
+                    &mut |m| tx.send(Msg::More(key.0.clone(), g, m)).is_ok(),
+                );
+            }
         });
     }
 
     /// Fetches whatever the screen needs and isn't cached yet; called when input is idle.
     pub fn ensure(&mut self) {
+        // scrolling toward the end of loaded comments pulls the next page, one at a time
+        if self.comments_data().is_some_and(gh::CommentsData::paused) && self.near_comments_end() {
+            self.load_more(false);
+        }
         let kind = self.panels[self.focus].kind;
         // The PR behind Files/Checks/Comments: only fetched while the user is working on PRs.
         if let Some(pr) = self.pr_item().filter(|p| p.kind == Kind::Pr).cloned()
@@ -511,6 +693,7 @@ impl App {
         {
             self.fetch(pr.clone(), Tab::Diff);
             if self.ctx.is_some() {
+                self.fetch(pr.clone(), Tab::Commits);
                 self.fetch(pr.clone(), Tab::Checks);
                 self.fetch(pr, Tab::Comments);
             }
@@ -519,6 +702,11 @@ impl App {
             && let Some(c) = self.selected_in(self.focus).cloned()
         {
             self.fetch(c, Tab::Logs);
+        }
+        if kind == PK::Commits
+            && let Some(c) = self.selected_in(self.focus).cloned()
+        {
+            self.fetch(c, Tab::Diff);
         }
         if kind.derived() && !(kind == PK::Files && self.ctx.is_none()) {
             return;
@@ -600,6 +788,7 @@ impl App {
     pub fn cur_tab(&self) -> Tab {
         match self.dk() {
             Some(PK::Files) if self.ctx.is_some() => Tab::Diff,
+            Some(PK::Commits) => Tab::Commits,
             Some(PK::Checks) => Tab::Checks,
             Some(PK::Comments) => Tab::Comments,
             _ => {
@@ -648,6 +837,7 @@ impl App {
             }
             let tab = match kind {
                 PK::Files => Tab::Diff,
+                PK::Commits => Tab::Commits,
                 PK::Checks => Tab::Checks,
                 _ => Tab::Comments,
             };
@@ -668,9 +858,13 @@ impl App {
 
     /// Selecting another PR restarts the Files panel at its first file.
     fn after_select(&mut self) {
-        if self.panels[self.focus].kind == PK::Prs {
-            self.set_file(0);
-            self.sync_derived();
+        match self.panels[self.focus].kind {
+            PK::Prs => {
+                self.set_file(0);
+                self.sync_derived();
+            }
+            PK::Commits => self.cfile = 0, // each commit's diff starts at its first file
+            _ => {}
         }
     }
 
@@ -679,18 +873,39 @@ impl App {
         self.scroll.set(0);
     }
 
+    /// The diff being shown and which of its files: the selected PR's (Files panel / Diff tab) or,
+    /// with the Commits panel focused, the selected commit's.
+    pub fn diff_data(&self) -> Option<(&FilesData, usize)> {
+        if self.dk() == Some(PK::Commits) {
+            let c = self.selected_in(self.focus)?;
+            return match self.cache.get(&(c.key(), Tab::Diff))? {
+                Load::Done(Ok(Data::Files(fd))) => Some((fd, self.cfile)),
+                _ => None,
+            };
+        }
+        match self.data()? {
+            Data::Files(fd) => Some((fd, self.file())),
+            _ => None,
+        }
+    }
+
+    pub fn diff_active(&self) -> bool {
+        self.cur_tab() == Tab::Diff || self.dk() == Some(PK::Commits)
+    }
+
     fn row_len(&self) -> usize {
         match self.data() {
             Some(Data::Checks(c)) => c.len(),
             Some(Data::Comments(e)) => e.len(),
-            Some(Data::Files(fd)) => fd.files.get(self.file()).map_or(0, |f| {
-                if self.eff_split.get() {
-                    diff::split(&f.lines).len()
-                } else {
-                    f.lines.len()
-                }
+            _ => self.diff_data().map_or(0, |(fd, fi)| {
+                fd.files.get(fi).map_or(0, |f| {
+                    if self.eff_split.get() {
+                        diff::split(&f.lines).len()
+                    } else {
+                        f.lines.len()
+                    }
+                })
             }),
-            _ => 0,
         }
     }
 
@@ -761,7 +976,7 @@ impl App {
                         }
                     } else if hit.body.contains(pos) && self.cursor_tab() {
                         let d = self.scroll.get() + (pos.y - hit.body.y) as usize;
-                        let r = if self.cur_tab() == Tab::Diff {
+                        let r = if self.diff_active() {
                             // soft-wrapped rows: display row -> logical row
                             let st = self.row_starts.borrow();
                             st.partition_point(|&s| s <= d).saturating_sub(1)
@@ -783,8 +998,9 @@ impl App {
 
     /// Whether the detail pane has a row cursor (vs plain scrolling).
     fn cursor_tab(&self) -> bool {
-        matches!(self.cur_tab(), Tab::Checks | Tab::Comments | Tab::Diff)
-            && !matches!(self.dk(), Some(PK::Checks | PK::Comments))
+        self.dk() == Some(PK::Commits)
+            || (matches!(self.cur_tab(), Tab::Checks | Tab::Comments | Tab::Diff)
+                && !matches!(self.dk(), Some(PK::Checks | PK::Comments)))
     }
 
     fn set_focus(&mut self, i: usize) {
@@ -898,18 +1114,18 @@ impl App {
             KeyCode::Esc if self.detail_focus => self.detail_focus = false,
             KeyCode::Esc if self.ctx.is_some() => self.exit_ctx(),
             KeyCode::Esc => self.filter.clear(),
-            KeyCode::Char('w') if self.cur_tab() == Tab::Diff => self.wrap = !self.wrap,
+            KeyCode::Char('w') if self.diff_active() => self.wrap = !self.wrap,
             KeyCode::Char('v') if self.cur_tab() == Tab::Diff => self.toggle_viewed(),
             KeyCode::Char('l') | KeyCode::Right if self.selected().is_some() => {
                 self.detail_focus = true
             }
             KeyCode::Char('h') | KeyCode::Left => self.detail_focus = false,
-            KeyCode::Char('t') if self.cur_tab() == Tab::Diff => {
+            KeyCode::Char('t') if self.diff_active() => {
                 (self.mode, self.row) = (self.mode.next(), 0);
                 self.scroll.set(0);
             }
-            KeyCode::Char('n') if self.cur_tab() == Tab::Diff => self.file_step(1),
-            KeyCode::Char('p') if self.cur_tab() == Tab::Diff => self.file_step(-1),
+            KeyCode::Char('n') if self.diff_active() => self.file_step(1),
+            KeyCode::Char('p') if self.diff_active() => self.file_step(-1),
             KeyCode::Char('j') | KeyCode::Down => self.nav(1),
             KeyCode::Char('k') | KeyCode::Up => self.nav(-1),
             KeyCode::Char('d') | KeyCode::Char('u') if ctrl && self.comment_rows() => {
@@ -948,7 +1164,8 @@ impl App {
                     } else {
                         f.lines.get(self.row).and_then(diff::DLine::anchor)
                     };
-                    sel.inline = anchor.map(|(l, side)| (fd.sha.clone(), f.path.clone(), l, side));
+                    sel.inline =
+                        anchor.map(|(l, side)| (fd.sha.clone(), f.raw_path.clone(), l, side));
                 }
             }
             _ => {}
@@ -1000,6 +1217,8 @@ impl App {
             Act::Actions => self.open_menu(None),
             Act::Approve => self.open_menu(Some("Approve")),
             Act::Comment => self.open_menu(Some("Comment on")),
+            // on a Comments tab with unloaded pages, `m` loads the next page instead
+            Act::Merge if self.comments_pending() => self.load_more(true),
             Act::Merge => self.open_menu(Some("Merge")),
             Act::CommandLog => self.show_log = !self.show_log,
             Act::Open => self.open(),
@@ -1214,27 +1433,50 @@ impl App {
     }
 
     fn file_step(&mut self, d: isize) {
-        let Some(Data::Files(fd)) = self.data() else {
+        let Some((fd, fi)) = self.diff_data() else {
             return;
         };
-        let n = fd.files.len().saturating_sub(1);
-        self.set_file(step(self.file(), d, n));
+        let to = step(fi, d, fd.files.len().saturating_sub(1));
+        if self.dk() == Some(PK::Commits) {
+            self.cfile = to;
+        } else {
+            self.set_file(to);
+        }
         self.row = 0;
         self.scroll.set(0);
     }
 
+    /// Head sha of the PR whose Files are loaded (the viewed marks are tied to it).
+    fn head_sha(&self) -> Option<(&Item, &str)> {
+        let pr = self.pr_item()?;
+        match self.cache.get(&(pr.key(), Tab::Diff))? {
+            Load::Done(Ok(Data::Files(fd))) => Some((pr, fd.sha.as_str())),
+            _ => None,
+        }
+    }
+
+    pub fn is_viewed(&self, path: &str) -> bool {
+        self.head_sha().is_some_and(|(pr, sha)| {
+            self.viewed
+                .is_viewed(&Viewed::key(&pr.repo, pr.number), sha, path)
+        })
+    }
+
     fn toggle_viewed(&mut self) {
-        let k = match (self.data(), self.pr_item()) {
-            (Some(Data::Files(fd)), Some(pr)) => fd
-                .files
-                .get(self.file())
-                .map(|f| (pr.key(), f.path.clone())),
+        let target = match (self.head_sha(), self.data()) {
+            (Some((pr, sha)), Some(Data::Files(fd))) => fd.files.get(self.file()).map(|f| {
+                (
+                    Viewed::key(&pr.repo, pr.number),
+                    sha.to_string(),
+                    f.path.clone(),
+                )
+            }),
             _ => None,
         };
-        if let Some(k) = k
-            && !self.viewed.remove(&k)
+        if let Some((key, sha, path)) = target
+            && let Err(e) = self.viewed.toggle(&key, &sha, &path)
         {
-            self.viewed.insert(k);
+            self.status = e;
         }
     }
 
@@ -1245,6 +1487,7 @@ impl App {
         };
         let ctx_panels = vec![
             Panel::new(PK::Files, "Files", &[]),
+            Panel::new(PK::Commits, "Commits", &[]),
             Panel::new(PK::Checks, "Checks", &[]),
             Panel::new(PK::Comments, "Comments", &[]),
         ];
