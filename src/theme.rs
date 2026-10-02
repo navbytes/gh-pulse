@@ -26,6 +26,10 @@ pub struct Icons {
     pub dot: &'static str,
     /// Middle-ellipsis glyph.
     pub ell: &'static str,
+    pub fav: &'static str,
+    pub hidden: &'static str,
+    pub up: &'static str,
+    pub down: &'static str,
     pub spin: &'static [&'static str],
 }
 
@@ -46,6 +50,10 @@ impl Icons {
                 viewed: "v",
                 dot: "-",
                 ell: "~",
+                fav: "*",
+                hidden: "x",
+                up: "^",
+                down: "v",
                 spin: &["|", "/", "-", "\\"],
             },
             IconSet::Unicode => Icons {
@@ -62,6 +70,10 @@ impl Icons {
                 viewed: "✓",
                 dot: "·",
                 ell: "…",
+                fav: "★",
+                hidden: "⊘",
+                up: "▲",
+                down: "▼",
                 spin: &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
             },
             IconSet::Nerd => Icons {
@@ -78,6 +90,10 @@ impl Icons {
                 viewed: "\u{f00c}",
                 dot: "·",
                 ell: "…",
+                fav: "\u{f005}",
+                hidden: "\u{f070}",
+                up: "▲",
+                down: "▼",
                 spin: &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
             },
         }
@@ -96,6 +112,10 @@ pub struct Theme {
     pub merged: Color,
     pub hunk: Color,
     pub hunk_bg: Color,
+    pub code_bg: Color,
+    pub quote: Color,
+    pub link: Color,
+    pub ascii: bool,
     pub add_bg: Color,
     pub del_bg: Color,
     pub add_bg2: Color,
@@ -122,6 +142,10 @@ impl Theme {
             merged: Color::Reset,
             hunk: Color::Reset,
             hunk_bg: Color::Reset,
+            code_bg: Color::Reset,
+            quote: Color::Reset,
+            link: Color::Reset,
+            ascii: icons == IconSet::Ascii,
             add_bg: Color::Reset,
             del_bg: Color::Reset,
             add_bg2: Color::Reset,
@@ -142,6 +166,9 @@ impl Theme {
         t.warn = t.rgb(p((229, 192, 90), (170, 120, 0)));
         t.merged = t.rgb(p((176, 126, 230), (130, 70, 190)));
         t.hunk = t.rgb(p((110, 170, 230), (30, 100, 180)));
+        t.code_bg = t.rgb(p((34, 38, 50), (236, 239, 244)));
+        t.quote = t.rgb(p((150, 156, 172), (95, 100, 115)));
+        t.link = t.rgb(p((110, 170, 230), (30, 100, 180)));
         t.hunk_bg = t.rgb(p((30, 40, 62), (228, 236, 250)));
         t.add_bg = t.rgb(p((22, 42, 31), (230, 246, 233)));
         t.del_bg = t.rgb(p((54, 28, 33), (253, 234, 234)));

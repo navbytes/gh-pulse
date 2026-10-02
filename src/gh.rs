@@ -497,45 +497,46 @@ pub struct Check {
     pub completed_at: Option<String>,
 }
 
-#[derive(Deserialize, Default, Debug)]
-#[serde(default, rename_all = "camelCase")]
-struct Cm {
-    author: Option<Author>,
-    body: String,
-    created_at: String,
-    state: String,
-    submitted_at: String,
-}
-
+/// Only the path is needed here (per-file thread counts for the Files panel).
 #[derive(Deserialize, Default, Debug)]
 #[serde(default)]
-struct RawComments {
-    comments: Vec<Cm>,
-    reviews: Vec<Cm>,
-}
-
-#[derive(Deserialize, Default, Debug)]
-#[serde(default, rename_all = "camelCase")]
 pub struct Thread {
-    id: String,
-    is_resolved: bool,
-    is_outdated: bool,
-    path: String,
-    line: Option<u32>,
-    comments: Nodes,
+    pub path: String,
 }
 
-#[derive(Deserialize, Default, Debug)]
-struct Nodes {
-    nodes: Vec<Cm>,
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reaction {
+    /// GitHub's enum name, e.g. THUMBS_UP.
+    pub content: String,
+    pub count: u32,
+    pub users: Vec<String>,
+}
+
+/// One comment as shown in the Comments tab: author, standing, age, edits, reactions, replies.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Card {
+    pub author: String,
+    /// authorAssociation: OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR, NONE, ...
+    pub role: String,
+    pub when: String,
+    pub edited: bool,
+    /// Review state (APPROVED, ...) or `path:line` for a thread.
+    pub badge: String,
+    pub resolved: bool,
+    pub outdated: bool,
+    pub body: String,
+    pub reactions: Vec<Reaction>,
+    pub replies: Vec<Card>,
 }
 
 /// A selectable block in the Comments tab.
 pub struct Entry {
+    /// One-line label for the Comments panel.
     pub head: String,
     pub body: String,
     pub resolved: bool,
     pub thread: Option<String>,
+    pub card: Card,
 }
 
 pub struct FilesData {
@@ -554,10 +555,6 @@ pub enum Data {
     Text(Vec<String>),
 }
 
-fn who(a: &Option<Author>) -> &str {
-    a.as_ref().map_or("ghost", |a| &a.login)
-}
-
 fn day(s: &str) -> &str {
     s.get(..10).unwrap_or(s)
 }
@@ -568,61 +565,144 @@ pub fn parse_threads(graphql: &str) -> Result<Vec<Thread>, String> {
     serde_json::from_value(nodes.cloned().unwrap_or_default()).map_err(|e| e.to_string())
 }
 
-pub fn entries(comments_json: &str, threads: Vec<Thread>) -> Result<Vec<Entry>, String> {
-    let raw: RawComments = json(comments_json)?;
+fn card_from(n: &Value) -> Card {
+    let s = |k: &str| n[k].as_str().unwrap_or("").to_string();
+    let reactions = n["reactionGroups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|g| {
+            let count = g["users"]["totalCount"].as_u64().unwrap_or(0) as u32;
+            (count > 0).then(|| Reaction {
+                content: g["content"].as_str().unwrap_or("").to_string(),
+                count,
+                users: g["users"]["nodes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|u| u["login"].as_str().map(str::to_string))
+                    .collect(),
+            })
+        })
+        .collect();
+    Card {
+        author: n["author"]["login"].as_str().unwrap_or("ghost").to_string(),
+        role: s("authorAssociation"),
+        when: if n["createdAt"].is_string() {
+            s("createdAt")
+        } else {
+            s("submittedAt")
+        },
+        edited: n["lastEditedAt"].is_string(),
+        body: s("body"),
+        reactions,
+        ..Default::default()
+    }
+}
+
+/// Entries for the Comments tab from the `COMMENTS_Q` GraphQL response.
+pub fn parse_comments(graphql: &str, pr: bool) -> Result<Vec<Entry>, String> {
+    let v: Value = json(graphql)?;
+    if let Some(e) = v["errors"][0]["message"].as_str() {
+        return Err(e.to_string());
+    }
+    let root = &v["data"]["repository"][if pr { "pullRequest" } else { "issue" }];
+    let nodes = |k: &str| root[k]["nodes"].as_array().cloned().unwrap_or_default();
     let mut out = vec![];
-    for c in raw.comments {
-        let head = format!("comment by {} on {}", who(&c.author), day(&c.created_at));
+    for n in nodes("comments") {
+        let card = card_from(&n);
+        let head = format!("comment by {} on {}", card.author, day(&card.when));
         out.push(Entry {
             head,
-            body: c.body,
+            body: card.body.clone(),
             resolved: false,
             thread: None,
+            card,
         });
     }
-    for r in raw
-        .reviews
-        .into_iter()
-        .filter(|r| !r.body.is_empty() || r.state != "COMMENTED")
-    {
+    for n in nodes("reviews") {
+        let mut card = card_from(&n);
+        card.badge = n["state"].as_str().unwrap_or("").to_string();
+        if card.body.is_empty() && card.badge == "COMMENTED" {
+            continue; // the inline comments of this review show up as threads
+        }
         let head = format!(
             "review {} by {} on {}",
-            r.state,
-            who(&r.author),
-            day(&r.submitted_at)
+            card.badge,
+            card.author,
+            day(&card.when)
         );
         out.push(Entry {
             head,
-            body: r.body,
+            body: card.body.clone(),
             resolved: false,
             thread: None,
+            card,
         });
     }
-    for t in threads {
-        let line = t.line.map(|l| format!(":{l}")).unwrap_or_default();
-        let flags = [(t.is_resolved, " resolved"), (t.is_outdated, " outdated")]
+    for t in nodes("reviewThreads") {
+        let mut it = t["comments"]["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(card_from);
+        let Some(mut card) = it.next() else { continue };
+        card.replies = it.collect();
+        let line = t["line"]
+            .as_u64()
+            .map(|l| format!(":{l}"))
+            .unwrap_or_default();
+        let path = t["path"].as_str().unwrap_or("");
+        (card.resolved, card.outdated) = (t["isResolved"] == true, t["isOutdated"] == true);
+        card.badge = format!("{path}{line}");
+        let flags = [(card.resolved, " resolved"), (card.outdated, " outdated")]
             .iter()
             .filter(|f| f.0)
             .map(|f| f.1)
             .collect::<String>();
-        let body = t
-            .comments
-            .nodes
-            .iter()
-            .map(|c| format!("{}: {}", who(&c.author), c.body))
-            .collect::<Vec<_>>()
-            .join("\n\n");
         out.push(Entry {
-            head: format!("thread {}{line}{flags}", t.path),
-            body,
-            resolved: t.is_resolved,
-            thread: Some(t.id),
+            head: format!("thread {}{flags}", card.badge),
+            body: card.body.clone(),
+            resolved: card.resolved,
+            thread: t["id"].as_str().map(str::to_string),
+            card,
         });
     }
     Ok(out)
 }
 
-fn epoch(s: &str) -> Option<i64> {
+const CARD_FIELDS: &str = "author{login} authorAssociation lastEditedAt body reactionGroups{content users(first:10){totalCount nodes{login}}}";
+
+fn comments_query(pr: bool) -> String {
+    let c = CARD_FIELDS;
+    let body = if pr {
+        format!(
+            "pullRequest(number:$p){{comments(first:100){{nodes{{createdAt {c}}}}} reviews(first:100){{nodes{{state submittedAt {c}}}}} reviewThreads(first:100){{nodes{{id isResolved isOutdated path line comments(first:50){{nodes{{createdAt {c}}}}}}}}}}}"
+        )
+    } else {
+        format!("issue(number:$p){{comments(first:100){{nodes{{createdAt {c}}}}}}}")
+    };
+    format!("query($o:String!,$n:String!,$p:Int!){{repository(owner:$o,name:$n){{{body}}}}}")
+}
+
+fn fetch_comments(repo: &str, n: &str, pr: bool) -> Result<Vec<Entry>, String> {
+    let (owner, name) = repo.split_once('/').ok_or("bad repo")?;
+    let out = gh([
+        "api",
+        "graphql",
+        "-f",
+        &format!("query={}", comments_query(pr)),
+        "-f",
+        &format!("o={owner}"),
+        "-f",
+        &format!("n={name}"),
+        "-F",
+        &format!("p={n}"),
+    ])?;
+    parse_comments(&out, pr)
+}
+
+pub fn epoch(s: &str) -> Option<i64> {
     let n = |a, b| s.get(a..b)?.parse::<i64>().ok();
     let (y, m, d) = (n(0, 4)?, n(5, 7)?, n(8, 10)?);
     let y = if m <= 2 { y - 1 } else { y };
@@ -705,14 +785,11 @@ pub fn detail(repo: &str, it: &Item, tab: Tab) -> Result<Data, String> {
                 Err(_) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
             }
         }
-        (Kind::Pr | Kind::Issue, Tab::Comments) => {
-            let pr = it.kind == Kind::Pr;
-            let view = if pr { "pr" } else { "issue" };
-            let fields = if pr { "comments,reviews" } else { "comments" };
-            let j = gh([view, "view", &n, "-R", repo, "--json", fields])?;
-            let threads = if pr { threads(repo, &n)? } else { vec![] };
-            Ok(Data::Comments(entries(&j, threads)?))
-        }
+        (Kind::Pr | Kind::Issue, Tab::Comments) => Ok(Data::Comments(fetch_comments(
+            repo,
+            &n,
+            it.kind == Kind::Pr,
+        )?)),
         (Kind::Pr, Tab::Diff) => {
             let sha = gh([
                 "pr",
@@ -1084,23 +1161,51 @@ mod tests {
     }
 
     #[test]
-    fn parses_threads_and_entries() {
+    fn parses_threads_for_counts() {
         let t = parse_threads(include_str!("../tests/threads.json")).unwrap();
         assert_eq!(t.len(), 1);
-        let comments = r#"{"comments":[{"author":{"login":"a"},"body":"hi","createdAt":"2026-01-02T00:00:00Z"}],
-            "reviews":[{"author":{"login":"b"},"body":"","state":"APPROVED","submittedAt":"2026-01-03T00:00:00Z"},
-                       {"author":{"login":"c"},"body":"","state":"COMMENTED","submittedAt":"2026-01-03T00:00:00Z"}]}"#;
-        let e = entries(comments, t).unwrap();
+        assert_eq!(t[0].path, "src/x.rs");
+    }
+
+    #[test]
+    fn parses_comment_cards() {
+        let e = parse_comments(include_str!("../tests/comments.json"), true).unwrap();
         let heads: Vec<_> = e.iter().map(|e| e.head.as_str()).collect();
         assert_eq!(
             heads,
             [
-                "comment by a on 2026-01-02",
-                "review APPROVED by b on 2026-01-03",
-                "thread src/x.rs:12 resolved"
-            ]
+                "comment by octocat on 2026-01-02",
+                "review APPROVED by hubot on 2026-01-03",
+                "thread src/x.rs:12 resolved outdated"
+            ],
+            "empty COMMENTED reviews are skipped"
         );
-        assert!(e[2].resolved && e[2].body.contains("alice: nit"));
+        let c = &e[0].card;
+        assert_eq!(
+            (c.role.as_str(), c.edited, c.body.as_str()),
+            ("OWNER", true, "Looks **good**")
+        );
+        assert_eq!(c.reactions.len(), 2, "zero-count groups are dropped");
+        assert_eq!(
+            (c.reactions[0].content.as_str(), c.reactions[0].count),
+            ("THUMBS_UP", 3)
+        );
+        assert_eq!(c.reactions[0].users, ["hubot", "monalisa"]);
+        let t = &e[2];
+        assert!(t.resolved && t.thread.as_deref() == Some("PRRT_1"));
+        assert_eq!(
+            (t.card.author.as_str(), t.card.badge.as_str()),
+            ("alice", "src/x.rs:12")
+        );
+        assert_eq!(t.card.replies.len(), 1);
+        assert_eq!(
+            t.card.replies[0].author, "ghost",
+            "deleted users render as ghost"
+        );
+        let issue = parse_comments(r#"{"data":{"repository":{"issue":{"comments":{"nodes":[{"author":{"login":"a"},"authorAssociation":"NONE","createdAt":"2026-02-01T00:00:00Z","lastEditedAt":null,"body":"hi","reactionGroups":[]}]}}}}}"#, false).unwrap();
+        assert_eq!(issue.len(), 1);
+        assert!(!issue[0].card.edited);
+        assert!(parse_comments(r#"{"errors":[{"message":"nope"}]}"#, true).is_err());
     }
 
     #[test]

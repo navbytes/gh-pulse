@@ -14,6 +14,9 @@ gh-pulse is a single binary: a synchronous ratatui event loop that talks to GitH
 | `src/act.rs` | Mutations as data: `Action` = label + optional prompt + `build(text) -> argv` |
 | `src/diff.rs` | Unified-diff parser, split-row builder, word-partner pairing, `wrap_ranges`, layout mode |
 | `src/syn.rs` | Optional syntect highlighter (feature `syntax`); a no-op stub otherwise |
+| `src/config.rs` | `config.toml` model, validation with line numbers, atomic save, the named-action `Keymap` |
+| `src/browse.rs` | Repo browser: GraphQL page parser, filter/sort/favorite/hide logic, browser key handling |
+| `src/md.rs` | Markdown to styled, wrapped lines (pulldown-cmark): headings, code, quotes, lists, tables, folding of `<details>` and long comments |
 | `src/theme.rs` | Palettes, icon sets, color depth fallback, locale/truecolor detection |
 
 ## Data flow
@@ -40,7 +43,7 @@ Every async result carries the generation it was requested in; mismatches are dr
 - Each panel has a `seq` bumped on every reload; `Msg::List` carries it (plus the list tab).
 - `dgen` is bumped whenever the detail cache is cleared or the repo scope changes; `Msg::Detail` and `Msg::Log`
   carry it (a log must also still belong to the selected item).
-- `repos_seq` does the same for the repo switcher.
+- `repos_seq` does the same for the repo browser's paged load (each page is a message; stale loads are dropped).
 
 ## Safety and confirm design
 
@@ -56,6 +59,7 @@ log shown with `L`.
 - Left column: focused panel expands; on short terminals the rest collapse to one borderless line.
 - Diff: logical rows have display heights (soft-wrap); the scroll offset is in display rows, and
   `App.row_starts` maps clicks back to logical rows. Highlighting (syntect) is incremental and cached per file.
+- Scrolling a selection taller than the pane (an expanded comment) keeps the view inside that selection; snapping to its end and back on alternate frames once made the pane flicker and tear (regression test `tall_expanded_comment_is_stable_and_pageable`).
 - Colors all come from `Theme`; `Reset` is used for body text so light and dark terminals both work.
 
 ## Testing

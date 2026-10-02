@@ -1,6 +1,9 @@
 use crate::app::{App, Hit, Load, Modal, PK};
+use crate::browse::{self, Browser};
+use crate::config::Act;
 use crate::diff::{self, DLine, DiffMode, Op, Row};
 use crate::gh::{self, Data, FilesData, Item, Kind, LIMIT, Tab};
+use crate::md::slice_spans;
 use crate::syn::Hl;
 use crate::theme::Theme;
 use ratatui::{
@@ -11,29 +14,55 @@ use ratatui::{
 const MIN_W: u16 = 50;
 const MIN_H: u16 = 12;
 
-const HELP: &str = "\
+/// The `?` text. Remappable actions show whatever keys the active keymap gives them.
+fn help_text(app: &App) -> String {
+    let k = |a: Act| app.keys.labels(a);
+    format!(
+        "\
 Panels (Status, Pull requests, Files, Issues, Actions, Branches, Releases, Notifications)
-  1-8, Tab/S-Tab  focus panel      { }  switch the panel's list tab (Mine/Review/...)
+  1-8, Tab/S-Tab  focus panel      {{ }}  switch the panel's list tab (Mine/Review/...)
   j/k, arrows     move             Ctrl-d/u  half page     g/G or Home/End  top/bottom
-  /  filter (Enter apply, Esc clear)
+  {filter}  filter (Enter apply, Esc clear)
   l/Right         focus the detail pane   h/Esc/Left  back to the list
-  G  (PR/Issues/... list focus) toggle global view; in Files and PR drill-in it jumps to the last row
-  Ctrl-r  switch repo
+  {global}  (PR/Issues/... list focus) toggle global view; in Files and PR drill-in it jumps to the last row
+  {browser}  repo browser: all your repos (search, sort, favorite, hide, Enter switches)
 Pull requests
   Files panel follows the selected PR; j/k there changes the file shown in the diff
   Enter on a PR drills in: Files / Checks / Comments of that PR (Esc returns)
   [ ]  detail tab (Overview/Checks/Comments/Diff); in a PR drill-in: next/prev panel
 Diff
   j/k line   Ctrl-d/u half page   g/G first/last row   n/p file   t unified/split/auto
-  w wrap/clip   v mark file viewed   f zoom
+  w wrap/clip   v mark file viewed   {zoom} zoom
+Comments
+  j/k move by comment   Ctrl-d/u half page (inside a tall comment first)
+  Enter  expand/collapse (long comments, <details>)   e  show who reacted
 Actions (always asks to confirm, shows the exact command)
-  x  action menu for the selected item / row    a approve  C comment  m merge
+  {actions}  action menu for the selected item / row    {approve} approve  {comment} comment  {merge} merge
   Input popups: Enter newline, Ctrl-S submit, Esc cancel
 Mouse: click panel/row/tab, wheel scrolls
 Anywhere
-  o  open in browser    y  copy URL    c  checkout selected PR
-  r  refresh panel      R  refresh all    L  command log
-  ?  this help    q  quit";
+  {open}  open in browser    {copy}  copy URL    {checkout}  checkout selected PR
+  {refresh}  refresh panel      {refresh_all}  refresh all    {log}  command log
+  {help}  this help    {quit}  quit
+(remap the keys marked above in config.toml, see docs/configuration.md)",
+        filter = k(Act::Filter),
+        global = k(Act::Global),
+        browser = k(Act::Browser),
+        zoom = k(Act::Zoom),
+        actions = k(Act::Actions),
+        approve = k(Act::Approve),
+        comment = k(Act::Comment),
+        merge = k(Act::Merge),
+        open = k(Act::Open),
+        copy = k(Act::CopyUrl),
+        checkout = k(Act::Checkout),
+        refresh = k(Act::Refresh),
+        refresh_all = k(Act::RefreshAll),
+        log = k(Act::CommandLog),
+        help = k(Act::Help),
+        quit = k(Act::Quit),
+    )
+}
 
 pub fn draw(f: &mut Frame, app: &App) {
     let th = &app.theme;
@@ -52,6 +81,9 @@ pub fn draw(f: &mut Frame, app: &App) {
             r,
         );
         return;
+    }
+    if let Some(b) = &app.browser {
+        return browser_view(f, app, b, area);
     }
     let log_h = if app.show_log && area.height >= 24 {
         8
@@ -131,7 +163,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 fn help_lines(app: &App, w: usize) -> Vec<Line<'static>> {
     let th = &app.theme;
     let mut out = vec![];
-    for l in HELP.lines() {
+    for l in help_text(app).lines() {
         let indent = l.len() - l.trim_start().len();
         if indent == 0 {
             out.push(Line::styled(
@@ -154,7 +186,8 @@ fn help_lines(app: &App, w: usize) -> Vec<Line<'static>> {
 
 /// Sized to the longest line (up to the terminal), wrapping or scrolling (j/k) when it doesn't fit.
 fn help_popup(f: &mut Frame, app: &App, area: Rect) {
-    let longest = HELP.lines().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
+    let text = help_text(app);
+    let longest = text.lines().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
     let w = (longest + 4).min(area.width.saturating_sub(2)).max(20);
     let inner_w = w.saturating_sub(2) as usize;
     let lines = help_lines(app, inner_w);
@@ -230,6 +263,157 @@ fn file_label(app: &App, it: &Item, w: usize) -> Line<'static> {
     Line::from(v)
 }
 
+/// Full-screen repository browser.
+fn browser_view(f: &mut Frame, app: &App, b: &Browser, area: Rect) {
+    use ratatui::widgets::{Cell, Row as TRow, Table, TableState};
+    let th = &app.theme;
+    let cfg = &app.cfg.repos;
+    let vis = b.visible(cfg);
+    let [head, search, body, foot] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+
+    let more = if b.truncated { "+" } else { "" };
+    let dir = if b.desc { th.ic.down } else { th.ic.up };
+    let mut h = vec![
+        Span::styled(" Repositories ", Style::new().fg(th.accent).bold()),
+        Span::styled(
+            format!("{} of {}{more}", vis.len(), b.rows.len()),
+            Style::new().fg(th.muted),
+        ),
+    ];
+    if b.loading {
+        h.push(Span::styled(
+            format!("  {} loading {}...", spinner(app), b.rows.len()),
+            Style::new().fg(th.muted),
+        ));
+    }
+    h.push(Span::styled(
+        format!(
+            "   sort: {} {dir}   type: {}   hidden: {}",
+            b.sort.label(),
+            b.ty.label(),
+            if b.show_hidden { "shown" } else { "off" }
+        ),
+        Style::new().fg(th.muted),
+    ));
+    f.render_widget(Paragraph::new(Line::from(h)), head);
+
+    let cursor = if b.typing { "_" } else { "" };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " / ",
+                Style::new().fg(if b.typing { th.accent } else { th.muted }),
+            ),
+            Span::raw(format!("{}{cursor}", b.query)),
+        ])),
+        search,
+    );
+
+    let hint = if let Some(e) = &b.error {
+        Line::styled(format!(" {} {e}", th.ic.fail), Style::new().fg(th.err))
+    } else if !app.status.is_empty() {
+        Line::styled(format!(" {}", app.status), Style::new().fg(th.warn))
+    } else if b.typing {
+        Line::styled(
+            " type to search   Enter/Esc leave the box   Up/Down move",
+            Style::new().fg(th.muted),
+        )
+    } else {
+        Line::styled(
+            " Enter switch  f favorite  H hide  . hidden  s sort  S direction  T type  / search  r reload  Esc back",
+            Style::new().fg(th.muted),
+        )
+    };
+    f.render_widget(Paragraph::new(hint), foot);
+
+    if vis.is_empty() {
+        let n = if b.loading {
+            Note::Loading
+        } else {
+            Note::Empty("no repositories match")
+        };
+        return f.render_widget(Paragraph::new(note(app, n)), body);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let w = body.width;
+    let (show_lang, show_counts) = (w >= 90, w >= 70);
+    let mut widths = vec![
+        Constraint::Length(2),
+        Constraint::Min(16),
+        Constraint::Length(4),
+        Constraint::Length(2),
+    ];
+    if show_lang {
+        widths.push(Constraint::Length(12));
+    }
+    widths.extend([Constraint::Length(6), Constraint::Length(5)]);
+    if show_counts {
+        widths.extend([Constraint::Length(4), Constraint::Length(4)]);
+    }
+    let muted = Style::new().fg(th.muted);
+    let mut hdr = vec!["", "name", "vis", ""];
+    if show_lang {
+        hdr.push("language");
+    }
+    hdr.extend(["stars", "push"]);
+    if show_counts {
+        hdr.extend(["PR", "iss"]);
+    }
+    let header = TRow::new(hdr.into_iter().map(|c| Cell::from(Span::styled(c, muted))));
+    let rows = vis.iter().map(|&i| {
+        let r = &b.rows[i];
+        let hidden = cfg.is_hidden(&r.name);
+        let mark = if hidden {
+            Span::styled(th.ic.hidden, muted)
+        } else if cfg.is_fav(&r.name) {
+            Span::styled(th.ic.fav, Style::new().fg(th.warn))
+        } else {
+            Span::raw(" ")
+        };
+        let base = if hidden { muted } else { Style::new() };
+        let flags = format!(
+            "{}{}",
+            if r.fork { "F" } else { "" },
+            if r.archived { "A" } else { "" }
+        );
+        let vis_c = if r.private {
+            Span::styled("priv", Style::new().fg(th.warn))
+        } else {
+            Span::styled("pub", muted)
+        };
+        let mut cells = vec![
+            Cell::from(mark),
+            Cell::from(Span::styled(r.name.clone(), base)),
+            Cell::from(vis_c),
+            Cell::from(Span::styled(flags, muted)),
+        ];
+        if show_lang {
+            cells.push(Cell::from(Span::styled(r.lang.clone(), muted)));
+        }
+        cells.push(Cell::from(Span::styled(r.stars.to_string(), base)));
+        cells.push(Cell::from(Span::styled(browse::ago(&r.pushed, now), muted)));
+        if show_counts {
+            cells.push(Cell::from(Span::styled(r.prs.to_string(), base)));
+            cells.push(Cell::from(Span::styled(r.issues.to_string(), base)));
+        }
+        TRow::new(cells)
+    });
+    let table = Table::new(rows, widths)
+        .header(header)
+        .column_spacing(1)
+        .row_highlight_style(Style::new().bg(th.sel_bg).bold());
+    let mut st = TableState::default().with_selected(Some(b.cursor.min(vis.len() - 1)));
+    f.render_stateful_widget(table, body, &mut st);
+}
+
 fn spinner(app: &App) -> &'static str {
     let s = app.theme.ic.spin;
     s[app.tick / 2 % s.len()]
@@ -260,38 +444,51 @@ fn bar_line(app: &App) -> Line<'static> {
 }
 
 fn hints(app: &App) -> String {
+    let kl = |a: Act| app.keys.label(a);
+    let (actions, zoom, filter) = (kl(Act::Actions), kl(Act::Zoom), kl(Act::Filter));
     let flt = if app.filter.is_empty() {
         String::new()
     } else {
         format!("  [filter: {}]", app.filter)
     };
     let ctx = if app.zoom {
-        "j/k move  t mode  w wrap  f/Esc unzoom  h back".to_string()
+        format!("j/k move  t mode  w wrap  {zoom}/Esc unzoom  h back")
     } else if app.log.is_some() {
         "j/k scroll  Ctrl-d/u page  g/G ends  Esc close log".to_string()
     } else if let Some(k) = app.dk().filter(|_| !app.detail_focus) {
         let back = if app.ctx.is_some() { "Esc back  " } else { "" };
         match k {
-            PK::Files if app.ctx.is_none() => {
-                "j/k file  l/Enter diff  [ ] detail tab  v viewed  f zoom  x actions".to_string()
-            }
-            PK::Files => {
-                format!("j/k file  l/Enter diff  v viewed  f zoom  {back}[ ] panel  x actions")
-            }
-            _ => format!("j/k move  l/Enter focus  {back}[ ] panel  x actions"),
+            PK::Files if app.ctx.is_none() => format!(
+                "j/k file  l/Enter diff  [ ] detail tab  v viewed  {zoom} zoom  {actions} actions"
+            ),
+            PK::Files => format!(
+                "j/k file  l/Enter diff  v viewed  {zoom} zoom  {back}[ ] panel  {actions} actions"
+            ),
+            _ => format!("j/k move  l/Enter focus  {back}[ ] panel  {actions} actions"),
         }
     } else if app.detail_focus {
         match app.cur_tab() {
-            Tab::Checks => "j/k move  Enter failed-log  x actions  [ ] tab  h back".into(),
-            Tab::Diff => "j/k line  n/p file  t mode  w wrap  v viewed  f zoom  h back".into(),
-            _ => "j/k scroll  [ ] tab  x actions  h back  o open  y copy".into(),
+            Tab::Checks => {
+                format!("j/k move  Enter failed-log  {actions} actions  [ ] tab  h back")
+            }
+            Tab::Diff => {
+                format!("j/k line  n/p file  t mode  w wrap  v viewed  {zoom} zoom  h back")
+            }
+            _ => format!(
+                "j/k scroll  [ ] tab  {actions} actions  h back  {} open  {} copy",
+                kl(Act::Open),
+                kl(Act::CopyUrl)
+            ),
         }
     } else if app.ctx.is_some() {
         "j/k move".into()
     } else {
-        "j/k move  Enter drill in  [ ] detail tab  { } list tab  / filter  x actions".into()
+        format!(
+            "j/k move  Enter drill in  [ ] detail tab  {{ }} list tab  {filter} filter  {actions} actions  {} repos",
+            kl(Act::Browser)
+        )
     };
-    format!("{ctx}  ? help  q quit{flt}")
+    format!("{ctx}  {} help  {} quit{flt}", kl(Act::Help), kl(Act::Quit))
 }
 
 fn bordered(app: &App, title: String, on: bool) -> Block<'static> {
@@ -527,7 +724,13 @@ fn window(app: &App, h: usize, len: usize, sel: Option<(usize, usize)>) -> usize
     let max = len.saturating_sub(h);
     let mut top = app.scroll.get().min(max);
     if let Some((s, e)) = sel {
-        if s < top {
+        if e + 1 - s > h {
+            // Taller than the pane (an expanded comment): keep the view inside it. Snapping to its
+            // bottom and back to its top on alternate frames made the pane flicker and tear.
+            if top < s || top + h > e + 1 {
+                top = s;
+            }
+        } else if s < top {
             top = s;
         } else if e >= top + h {
             top = e + 1 - h;
@@ -535,6 +738,7 @@ fn window(app: &App, h: usize, len: usize, sel: Option<(usize, usize)>) -> usize
     }
     top = top.min(max);
     app.scroll.set(top);
+    app.view_len.set(len);
     app.view_max.set(max);
     app.view_h.set(h);
     top
@@ -575,16 +779,13 @@ fn derived_detail(f: &mut Frame, app: &App, area: Rect, k: PK) {
             _ => f.render_widget(Paragraph::new(note(app, Note::Loading)), inner),
         }
     } else {
-        let th = &app.theme;
-        let mut lines = vec![
-            Line::styled(it.title.clone(), Style::new().fg(th.accent).bold()),
-            Line::raw(""),
-        ];
-        lines.extend(
-            wrap(&it.body, inner.width as usize)
-                .into_iter()
-                .map(Line::raw),
-        );
+        let cur = app.panels[app.focus].cursor;
+        let lines = match app.data() {
+            Some(Data::Comments(e)) if cur < e.len() => {
+                card_lines(app, &e[cur], cur, inner.width as usize, false)
+            }
+            _ => vec![Line::raw(it.body.clone())],
+        };
         pane(f, app, inner, lines, None)
     }
 }
@@ -683,30 +884,21 @@ fn detail(f: &mut Frame, app: &App, area: Rect) {
             pane(f, app, inner, lines, Some((app.row, app.row)))
         }
         (Tab::Comments, Some(Data::Comments(e))) => {
-            let (mut lines, mut sel) = (vec![], (0, 0));
+            let (mut lines, mut sel, mut starts) = (vec![], (0, 0), vec![]);
             for (i, en) in e.iter().enumerate() {
                 let start = lines.len();
+                starts.push(start);
                 let on = i == app.row;
-                let head = format!("{}{}", if on { "> " } else { "  " }, en.head);
-                let col = if en.resolved { th.muted } else { th.accent };
-                let mut h = Line::styled(head, Style::new().fg(col).bold());
-                if on {
-                    h = h.style(sel_style);
-                }
-                lines.push(h);
-                lines.extend(
-                    wrap(&en.body, w.saturating_sub(2))
-                        .into_iter()
-                        .map(|s| Line::raw(format!("  {s}"))),
-                );
+                lines.extend(card_lines(app, en, i, w, on));
                 lines.push(Line::raw(""));
                 if on {
                     sel = (start, lines.len() - 1);
                 }
             }
             if lines.is_empty() {
-                lines.push(note(app, Note::Empty("nothing here")));
+                lines.push(note(app, Note::Empty("no comments")));
             }
+            *app.row_starts.borrow_mut() = starts;
             pane(f, app, inner, lines, Some(sel))
         }
         (Tab::Diff, Some(Data::Files(fd))) => diff_view(f, app, fd, inner),
@@ -719,6 +911,250 @@ fn detail(f: &mut Frame, app: &App, area: Rect) {
         }
         _ => {}
     }
+}
+
+fn wrap_spans(spans: Vec<Span<'static>>, w: usize) -> Vec<Vec<Span<'static>>> {
+    let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+    crate::diff::wrap_ranges(&text, w.max(1))
+        .into_iter()
+        .map(|(a, b)| slice_spans(&spans, a, b))
+        .collect()
+}
+
+fn reaction_label(th: &Theme, content: &str) -> &'static str {
+    let (emoji, plain) = match content {
+        "THUMBS_UP" => ("\u{1f44d}", "+1"),
+        "THUMBS_DOWN" => ("\u{1f44e}", "-1"),
+        "LAUGH" => ("\u{1f604}", "laugh"),
+        "HOORAY" => ("\u{1f389}", "hooray"),
+        "CONFUSED" => ("\u{1f615}", "confused"),
+        "HEART" => ("\u{2764}", "heart"),
+        "ROCKET" => ("\u{1f680}", "rocket"),
+        "EYES" => ("\u{1f440}", "eyes"),
+        _ => ("?", "?"),
+    };
+    if th.ascii { plain } else { emoji }
+}
+
+fn lang_ext(lang: &str) -> &str {
+    match lang.to_lowercase().as_str() {
+        "rust" => "rs",
+        "python" | "python3" => "py",
+        "javascript" | "node" => "js",
+        "typescript" => "ts",
+        "bash" | "shell" | "zsh" | "console" => "sh",
+        "yaml" => "yml",
+        "markdown" => "md",
+        "ruby" => "rb",
+        "golang" => "go",
+        "c++" => "cpp",
+        _ => lang,
+    }
+}
+
+/// Code-fence highlighter for comments (a no-op without the `syntax` feature).
+type Segs = Vec<Vec<(Color, String)>>;
+
+fn md_highlighter<'a>(app: &'a App) -> impl Fn(&str, &[String]) -> Option<Segs> + 'a {
+    move |lang, code| {
+        use std::hash::{Hash, Hasher};
+        if lang.is_empty() {
+            return None;
+        }
+        let th = &app.theme;
+        let mut g = app.hl.borrow_mut();
+        let hl = g.get_or_insert_with(|| Hl::new(th.syntect_theme(), th.rgb_fn()));
+        let lines: Vec<DLine> = code
+            .iter()
+            .map(|t| DLine {
+                op: Op::Ctx,
+                old: None,
+                new: None,
+                text: t.clone(),
+            })
+            .collect();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        code.hash(&mut h);
+        let key = format!("md|{lang}|{:x}", h.finish());
+        hl.ensure(&key, &format!("x.{}", lang_ext(lang)), &lines, lines.len());
+        (0..lines.len()).map(|i| hl.get(&key, i).cloned()).collect()
+    }
+}
+
+fn role_label(role: &str) -> Option<&'static str> {
+    Some(match role {
+        "OWNER" => "owner",
+        "MEMBER" => "member",
+        "COLLABORATOR" => "collaborator",
+        "CONTRIBUTOR" => "contributor",
+        "FIRST_TIME_CONTRIBUTOR" | "FIRST_TIMER" => "first-timer",
+        _ => return None,
+    })
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// `author [role] . 3d ago . edited` plus review/thread badges.
+/// `badge` false leaves the review-state / `path:line` badge out (thread paths get their own line).
+fn card_header(app: &App, c: &crate::gh::Card, nested: bool, badge: bool) -> Vec<Span<'static>> {
+    let th = &app.theme;
+    let muted = Style::new().fg(th.muted);
+    let dot = Span::styled(format!(" {} ", th.ic.dot), muted);
+    let mut v = vec![];
+    if nested {
+        v.push(Span::styled(
+            if th.ascii { "> " } else { "\u{21b3} " },
+            muted,
+        ));
+    }
+    v.push(Span::styled(
+        c.author.clone(),
+        Style::new().fg(th.accent).bold(),
+    ));
+    if let Some(r) = role_label(&c.role) {
+        v.push(Span::styled(format!(" [{r}]"), muted));
+    }
+    if badge && !c.badge.is_empty() {
+        let col = match c.badge.as_str() {
+            "APPROVED" => th.ok,
+            "CHANGES_REQUESTED" => th.err,
+            _ => th.warn,
+        };
+        v.push(Span::styled(format!(" {}", c.badge), Style::new().fg(col)));
+    }
+    let ago = crate::browse::ago(&c.when, now_secs());
+    if !ago.is_empty() {
+        v.push(dot.clone());
+        v.push(Span::styled(format!("{ago} ago"), muted));
+    }
+    if c.edited {
+        v.push(dot);
+        v.push(Span::styled("edited", muted.italic()));
+    }
+    for (on, label, col) in [
+        (c.resolved, "resolved", th.ok),
+        (c.outdated, "outdated", th.muted),
+    ] {
+        if on {
+            v.push(Span::styled(format!("  [{label}]"), Style::new().fg(col)));
+        }
+    }
+    v
+}
+
+fn reactions_line(app: &App, c: &crate::gh::Card, open: bool) -> Option<Line<'static>> {
+    let th = &app.theme;
+    if c.reactions.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = c
+        .reactions
+        .iter()
+        .map(|r| {
+            let l = reaction_label(th, &r.content);
+            if open {
+                let more = (r.count as usize).saturating_sub(r.users.len());
+                let extra = if more > 0 {
+                    format!(" +{more}")
+                } else {
+                    String::new()
+                };
+                format!("{l} {}{extra}", r.users.join(", "))
+            } else {
+                format!("{l} {}", r.count)
+            }
+        })
+        .collect();
+    Some(Line::styled(parts.join("  "), Style::new().fg(th.muted)))
+}
+
+/// One comment as a card: header, markdown body, reactions, nested replies. `idx` keys expand state.
+fn card_lines(
+    app: &App,
+    e: &crate::gh::Entry,
+    idx: usize,
+    w: usize,
+    selected: bool,
+) -> Vec<Line<'static>> {
+    let th = &app.theme;
+    let key = (app.selected().map(Item::key).unwrap_or_default(), idx);
+    let (expanded, open) = (app.expanded.contains(&key), app.react_open.contains(&key));
+    let hl = md_highlighter(app);
+    let rail = |on: bool| {
+        Span::styled(
+            if on { "\u{258e}" } else { " " },
+            Style::new().fg(th.accent),
+        )
+    };
+    let body = |text: &str, width: usize| {
+        crate::md::render(
+            text,
+            th,
+            &crate::md::Opts {
+                width,
+                expanded,
+                hl: Some(&hl),
+            },
+        )
+    };
+    let mut out: Vec<Line<'static>> = vec![];
+    let mut push = |indent: usize, spans: Vec<Span<'static>>| {
+        let mut v = vec![rail(selected), Span::raw(" ".repeat(indent))];
+        v.extend(spans);
+        out.push(Line::from(v));
+    };
+    let c = &e.card;
+    let narrow = w.saturating_sub(3).max(1);
+    // Long headers wrap rather than clip, so the time and badges never fall off the edge.
+    for row in wrap_spans(card_header(app, c, false, e.thread.is_none()), narrow) {
+        push(0, row);
+    }
+    if e.thread.is_some() && !c.badge.is_empty() {
+        let path = mid_ellipsis(&c.badge, narrow.saturating_sub(1), th.ic.ell);
+        push(1, vec![Span::styled(path, Style::new().fg(th.warn))]);
+    }
+    let r = body(&c.body, w.saturating_sub(3));
+    let folded = r.folded;
+    for l in r.lines {
+        push(1, l.spans);
+    }
+    if let Some(l) = reactions_line(app, c, open) {
+        push(1, l.spans);
+    }
+    for reply in &c.replies {
+        for row in wrap_spans(
+            card_header(app, reply, true, true),
+            w.saturating_sub(7).max(1),
+        ) {
+            push(3, row);
+        }
+        let rr = body(&reply.body, w.saturating_sub(7));
+        for l in rr.lines {
+            push(5, l.spans);
+        }
+        if let Some(l) = reactions_line(app, reply, open) {
+            push(5, l.spans);
+        }
+    }
+    if folded && !expanded {
+        push(
+            1,
+            vec![Span::styled(
+                "Enter expands",
+                Style::new().fg(th.muted).italic(),
+            )],
+        );
+    }
+    if selected {
+        for l in &mut out {
+            *l = std::mem::take(l).style(Style::new().bg(th.sel_bg));
+        }
+    }
+    out
 }
 
 /// Job lines come with unicode status marks; swap in the active icon set and color them.
@@ -840,7 +1276,17 @@ fn overview(
         v.push(kv("labels", names));
     }
     v.push(Line::raw(""));
-    v.extend(wrap(&it.body, w).into_iter().map(Line::raw));
+    let hl = md_highlighter(app);
+    let body = crate::md::render(
+        &it.body,
+        th,
+        &crate::md::Opts {
+            width: w,
+            expanded: true,
+            hl: Some(&hl),
+        },
+    );
+    v.extend(body.lines);
     v
 }
 
@@ -863,26 +1309,6 @@ fn changed(a: &str, b: &str) -> Option<((usize, usize), (usize, usize))> {
 
 fn slice_chars(s: &str, a: usize, b: usize) -> String {
     s.chars().skip(a).take(b - a).collect()
-}
-
-/// The part of a styled line covering chars [s, e), styles preserved (so word highlights survive wrapping).
-fn slice_spans(spans: &[Span<'static>], s: usize, e: usize) -> Vec<Span<'static>> {
-    let (mut out, mut off) = (vec![], 0);
-    for sp in spans {
-        let n = sp.content.chars().count();
-        let (a, b) = (off.max(s), (off + n).min(e));
-        if a < b {
-            out.push(Span::styled(
-                slice_chars(&sp.content, a - off, b - off),
-                sp.style,
-            ));
-        }
-        off += n;
-        if off >= e {
-            break;
-        }
-    }
-    out
 }
 
 /// Shortens `s` to `w` cells keeping both ends ("src/lo…ng.rs"); the start is never cut off.
@@ -1373,27 +1799,6 @@ fn modal(f: &mut Frame, app: &App) {
             let lines: Vec<Line> = lines.into_iter().map(Line::raw).collect();
             f.render_widget(Paragraph::new(lines).scroll((c.scroll, 0)), area);
         }
-        Modal::Repos(list, i) => {
-            let n = list.as_ref().map_or(1, Vec::len) as u16;
-            let area = popup(
-                f,
-                app,
-                50,
-                n.min(20) + 2,
-                "Switch repo (Enter pick, Esc cancel)",
-            );
-            match list {
-                None => f.render_widget(Paragraph::new(note(app, Note::Loading)), area),
-                Some(l) => {
-                    let list = List::new(l.iter().map(String::as_str)).highlight_style(bar);
-                    f.render_stateful_widget(
-                        list,
-                        area,
-                        &mut ListState::default().with_selected(Some(*i)),
-                    );
-                }
-            }
-        }
     }
 }
 
@@ -1450,11 +1855,32 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
             bucket: "pass".into(),
             ..Default::default()
         }];
+        let card = crate::gh::Card {
+            author: "alice".into(),
+            role: "MEMBER".into(),
+            when: "2026-01-02T00:00:00Z".into(),
+            edited: true,
+            badge: "src/main.rs:1".into(),
+            body: "please **rename** this\n\n- first\n- second\n\n```rust\nlet x = 1;\n```\n"
+                .into(),
+            reactions: vec![crate::gh::Reaction {
+                content: "THUMBS_UP".into(),
+                count: 2,
+                users: vec!["hubot".into(), "monalisa".into()],
+            }],
+            replies: vec![crate::gh::Card {
+                author: "octocat".into(),
+                body: "done, see [diff](https://example.com/d)".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
         let comments = vec![Entry {
             head: "thread src/main.rs:1".into(),
             body: "please rename".into(),
             resolved: false,
             thread: None,
+            card,
         }];
         a.seed(
             pr,
@@ -1643,6 +2069,315 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
             line.chars().take(45).position(|c| c == '+').unwrap()
         };
         assert_eq!(col("notes.md"), col("main.rs"), "{s}");
+    }
+
+    #[test]
+    fn repo_browser_layout() {
+        let mut a = seeded();
+        let page = crate::browse::parse_page(include_str!("../tests/repos.json")).unwrap();
+        let mut b = Browser::new();
+        (b.viewer, b.rows, b.loading) = (page.viewer, page.rows, true);
+        a.browser = Some(b);
+        a.cfg.repos.toggle_fav("friend/shared");
+        a.cfg.repos.toggle_hidden("hello-org/infra");
+        for (w, h) in [(80, 24), (120, 40)] {
+            let s = render_app(&a, w, h);
+            for want in [
+                "Repositories",
+                "4 of 5",
+                "loading 5",
+                "sort: pushed",
+                "octocat/hello-world",
+                "friend/shared",
+                "★",
+                "stars",
+            ] {
+                assert!(s.contains(want), "{w}x{h} missing {want:?}\n{s}");
+            }
+            assert!(
+                !s.contains("hello-org/infra"),
+                "hidden repos are not listed"
+            );
+            assert!(
+                !s.contains("[3] Files"),
+                "full screen: the normal panels are gone"
+            );
+            // favorites first
+            let (fav, other) = (
+                s.find("friend/shared").unwrap(),
+                s.find("octocat/hello-world").unwrap(),
+            );
+            assert!(fav < other, "{s}");
+        }
+        assert!(
+            render_app(&a, 120, 40).contains("language"),
+            "wide terminals add the language column"
+        );
+        assert!(!render_app(&a, 80, 24).contains("language"));
+        key(&mut a, KeyCode::Enter); // leave the search box
+        key(&mut a, KeyCode::Char('.'));
+        let s = render_app(&a, 120, 40);
+        assert!(
+            s.contains("hello-org/infra") && s.contains("⊘") && s.contains("5 of 5"),
+            "{s}"
+        );
+        key(&mut a, KeyCode::Esc);
+        assert!(a.browser.is_none() && render_app(&a, 120, 40).contains("[3] Files"));
+    }
+
+    #[test]
+    fn comments_render_as_markdown_cards() {
+        for (w, h) in [(80, 24), (120, 40)] {
+            let mut a = seeded();
+            key(&mut a, KeyCode::Char(']')); // Checks
+            key(&mut a, KeyCode::Char(']')); // Comments
+            let s = render_app(&a, w, h);
+            for want in [
+                "alice",
+                "[member]",
+                "edited",
+                "ago",
+                "src/main.rs:1",
+                "rename",
+                "\u{2022} first",
+                "\u{2022} second",
+                "let x = 1;",
+                "\u{1f44d}",
+                "octocat",
+                "diff (https://example.com/d)",
+            ] {
+                assert!(s.contains(want), "{w}x{h} missing {want:?}\n{s}");
+            }
+            assert!(
+                !s.contains("**") && !s.contains("```"),
+                "markup is rendered, not shown\n{s}"
+            );
+            assert!(!s.contains("hubot, monalisa"));
+            key(&mut a, KeyCode::Char('l')); // detail focus
+            key(&mut a, KeyCode::Char('e')); // reactions: names
+            assert!(render_app(&a, w, h).contains("hubot, monalisa"), "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn long_comments_collapse_and_enter_expands() {
+        let mut a = seeded();
+        let pr = a.pr_item().cloned().unwrap();
+        let long: String = (0..60).map(|i| format!("para {i}\n\n")).collect();
+        let card = crate::gh::Card {
+            author: "bot".into(),
+            body: long,
+            ..Default::default()
+        };
+        let e = Entry {
+            head: "comment by bot".into(),
+            body: String::new(),
+            resolved: false,
+            thread: None,
+            card,
+        };
+        a.seed(pr, vec![(Tab::Comments, Data::Comments(vec![e]))]);
+        key(&mut a, KeyCode::Enter); // drill in
+        key(&mut a, KeyCode::Char(']')); // Checks
+        key(&mut a, KeyCode::Char(']')); // Comments panel: the thread pane
+        let s = render_app(&a, 100, 40);
+        assert!(
+            s.contains("more lines (Enter to expand)") && !s.contains("para 59"),
+            "{s}"
+        );
+        key(&mut a, KeyCode::Enter);
+        key(&mut a, KeyCode::Char('l'));
+        render_app(&a, 100, 40); // the renderer reports how far the pane can scroll
+        key(&mut a, KeyCode::Char('G'));
+        let s = render_app(&a, 100, 40);
+        assert!(
+            !s.contains("Enter to expand") && s.contains("para 59"),
+            "{s}"
+        );
+    }
+
+    fn tall_card_app(paras: usize) -> App {
+        let mut a = seeded();
+        let pr = a.pr_item().cloned().unwrap();
+        let long: String = (0..paras).map(|i| format!("para{i} words\n\n")).collect();
+        let card = crate::gh::Card {
+            author: "bot".into(),
+            body: long,
+            ..Default::default()
+        };
+        let e = Entry {
+            head: "comment by bot".into(),
+            body: String::new(),
+            resolved: false,
+            thread: None,
+            card,
+        };
+        a.seed(pr, vec![(Tab::Comments, Data::Comments(vec![e]))]);
+        key(&mut a, KeyCode::Char(']'));
+        key(&mut a, KeyCode::Char(']')); // Comments tab
+        key(&mut a, KeyCode::Char('l'));
+        key(&mut a, KeyCode::Enter); // expand
+        a
+    }
+
+    /// Regression: a selected comment taller than the pane used to snap between its top and bottom
+    /// on alternate frames (window() flip-flop), tearing the screen and "losing" text at some sizes.
+    #[test]
+    fn tall_expanded_comment_is_stable_and_pageable() {
+        let mut a = tall_card_app(100);
+        let frames: Vec<String> = (0..4).map(|_| render_app(&a, 140, 45)).collect();
+        assert!(
+            frames.windows(2).all(|w| w[0] == w[1]),
+            "frame changes with no input:\n{}\n---\n{}",
+            frames[0],
+            frames[1]
+        );
+        assert!(
+            frames[0].contains("bot")
+                && frames[0].contains("para0 words")
+                && !frames[0].contains("para90"),
+            "{}",
+            frames[0]
+        );
+        for _ in 0..4 {
+            a.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+            render_app(&a, 140, 45);
+        }
+        let s = render_app(&a, 140, 45);
+        assert_eq!(s, render_app(&a, 140, 45), "stays put after paging");
+        assert!(
+            s.contains("para4") && !s.contains("para0 words"),
+            "Ctrl-d scrolls inside the comment\n{s}"
+        );
+        for _ in 0..4 {
+            a.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+            render_app(&a, 140, 45);
+        }
+        assert!(
+            render_app(&a, 140, 45).contains("para0 words"),
+            "and back up"
+        );
+    }
+
+    #[test]
+    fn card_text_survives_every_pane_width() {
+        let mut a = seeded();
+        let pr = a.pr_item().cloned().unwrap();
+        let body = "> quoted alpha1 beta1 gamma1 delta1 epsilon1 zeta1 eta1 theta1 iota1 kappa1 lambda1\n>\n> second2 paragraph2 inside3 quote3 with `inline4 code4` and more5 words5\n\n- item6 one6 two6 three6 four6 five6 six6 seven6 eight6 nine6 ten6\n- [x] task7 item7 with8 words8 that9 wrap9 around9 the10 pane10\n\n| head11 | other11 |\n|---|---|\n| cell12 | cell13 words13 |\n\nplain14 ending14 paragraph14 here14 with15 several15 words15 to16 wrap16\n";
+        let card = crate::gh::Card {
+            author: "bot".into(),
+            body: body.into(),
+            ..Default::default()
+        };
+        let e = Entry {
+            head: "c".into(),
+            body: String::new(),
+            resolved: false,
+            thread: None,
+            card,
+        };
+        a.seed(pr, vec![(Tab::Comments, Data::Comments(vec![e]))]);
+        key(&mut a, KeyCode::Char(']'));
+        key(&mut a, KeyCode::Char(']'));
+        let words: Vec<&str> = body
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() > 4 && w.ends_with(|c: char| c.is_ascii_digit()))
+            .collect();
+        for w in 60..=200u16 {
+            let s = render_app(&a, w, 120);
+            let flat: String = s
+                .chars()
+                .filter(|c| {
+                    !c.is_whitespace() && !"\u{258f}\u{258e}\u{2502}\u{2022}\u{2551}".contains(*c)
+                })
+                .collect();
+            for word in &words {
+                // wrapping may split a word across rows, so compare with the row breaks removed
+                assert!(flat.contains(word), "width {w}: lost {word:?}\n{s}");
+            }
+        }
+    }
+
+    #[test]
+    fn help_and_bar_follow_remapped_keys() {
+        let mut a = seeded();
+        let keys: std::collections::BTreeMap<String, crate::config::Keys> = [
+            ("actions".to_string(), crate::config::Keys::One("z".into())),
+            ("help".to_string(), crate::config::Keys::One("!".into())),
+            (
+                "repo_browser".to_string(),
+                crate::config::Keys::Many(vec!["b".into(), "ctrl-b".into()]),
+            ),
+        ]
+        .into();
+        a.keys = crate::config::Keymap::build(&keys).unwrap();
+        let bar = render_app(&a, 160, 30).lines().last().unwrap().to_string();
+        assert!(
+            bar.contains("z actions") && bar.contains("! help") && bar.contains("b repos"),
+            "{bar}"
+        );
+        assert!(
+            !bar.contains("x actions") && !bar.contains("? help"),
+            "{bar}"
+        );
+        key(&mut a, KeyCode::Char('!')); // the new help key works...
+        let s = render_app(&a, 200, 60);
+        assert!(
+            s.contains("z  action menu") && s.contains("b / ctrl-b  repo browser"),
+            "{s}"
+        );
+        assert!(
+            s.contains("!  this help")
+                && !s.contains("x  action menu")
+                && !s.contains("?  this help"),
+            "{s}"
+        );
+        assert!(
+            s.contains("e  show who reacted")
+                && s.contains("Ctrl-d/u half page (inside a tall comment first)"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn thread_headers_keep_time_and_badges_visible() {
+        let mut a = seeded();
+        let pr = a.pr_item().cloned().unwrap();
+        let card = crate::gh::Card {
+            author: "a-reviewer-with-a-rather-long-login".into(),
+            role: "COLLABORATOR".into(),
+            when: "2026-01-02T00:00:00Z".into(),
+            edited: true,
+            resolved: true,
+            outdated: true,
+            badge:
+                "pkg/cmd/extension/browse/internal/some/deeply/nested/directory/model_test.go:218"
+                    .into(),
+            body: "nit".into(),
+            ..Default::default()
+        };
+        let e = Entry {
+            head: "thread".into(),
+            body: "nit".into(),
+            resolved: true,
+            thread: Some("T".into()),
+            card,
+        };
+        a.seed(pr, vec![(Tab::Comments, Data::Comments(vec![e]))]);
+        key(&mut a, KeyCode::Char(']'));
+        key(&mut a, KeyCode::Char(']'));
+        let s = render_app(&a, 80, 24);
+        for want in [
+            "ago",
+            "edited",
+            "[resolved]",
+            "[outdated]",
+            "[collaborator]",
+            "model_test.go:218",
+            "\u{2026}",
+        ] {
+            assert!(s.contains(want), "missing {want:?}\n{s}");
+        }
     }
 
     #[test]

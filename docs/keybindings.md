@@ -23,7 +23,9 @@ Press `?` in the app for the same list. Keys are checked against `src/app.rs` (`
 | `R` | Refresh all panels |
 | `L` | Toggle the command log strip |
 | `f` | Zoom the right pane to full width; `f` or `Esc` restores |
-| `Ctrl-r` | Repo switcher |
+| `B` / `Ctrl-r` | Repo browser (full screen) |
+
+The keys of the actions in this table can be remapped in `config.toml`; see [configuration.md](configuration.md).
 
 ## Lists (left column)
 
@@ -57,8 +59,18 @@ Right pane: Files shows the diff of the selected file, Checks the failed-step lo
 |---|---|
 | `j` `k` `Ctrl-d` `Ctrl-u` `g` `G` | Scroll, or move the row cursor on Checks / Comments / Diff tabs |
 | `[` `]` | Previous / next detail tab, from list focus and from the Files panel (focusing Files starts on Diff) (Overview, Checks, Comments, Diff for PRs; Overview, Comments for issues; Jobs, Logs for runs; Overview, Commits for branches; Overview, Assets for releases). Works from list focus too. |
-| `Enter` | On the Checks tab: show the check's failed-step log (`Esc`, `q`, `h` close it) |
+| `Enter` | On the Checks tab: show the check's failed-step log (`Esc`, `q`, `h` close it). On Comments: expand / collapse the selected comment (long comments, `<details>` blocks). In the drill-in Comments panel it works straight from the list |
 | `h` / `Left` / `Esc` | Back to the list |
+
+## Comments (Comments tab, issue Comments, drill-in Comments)
+
+| Key | Action |
+|---|---|
+| `j` `k` | Move by comment |
+| `Ctrl-d` `Ctrl-u` | Half a page: scrolls inside a comment taller than the pane first, then moves to the next/previous comment |
+| `Enter` | Expand / collapse the comment (long bodies, `<details>`) |
+| `e` | Show / hide who reacted |
+| `x` | Menu: reply to / resolve the thread, comment |
 
 ## Diff (Diff tab or Files panel)
 
@@ -79,8 +91,28 @@ Right pane: Files shows the diff of the selected file, Checks the failed-step lo
 | Action menu | `j` `k` / arrows move, `Enter` picks, `Esc` / `q` cancels |
 | Text input | typing, `Enter` newline, `Backspace`, `Ctrl-S` continue, `Esc` cancel |
 | Confirm | `y` runs the command; `n` / `Esc` cancels; `j` `k` scroll if the command is taller than the screen. `Enter` does nothing on purpose |
-| Repo switcher | `j` `k` / arrows move, `Enter` picks, `Esc` / `q` cancels |
 | Filter prompt | typing, `Backspace`, `Enter` applies, `Esc` clears |
+
+## Repo browser (`B` / `Ctrl-r`)
+
+Opens with the search box focused: type to filter by name or language. Up/Down, `PageUp`/`PageDown`, `Ctrl-d`/`Ctrl-u`,
+`Home`/`End` move the cursor even while typing. `Enter` or `Esc` leaves the box; `/` returns to it.
+
+| Key | Action |
+|---|---|
+| `Enter` | Switch the app to the selected repo (same as `-R`) |
+| `j` `k` `g` `G` | Move (outside the search box) |
+| `/` | Focus the search box |
+| `s` | Cycle sort: pushed, name, stars |
+| `S` | Reverse the sort direction |
+| `T` | Cycle type: all, owned (yours), member (someone else's personal repo you collaborate on), org, favorites |
+| `f` | Toggle favorite (favorites always sort to the top) |
+| `H` | Hide / unhide the repo (hidden repos vanish from the browser and from the global view) |
+| `.` | Show hidden repos (dimmed, with an icon) so they can be unhidden |
+| `r` | Reload from GitHub |
+| `Esc` / `q` / `B` / `Ctrl-r` | Clear the search, then close |
+
+Favorites and hidden repos are saved to `config.toml` immediately.
 
 ## Mouse
 

@@ -48,12 +48,16 @@ j/k move  Enter drill in  [ ] detail tab  { } list tab  / filter  x actions  ? h
   Actions (Runs / Workflows), Branches, Releases, Notifications. Filter any list with `/`.
 - **Code review without the browser**: unified, split or auto diff with soft-wrap, word-level highlighting,
   optional syntax highlighting, per-file stats, review-thread badges and viewed marks.
+- **Comments as cards**: GitHub-flavored markdown rendered in the terminal (headings, emphasis, inline and fenced
+  code with optional syntax highlighting, quotes, lists, task lists, tables, links), author role badges, relative
+  times, edited markers, reaction counts (`e` for names), nested review-thread replies with resolved/outdated
+  badges. Bot boilerplate (`<details>`, HTML comments, huge blobs) is collapsed; `Enter` expands.
 - **PR drill-in**: `Enter` on a PR turns the left column into that PR's Files, Checks and Comments, with check
   logs and full threads in the right pane.
 - **Actions with a seatbelt**: approve, request changes, comment, merge, close, label, assign, reply to or
   resolve threads, comment on a diff line, re-run or cancel runs, create issues/releases, delete branches. Every
   one shows the exact command first.
-- **Global view**: your PRs and issues across all repositories (`G`), plus a repo switcher (`Ctrl-r`).
+- **Global view**: your PRs and issues across all repositories (`G`), plus a full-screen **repo browser** (`B`) over every repo you can access, with search, sort, favorites and hide.
 - **Mouse and keyboard**: click panels, rows and tabs; wheel scrolls. `?` shows every key.
 - **Themes**: dark and light palettes, truecolor with a 256-color fallback, ASCII and Nerd Font icon sets.
 - **Command log**: `L` shows every `gh`/`git` command that was run.
@@ -86,6 +90,7 @@ Run it inside a clone of a GitHub repository, or point it at one:
 gh-pulse                       # repo of the current directory
 gh-pulse -R cli/cli            # any repo you can access
 gh-pulse --theme light --ascii
+gh-pulse                       # then press B to browse every repo you can access
 ```
 
 | Flag | Meaning |
@@ -97,10 +102,17 @@ gh-pulse --theme light --ascii
 
 gh-pulse needs an interactive terminal; piping stdin/stdout prints a message and exits.
 
+## Configuration
+
+Optional `~/.config/gh-pulse/config.toml` (`$XDG_CONFIG_HOME` is honored): default theme and icons, favorite and
+hidden repos (written by the repo browser), and key remapping. Flags override the file; a missing file means
+defaults; an invalid file stops startup with `file:line: message`. See [docs/configuration.md](docs/configuration.md).
+The file never contains credentials; authentication stays entirely with `gh`.
+
 ## Concepts
 
 - **Repo scope.** Everything is about one repository: the current directory's, or `-R`. The header shows the
-  repo, your local branch (only when the directory is a clone of it) and your user. `Ctrl-r` switches repo.
+  repo, your local branch (only when the directory is a clone of it) and your user. `B` (or `Ctrl-r`) opens the repo browser to switch.
 - **Panels.** Numbered like lazygit; the focused one expands, the rest collapse. `[` `]` change the detail
   tab, `{` `}` change the panel's own list (e.g. Mine vs Merged).
 - **Files follows the PR.** Panel 3 always lists the files of the selected PR; moving through it changes the
@@ -203,10 +215,9 @@ at word boundaries with a `↪` marker; `w` switches to clipping. `f` zooms the 
 
 ## Roadmap
 
-- All-repos view with a persistent hide list (config file).
 - Commits panel in the PR drill-in.
 - Persisted (or GitHub-synced) viewed marks.
-- Config file for defaults.
+- Open PR/issue counts in more places; org-level views.
 - Make syntax highlighting the default if the size cost is acceptable.
 
 See [docs/BACKLOG.md](docs/BACKLOG.md).

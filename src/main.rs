@@ -1,7 +1,10 @@
 mod act;
 mod app;
+mod browse;
+mod config;
 mod diff;
 mod gh;
+mod md;
 mod syn;
 mod theme;
 mod ui;
@@ -29,14 +32,14 @@ fn die(msg: &str) -> ! {
 }
 
 fn main() -> std::io::Result<()> {
-    let (mut repo, mut light, mut ascii, mut nerd) = (None, false, false, false);
+    let (mut repo, mut light, mut ascii, mut nerd) = (None, None, false, false);
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "-R" | "--repo" => repo = args.next().or_else(|| die(USAGE)),
             "--theme" => match args.next().as_deref() {
-                Some("light") => light = true,
-                Some("dark") => light = false,
+                Some("light") => light = Some(true),
+                Some("dark") => light = Some(false),
                 _ => die(USAGE),
             },
             "--ascii" => ascii = true,
@@ -45,6 +48,15 @@ fn main() -> std::io::Result<()> {
             _ => die(USAGE),
         }
     }
+    // Config problems are startup errors, never silent: a typo'd key or a clashing binding stops here.
+    let cfg = match config::path() {
+        Some(p) => config::load_from(&p).unwrap_or_else(|e| die(&e)),
+        None => config::Config::default(),
+    };
+    let keys = config::Keymap::build(&cfg.keys).unwrap_or_else(|e| {
+        let at = config::path().map_or_else(|| "config".into(), |p| p.display().to_string());
+        die(&format!("{at}: {e}"))
+    });
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         die("gh-pulse needs an interactive terminal");
     }
@@ -53,6 +65,9 @@ fn main() -> std::io::Result<()> {
         None => gh::repo_here()
             .unwrap_or_else(|e| die(&format!("not in a GitHub repo ({e}); pass -R owner/repo"))),
     };
+    // Flags win over the config file.
+    let (ascii, nerd) = (ascii || cfg.ascii, nerd || cfg.nerd);
+    let light = light.unwrap_or(cfg.theme.as_deref() == Some("light"));
     let icons = if ascii || !theme::utf8() {
         IconSet::Ascii
     } else if nerd {
@@ -72,7 +87,7 @@ fn main() -> std::io::Result<()> {
     ratatui::run(|term| {
         crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
         let _guard = MouseGuard;
-        let mut app = app::App::new(repo, theme);
+        let mut app = app::App::from_config(repo, theme, cfg, keys);
         loop {
             app.poll();
             term.draw(|f| ui::draw(f, &app))?;

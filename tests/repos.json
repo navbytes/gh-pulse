@@ -1,0 +1,7 @@
+{"data":{"viewer":{"login":"octocat","repositories":{"pageInfo":{"hasNextPage":true,"endCursor":"CURSOR1"},"nodes":[
+{"nameWithOwner":"octocat/hello-world","isPrivate":false,"isFork":false,"isArchived":false,"stargazerCount":10,"pushedAt":"2026-10-02T10:00:00Z","primaryLanguage":{"name":"Go"},"owner":{"__typename":"User","login":"octocat"},"issues":{"totalCount":1},"pullRequests":{"totalCount":0}},
+{"nameWithOwner":"hello-org/web","isPrivate":true,"isFork":false,"isArchived":true,"stargazerCount":42,"pushedAt":"2026-08-01T10:00:00Z","primaryLanguage":{"name":"TypeScript"},"owner":{"__typename":"Organization","login":"hello-org"},"issues":{"totalCount":7},"pullRequests":{"totalCount":3}},
+{"nameWithOwner":"friend/shared","isPrivate":false,"isFork":true,"isArchived":false,"stargazerCount":5,"pushedAt":"2026-06-01T10:00:00Z","primaryLanguage":{"name":"Rust"},"owner":{"__typename":"User","login":"friend"},"issues":{"totalCount":0},"pullRequests":{"totalCount":1}},
+{"nameWithOwner":"octocat/dotfiles","isPrivate":true,"isFork":false,"isArchived":false,"stargazerCount":0,"pushedAt":"2026-01-01T10:00:00Z","primaryLanguage":null,"owner":{"__typename":"User","login":"octocat"},"issues":{"totalCount":0},"pullRequests":{"totalCount":0}},
+{"nameWithOwner":"hello-org/infra","isPrivate":true,"isFork":false,"isArchived":false,"stargazerCount":1,"pushedAt":"2025-01-01T10:00:00Z","primaryLanguage":{"name":"HCL"},"owner":{"__typename":"Organization","login":"hello-org"},"issues":{"totalCount":2},"pullRequests":{"totalCount":0}}
+]}}}}

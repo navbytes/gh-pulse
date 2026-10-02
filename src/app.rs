@@ -1,4 +1,6 @@
 use crate::act::{self, Action, Sel};
+use crate::browse::{self, Browser, Out, RepoRow};
+use crate::config::{self, Act, Config, Keymap};
 use crate::diff::{self, DiffMode};
 use crate::gh::{self, Data, Item, Kind, Tab};
 use crate::syn::Hl;
@@ -8,6 +10,7 @@ use ratatui::layout::{Position, Rect};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
@@ -115,8 +118,6 @@ pub enum Modal {
         build: act::Build,
     },
     Confirm(Confirm),
-    /// None while `gh repo list` is loading.
-    Repos(Option<Vec<String>>, usize),
 }
 
 /// Screen regions recorded by the last draw, for mouse hit-testing.
@@ -136,6 +137,14 @@ pub struct Log {
     pub lines: Vec<String>,
 }
 
+/// One page of the repo browser's background load.
+struct RepoMsg {
+    viewer: String,
+    rows: Vec<RepoRow>,
+    last: bool,
+    truncated: bool,
+}
+
 enum Msg {
     // Results carry the generation they were requested in; stale ones are dropped.
     List(PK, usize, u64, Result<Vec<Item>, String>),
@@ -143,11 +152,16 @@ enum Msg {
     Log(String, String, u64, Result<String, String>),
     Status(Result<String, String>),
     Done(Result<String, String>),
-    Repos(u64, Result<Vec<String>, String>),
+    Repos(u64, Result<RepoMsg, String>),
     Header(String),
 }
 
 pub struct App {
+    pub cfg: Config,
+    cfg_path: Option<PathBuf>,
+    pub keys: Keymap,
+    /// Full-screen repo browser while open.
+    pub browser: Option<Browser>,
     pub theme: Theme,
     pub hit: RefCell<Hit>,
     pub tick: usize,
@@ -171,6 +185,9 @@ pub struct App {
     pub row: usize,
     pub ctx: Option<Ctx>,
     pub zoom: bool,
+    /// Comments the user expanded (long ones, details blocks) / whose reaction names are shown, per item and row.
+    pub expanded: HashSet<(String, usize)>,
+    pub react_open: HashSet<(String, usize)>,
     /// (PR key, path) pairs the user marked viewed; in-memory only.
     pub viewed: HashSet<(String, String)>,
     pub mode: DiffMode,
@@ -182,6 +199,7 @@ pub struct App {
     // Written by the renderer, which only has &App; nav() clamps against them.
     pub scroll: Cell<usize>,
     pub view_max: Cell<usize>,
+    pub view_len: Cell<usize>,
     pub view_h: Cell<usize>,
     pub log: Option<Log>,
     cache: HashMap<(String, Tab), Load>,
@@ -253,11 +271,22 @@ impl App {
         Self::with(repo, theme, true)
     }
 
+    /// The real entry point: config and keymap come from the user's config file.
+    pub fn from_config(repo: String, theme: Theme, cfg: Config, keys: Keymap) -> Self {
+        let mut app = Self::new(repo, theme);
+        (app.cfg, app.keys, app.cfg_path) = (cfg, keys, config::path());
+        app
+    }
+
     /// `load: false` skips all `gh` calls (layout tests).
     pub fn with(repo: String, theme: Theme, load: bool) -> Self {
         let panel = Panel::new;
         let (tx, rx) = channel();
         let mut app = App {
+            cfg: Config::default(),
+            cfg_path: None,
+            keys: Keymap::build(&Default::default()).expect("default keys are valid"),
+            browser: None,
             theme,
             hit: RefCell::default(),
             tick: 0,
@@ -293,6 +322,8 @@ impl App {
             row: 0,
             ctx: None,
             zoom: false,
+            expanded: HashSet::new(),
+            react_open: HashSet::new(),
             viewed: HashSet::new(),
             mode: DiffMode::Auto,
             wrap: true,
@@ -300,6 +331,7 @@ impl App {
             row_starts: RefCell::new(vec![]),
             scroll: Cell::new(0),
             view_max: Cell::new(0),
+            view_len: Cell::new(0),
             view_h: Cell::new(10),
             log: None,
             cache: HashMap::new(),
@@ -382,6 +414,7 @@ impl App {
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 Msg::List(kind, tab, seq, res) => {
+                    let (global, hidden) = (self.global, self.cfg.repos.clone());
                     let Some(p) = self.panel_mut(kind) else {
                         continue;
                     };
@@ -390,7 +423,13 @@ impl App {
                     }
                     p.loading = false;
                     match res {
-                        Ok(items) => {
+                        Ok(mut items) => {
+                            // hidden repos disappear from the cross-repo (global) results
+                            let cross_repo = (global && matches!(p.kind, PK::Prs | PK::Issues))
+                                || p.kind == PK::Notifs;
+                            if cross_repo {
+                                items.retain(|i| !hidden.is_hidden(&i.repo));
+                            }
                             p.cursor = p.cursor.min(items.len().saturating_sub(1));
                             p.items = items;
                         }
@@ -417,12 +456,20 @@ impl App {
                     self.reload_all();
                 }
                 Msg::Repos(g, _) if g != self.repos_seq => {}
-                Msg::Repos(_, Ok(v)) => {
-                    if let Some(Modal::Repos(slot @ None, _)) = &mut self.modal {
-                        *slot = Some(v);
+                Msg::Repos(_, Ok(m)) => {
+                    if let Some(b) = &mut self.browser {
+                        if b.viewer.is_empty() {
+                            b.viewer = m.viewer;
+                        }
+                        b.rows.extend(m.rows);
+                        (b.loading, b.truncated) = (!m.last, m.truncated);
                     }
                 }
-                Msg::Repos(_, Err(e)) => (self.modal, self.status) = (None, e),
+                Msg::Repos(_, Err(e)) => {
+                    if let Some(b) = &mut self.browser {
+                        (b.loading, b.error) = (false, Some(e));
+                    }
+                }
                 Msg::Header(h) => self.header = h,
             }
         }
@@ -504,8 +551,12 @@ impl App {
             return p.items.iter().collect();
         }
         let f = self.filter.to_lowercase();
+        let num = f.trim_start_matches('#');
         let hit = |it: &&Item| {
-            it.title.to_lowercase().contains(&f) || it.meta.to_lowercase().contains(&f)
+            it.title.to_lowercase().contains(&f)
+                || it.meta.to_lowercase().contains(&f)
+                // "123" or "#123" finds a PR/issue by number
+                || (it.number > 0 && !num.is_empty() && it.number.to_string().contains(num))
         };
         p.items.iter().filter(hit).collect()
     }
@@ -725,6 +776,11 @@ impl App {
         }
     }
 
+    /// Detail focus on the Comments tab with its row cursor (not the single-thread pane).
+    fn comment_rows(&self) -> bool {
+        self.detail_focus && self.cur_tab() == Tab::Comments && self.cursor_tab()
+    }
+
     /// Whether the detail pane has a row cursor (vs plain scrolling).
     fn cursor_tab(&self) -> bool {
         matches!(self.cur_tab(), Tab::Checks | Tab::Comments | Tab::Diff)
@@ -784,6 +840,10 @@ impl App {
             self.modal = self.modal_key(m, k, ctrl);
             return false;
         }
+        if self.browser.is_some() {
+            self.browser_key(k);
+            return false;
+        }
         if self.help {
             let m = self.help_max.get();
             match k.code {
@@ -818,10 +878,10 @@ impl App {
             self.log = None;
             return false;
         }
+        if let Some(a) = self.keys.get(&k) {
+            return self.run_act(a, k);
+        }
         match k.code {
-            KeyCode::Char('q') if self.log.is_none() => return true,
-            KeyCode::Char('?') => self.help = true,
-            KeyCode::Char('/') if !self.detail_focus => self.typing = true,
             KeyCode::Tab => self.set_focus(self.focus + 1),
             KeyCode::BackTab => self.set_focus(self.focus + self.panels.len() - 1),
             KeyCode::Char(c @ '1'..='8') if (c as usize - '1' as usize) < self.panels.len() => {
@@ -831,42 +891,13 @@ impl App {
             KeyCode::Char(']') => self.tab_step(1),
             KeyCode::Char('{') => self.panel_tab_step(-1),
             KeyCode::Char('}') => self.panel_tab_step(1),
-            KeyCode::Char('r') if ctrl => self.open_repos(),
-            KeyCode::Char('r') => {
-                self.clear_cache();
-                self.load_panel(self.focus);
-            }
-            KeyCode::Char('R') => self.reload_all(),
-            KeyCode::Char('x') => self.open_menu(None),
-            KeyCode::Char('a') => self.open_menu(Some("Approve")),
-            KeyCode::Char('C') => self.open_menu(Some("Comment on")),
-            KeyCode::Char('m') => self.open_menu(Some("Merge")),
-            KeyCode::Char('L') => self.show_log = !self.show_log,
-            KeyCode::Char('G')
-                if !self.detail_focus
-                    && self.log.is_none()
-                    && self.ctx.is_none()
-                    && self.dk().is_none() =>
-            {
-                self.global = !self.global;
-                self.reload_all();
-            }
-            // Derived panels and drill-in: G is "last row" like End; say why it isn't the global toggle.
-            KeyCode::Char('G') if !self.detail_focus && self.log.is_none() => {
-                self.nav(isize::MAX);
-                self.status = "G jumps to the last row here; the global view toggles from the PR/Issues lists".into();
-            }
             KeyCode::Home => self.nav(isize::MIN),
             KeyCode::End => self.nav(isize::MAX),
-            KeyCode::Char('o') => self.open(),
-            KeyCode::Char('y') => self.copy(),
-            KeyCode::Char('c') => self.checkout(),
             KeyCode::Enter => self.enter(),
             KeyCode::Esc if self.zoom => self.zoom = false,
             KeyCode::Esc if self.detail_focus => self.detail_focus = false,
             KeyCode::Esc if self.ctx.is_some() => self.exit_ctx(),
             KeyCode::Esc => self.filter.clear(),
-            KeyCode::Char('f') => self.zoom = !self.zoom,
             KeyCode::Char('w') if self.cur_tab() == Tab::Diff => self.wrap = !self.wrap,
             KeyCode::Char('v') if self.cur_tab() == Tab::Diff => self.toggle_viewed(),
             KeyCode::Char('l') | KeyCode::Right if self.selected().is_some() => {
@@ -881,6 +912,10 @@ impl App {
             KeyCode::Char('p') if self.cur_tab() == Tab::Diff => self.file_step(-1),
             KeyCode::Char('j') | KeyCode::Down => self.nav(1),
             KeyCode::Char('k') | KeyCode::Up => self.nav(-1),
+            KeyCode::Char('d') | KeyCode::Char('u') if ctrl && self.comment_rows() => {
+                self.page_comments(if k.code == KeyCode::Char('d') { 1 } else { -1 })
+            }
+            KeyCode::Char('e') if self.cur_tab() == Tab::Comments => self.toggle_card(true),
             KeyCode::Char('d') if ctrl => self.nav((self.view_h.get() / 2) as isize),
             KeyCode::Char('u') if ctrl => self.nav(-((self.view_h.get() / 2) as isize)),
             KeyCode::Char('g') => self.nav(isize::MIN),
@@ -951,25 +986,144 @@ impl App {
         })
     }
 
-    fn open_repos(&mut self) {
-        self.modal = Some(Modal::Repos(None, 0));
+    fn run_act(&mut self, a: Act, k: KeyEvent) -> bool {
+        match a {
+            Act::Quit => return true,
+            Act::Help => self.help = true,
+            Act::Filter if !self.detail_focus => self.typing = true,
+            Act::Filter => {}
+            Act::Refresh => {
+                self.clear_cache();
+                self.load_panel(self.focus);
+            }
+            Act::RefreshAll => self.reload_all(),
+            Act::Actions => self.open_menu(None),
+            Act::Approve => self.open_menu(Some("Approve")),
+            Act::Comment => self.open_menu(Some("Comment on")),
+            Act::Merge => self.open_menu(Some("Merge")),
+            Act::CommandLog => self.show_log = !self.show_log,
+            Act::Open => self.open(),
+            Act::CopyUrl => self.copy(),
+            Act::Checkout => self.checkout(),
+            Act::Zoom => self.zoom = !self.zoom,
+            Act::Browser => self.open_browser(),
+            Act::Global => {
+                if !self.detail_focus
+                    && self.log.is_none()
+                    && self.ctx.is_none()
+                    && self.dk().is_none()
+                {
+                    self.global = !self.global;
+                    self.reload_all();
+                } else if k.code == KeyCode::Char('G') {
+                    // Derived panels and drill-in: G is "last row" like End; say why it isn't the toggle.
+                    self.nav(isize::MAX);
+                    if !self.detail_focus && self.log.is_none() {
+                        self.status = "G jumps to the last row here; the global view toggles from the PR/Issues lists".into();
+                    }
+                } else {
+                    self.status = "the global view toggles from the PR/Issues lists".into();
+                }
+            }
+        }
+        false
+    }
+
+    /// Open the full-screen repo browser and page through every repo the user can access.
+    fn open_browser(&mut self) {
         self.repos_seq += 1;
-        let (tx, g) = (self.tx.clone(), self.repos_seq);
+        let (tx, seq) = (self.tx.clone(), self.repos_seq);
+        self.browser = Some(Browser::new());
         thread::spawn(move || {
-            let r = gh::gh([
-                "repo",
-                "list",
-                "--limit=50",
-                "--json",
-                "nameWithOwner",
-                "-q",
-                ".[].nameWithOwner",
-            ]);
-            let _ = tx.send(Msg::Repos(
-                g,
-                r.map(|s| s.lines().map(str::to_string).collect()),
-            ));
+            let (mut after, mut total) = (None::<String>, 0usize);
+            loop {
+                match browse::fetch_page(after.as_deref()) {
+                    Err(e) => {
+                        let _ = tx.send(Msg::Repos(seq, Err(e)));
+                        return;
+                    }
+                    Ok(p) => {
+                        total += p.rows.len();
+                        let capped = p.next.is_some() && total >= browse::MAX_REPOS;
+                        let last = p.next.is_none() || capped;
+                        after = p.next;
+                        let m = RepoMsg {
+                            viewer: p.viewer,
+                            rows: p.rows,
+                            last,
+                            truncated: capped,
+                        };
+                        if tx.send(Msg::Repos(seq, Ok(m))).is_err() || last {
+                            return;
+                        }
+                    }
+                }
+            }
         });
+    }
+
+    fn browser_key(&mut self, k: KeyEvent) {
+        // Typing "B" into the search box must not close it; Ctrl-r still does.
+        let typing = self.browser.as_ref().is_some_and(|b| b.typing);
+        if self.keys.get(&k) == Some(Act::Browser)
+            && (!typing || k.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            self.browser = None;
+            return;
+        }
+        let Some(b) = self.browser.as_mut() else {
+            return;
+        };
+        match b.key(k, &self.cfg.repos) {
+            Out::None => {}
+            Out::Close => self.browser = None,
+            Out::Reload => self.open_browser(),
+            Out::Switch(r) => self.switch_repo(r),
+            Out::Fav(r) => {
+                let on = self.cfg.repos.toggle_fav(&r);
+                self.status = format!(
+                    "{} {r} {} favorites",
+                    if on { "added" } else { "removed" },
+                    if on { "to" } else { "from" }
+                );
+                if !self.save_cfg() {
+                    self.cfg.repos.toggle_fav(&r); // refused: keep memory and file in agreement
+                }
+            }
+            Out::Hide(r) => {
+                let on = self.cfg.repos.toggle_hidden(&r);
+                self.status = format!("{} {r}", if on { "hidden:" } else { "unhidden:" });
+                if !self.save_cfg() {
+                    self.cfg.repos.toggle_hidden(&r);
+                }
+            }
+        }
+    }
+
+    /// Same as starting with `-R repo`.
+    fn switch_repo(&mut self, repo: String) {
+        self.browser = None;
+        self.exit_ctx();
+        self.repo = repo;
+        (self.global, self.header) = (false, format!(" {}", self.repo));
+        self.panels.iter_mut().for_each(|p| p.cursor = 0);
+        self.reset_view();
+        self.reload_all();
+        self.spawn_header();
+    }
+
+    /// False when the save was refused or failed; the status line then says why.
+    fn save_cfg(&mut self) -> bool {
+        let Some(path) = &self.cfg_path else {
+            return true;
+        };
+        match config::save_to(path, &self.cfg) {
+            Ok(()) => true,
+            Err(e) => {
+                self.status = e;
+                false
+            }
+        }
     }
 
     /// Returns the modal to keep showing, if any.
@@ -1056,22 +1210,6 @@ impl App {
                     Some(Modal::Confirm(c))
                 }
             },
-            Modal::Repos(list, i) => match (k.code, &list) {
-                (KeyCode::Esc | KeyCode::Char('q'), _) => None,
-                (KeyCode::Enter, Some(l)) if !l.is_empty() => {
-                    self.repo = l[i].clone();
-                    (self.global, self.header) = (false, format!(" {}", self.repo));
-                    self.panels.iter_mut().for_each(|p| p.cursor = 0);
-                    self.reset_view();
-                    self.reload_all();
-                    self.spawn_header();
-                    None
-                }
-                _ => {
-                    let i = mv(i, list.as_ref().map_or(0, Vec::len));
-                    Some(Modal::Repos(list, i))
-                }
-            },
         }
     }
 
@@ -1131,7 +1269,64 @@ impl App {
         }
     }
 
+    fn toggle_card(&mut self, reactions: bool) {
+        let key = (
+            self.selected().map(Item::key).unwrap_or_default(),
+            self.lrow(),
+        );
+        let set = if reactions {
+            &mut self.react_open
+        } else {
+            &mut self.expanded
+        };
+        if !set.remove(&key) {
+            set.insert(key);
+        }
+    }
+
+    /// Half a page in the Comments tab, moving by whole comments.
+    fn page_comments(&mut self, dir: isize) {
+        let st = self.row_starts.borrow().clone();
+        if st.is_empty() {
+            return;
+        }
+        let half = (self.view_h.get() / 2).max(1);
+        let row = self.row.min(st.len() - 1);
+        let cur = st[row];
+        // A comment taller than the pane is read in place first: scroll within it, then move on.
+        let end = st.get(row + 1).map_or(self.view_len.get(), |n| n - 1); // exclusive, minus the gap line
+        let (top, h) = (self.scroll.get(), self.view_h.get());
+        if end > cur + h {
+            if dir > 0 && top + h < end {
+                self.scroll.set((top + half).min(end - h));
+                return;
+            }
+            if dir < 0 && top > cur {
+                self.scroll.set(top.saturating_sub(half).max(cur));
+                return;
+            }
+        }
+        let target = if dir > 0 {
+            cur + half
+        } else {
+            cur.saturating_sub(half)
+        };
+        let r = st.partition_point(|&s| s <= target).saturating_sub(1);
+        let r = if dir > 0 {
+            r.max(self.row + 1)
+        } else {
+            r.min(self.row.saturating_sub(1))
+        };
+        self.row = r.min(st.len() - 1);
+    }
+
     fn enter(&mut self) {
+        // Comments: Enter expands the selected comment (also straight from the drill-in list)
+        if self.dk() == Some(PK::Comments) || (self.detail_focus && self.cur_tab() == Tab::Comments)
+        {
+            self.toggle_card(false);
+            return;
+        }
         if !self.detail_focus {
             if self.ctx.is_none() && self.panels[self.focus].kind == PK::Prs {
                 self.enter_ctx();
@@ -1218,5 +1413,81 @@ impl App {
             }
             _ => self.status = "checkout works on pull requests".into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::IconSet;
+
+    #[test]
+    fn refused_save_leaves_favorites_and_hidden_unchanged() {
+        let dir = std::env::temp_dir().join(format!("gh-pulse-app-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "repos = [broken\n").unwrap();
+        let mut a = App::with(
+            "o/r".into(),
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+        );
+        a.cfg_path = Some(path.clone());
+        let mut b = Browser::new();
+        b.rows = vec![RepoRow {
+            name: "o/a".into(),
+            owner: "o".into(),
+            ..Default::default()
+        }];
+        (b.typing, b.viewer) = (false, "o".into());
+        a.browser = Some(b);
+        let press = |a: &mut App, c| a.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        press(&mut a, 'f');
+        assert!(
+            a.cfg.repos.favorites.is_empty(),
+            "favorite must not stick when the save is refused"
+        );
+        assert!(a.status.contains("not saving"), "{}", a.status);
+        press(&mut a, 'H');
+        assert!(a.cfg.repos.hidden.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "repos = [broken\n",
+            "their file is untouched"
+        );
+        // a good config saves and keeps the change
+        std::fs::write(&path, "").unwrap();
+        press(&mut a, 'f');
+        assert!(
+            a.cfg.repos.is_fav("o/a") && std::fs::read_to_string(&path).unwrap().contains("o/a")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn filter_matches_numbers_and_notifications_drop_hidden_repos() {
+        let mut a = App::with(
+            "o/r".into(),
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+        );
+        let i = a.panel_idx(PK::Prs).unwrap();
+        let it = |n, t: &str| Item {
+            number: n,
+            title: t.into(),
+            kind: Kind::Pr,
+            ..Default::default()
+        };
+        a.panels[i].items = vec![it(14320, "rate limits"), it(7, "docs")];
+        a.filter = "#143".into();
+        assert_eq!(a.visible(i).len(), 1);
+        a.filter = "7".into();
+        assert_eq!(
+            a.visible(i).iter().map(|x| x.number).collect::<Vec<_>>(),
+            [7]
+        );
+        a.filter = "docs".into();
+        assert_eq!(a.visible(i).len(), 1);
     }
 }
