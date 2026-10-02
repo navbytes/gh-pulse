@@ -1,0 +1,94 @@
+mod act;
+mod app;
+mod diff;
+mod gh;
+mod syn;
+mod theme;
+mod ui;
+
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseEventKind,
+};
+use std::io::IsTerminal;
+use std::time::Duration;
+use theme::{IconSet, Theme};
+
+const USAGE: &str = "usage: gh-pulse [-R owner/repo] [--theme dark|light] [--ascii] [--nerd]";
+
+struct MouseGuard;
+
+impl Drop for MouseGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    }
+}
+
+fn die(msg: &str) -> ! {
+    eprintln!("{msg}");
+    std::process::exit(2)
+}
+
+fn main() -> std::io::Result<()> {
+    let (mut repo, mut light, mut ascii, mut nerd) = (None, false, false, false);
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "-R" | "--repo" => repo = args.next().or_else(|| die(USAGE)),
+            "--theme" => match args.next().as_deref() {
+                Some("light") => light = true,
+                Some("dark") => light = false,
+                _ => die(USAGE),
+            },
+            "--ascii" => ascii = true,
+            "--nerd" => nerd = true,
+            "-h" | "--help" => die(USAGE),
+            _ => die(USAGE),
+        }
+    }
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        die("gh-pulse needs an interactive terminal");
+    }
+    let repo = match repo {
+        Some(r) => gh::resolve_repo(&r).unwrap_or_else(|e| die(&e)),
+        None => gh::repo_here()
+            .unwrap_or_else(|e| die(&format!("not in a GitHub repo ({e}); pass -R owner/repo"))),
+    };
+    let icons = if ascii || !theme::utf8() {
+        IconSet::Ascii
+    } else if nerd {
+        IconSet::Nerd
+    } else {
+        IconSet::Unicode
+    };
+    let theme = Theme::new(light, icons, theme::truecolor());
+
+    // Mouse capture must be undone on panic too, or the shell keeps receiving click escape codes.
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |i| {
+        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+        prev(i);
+    }));
+    // ratatui::run installs a panic hook and restores the terminal on every exit path.
+    ratatui::run(|term| {
+        crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
+        let _guard = MouseGuard;
+        let mut app = app::App::new(repo, theme);
+        loop {
+            app.poll();
+            term.draw(|f| ui::draw(f, &app))?;
+            if !event::poll(Duration::from_millis(100))? {
+                app.ensure();
+                continue;
+            }
+            match event::read()? {
+                Event::Key(k) if k.kind == KeyEventKind::Press => {
+                    if app.on_key(k) {
+                        return Ok(());
+                    }
+                }
+                Event::Mouse(m) if !matches!(m.kind, MouseEventKind::Moved) => app.on_mouse(m),
+                _ => {} // Resize: the next draw re-lays-out from the new size
+            }
+        }
+    })
+}

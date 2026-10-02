@@ -1,0 +1,1 @@
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"PRRT_1","isResolved":true,"isOutdated":false,"path":"src/x.rs","line":12,"comments":{"nodes":[{"author":{"login":"alice"},"body":"nit","createdAt":"2026-01-01T00:00:00Z"},{"author":null,"body":"done","createdAt":"2026-01-01T01:00:00Z"}]}}]}}}}}

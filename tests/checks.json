@@ -1,0 +1,2 @@
+[{"name":"build","bucket":"pass","link":"https://github.com/o/r/actions/runs/111/job/222","workflow":"CI","startedAt":"2026-08-28T08:11:00Z","completedAt":"2026-08-28T08:12:05Z"},
+{"name":"pending","bucket":"pending","link":"https://github.com/o/r/runs/9","workflow":null,"startedAt":"2026-08-28T08:11:00Z","completedAt":"0001-01-01T00:00:00Z"}]

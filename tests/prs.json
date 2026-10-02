@@ -1,0 +1,3 @@
+[{"author":{"id":"X","is_bot":false,"login":"octocat","type":"User","url":"https://github.com/octocat"},
+"body":"Fixes the thing","labels":[{"id":"L","name":"bug","color":"d73a4a","description":""}],
+"number":42,"repository":{"name":"repo","nameWithOwner":"octo/repo"},"state":"open","title":"Fix thing","url":"https://github.com/octo/repo/pull/42"}]
