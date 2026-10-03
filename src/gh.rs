@@ -161,6 +161,8 @@ pub enum Kind {
     Branch,
     Release,
     Tag,
+    /// A row of the Repos panel (favorites / recent): `repo` is the name, the card text is in `body`.
+    Repo,
     Other,
     /// Rows of the derived Files / Checks / Comments panels.
     File,
@@ -224,6 +226,9 @@ pub struct Item {
     pub author: Author,
     pub labels: Vec<Label>,
     pub is_draft: bool,
+    /// ISO timestamp of the last update (search results), for merging and sorting.
+    #[serde(rename = "updatedAt")]
+    pub updated: String,
     pub repository: RepoRef,
     #[serde(skip)]
     pub repo: String,
@@ -251,6 +256,17 @@ impl Item {
         } else {
             &self.title
         }
+    }
+
+    /// The repo name for the screen: neutralized like every other GitHub text. `repo` itself stays
+    /// raw, because it goes into `-R`, and is only trusted for that when it passes `repo_ok`.
+    pub fn repo_display(&self) -> String {
+        crate::sanitize::line(&self.repo).into_owned()
+    }
+
+    /// A repo name safe to hand to `gh -R` (plain `owner/name`); empty (unknown) counts as fine.
+    pub fn repo_ok(&self) -> bool {
+        self.repo.is_empty() || crate::state::valid_repo(&self.repo)
     }
 
     pub fn key(&self) -> String {
@@ -479,12 +495,13 @@ fn json<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, String> {
 }
 
 pub fn clean_item(i: &mut Item) {
-    use crate::sanitize::clean_in_place as c;
-    c(&mut i.title);
+    use crate::sanitize::{clean_in_place as c, line_in_place as l};
+    // one-line fields keep no line breaks; the body keeps its own
+    l(&mut i.title);
     c(&mut i.body);
-    c(&mut i.meta);
-    c(&mut i.author.login);
-    i.labels.iter_mut().for_each(|l| c(&mut l.name));
+    l(&mut i.meta);
+    l(&mut i.author.login);
+    i.labels.iter_mut().for_each(|x| l(&mut x.name));
 }
 
 pub fn parse_items(s: &str, kind: Kind, repo: &str) -> Result<Vec<Item>, String> {
@@ -521,43 +538,6 @@ struct Workflow {
 
 const PR_FIELDS: &str = "number,title,url,state,isDraft,author,labels,body";
 const ISSUE_FIELDS: &str = "number,title,url,state,author,labels,body";
-
-fn search(panel: usize, tab: usize) -> Result<Vec<Item>, String> {
-    let (sub, kind, fields, f): (_, _, _, &[&str]) = if panel == 1 {
-        let f: &[&str] = match tab {
-            0 => &["--author=@me"],
-            1 => &["--review-requested=@me"],
-            2 => &["--involves=@me"],
-            _ => &["--author=@me", "--merged"],
-        };
-        (
-            "prs",
-            Kind::Pr,
-            "number,title,url,state,isDraft,author,labels,body,repository",
-            f,
-        )
-    } else {
-        let f: &[&str] = match tab {
-            0 => &["--assignee=@me"],
-            1 => &["--author=@me"],
-            _ => &["--involves=@me"],
-        };
-        (
-            "issues",
-            Kind::Issue,
-            "number,title,url,state,author,labels,body,repository",
-            f,
-        )
-    };
-    let limit = format!("--limit={LIMIT}");
-    // `gh search` has no --state=merged (it is --merged), and it conflicts with --state=open.
-    let mut a = vec!["search", sub, &limit, "--json", fields];
-    if !f.contains(&"--merged") {
-        a.push("--state=open");
-    }
-    a.extend(f);
-    parse_items(&gh(a)?, kind, "")
-}
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -901,6 +881,50 @@ pub fn parse_startup(body: &str, repo: &str, want: &StartupWant) -> Result<Start
     })
 }
 
+/// `owner/name` of the first GitHub remote in `git remote -v` output (`origin` first). Offline: no API.
+pub fn repo_from_remotes(remotes: &str, host: &str) -> Option<String> {
+    let parse = |url: &str| {
+        let rest = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))
+            .or_else(|| url.strip_prefix("ssh://"))
+            .unwrap_or(url);
+        let rest = rest.split_once('@').map_or(rest, |(_, r)| r); // user@host
+        let path = rest
+            .strip_prefix(host)?
+            .trim_start_matches([':', '/'])
+            .trim_end_matches('/');
+        let path = path.strip_suffix(".git").unwrap_or(path);
+        crate::state::valid_repo(path).then(|| path.to_string())
+    };
+    let mut fetch: Vec<(&str, &str)> = remotes
+        .lines()
+        .filter(|l| l.ends_with("(fetch)"))
+        .filter_map(|l| {
+            let mut w = l.split_whitespace();
+            Some((w.next()?, w.next()?))
+        })
+        .collect();
+    fetch.sort_by_key(|(name, _)| *name != "origin");
+    fetch.into_iter().find_map(|(_, url)| parse(url))
+}
+
+/// The cwd's repo judged from its git remotes (no API call), if it has a GitHub one.
+pub fn local_repo() -> Option<String> {
+    let o = Command::new("git").args(["remote", "-v"]).output().ok()?;
+    o.status
+        .success()
+        .then(|| repo_from_remotes(&String::from_utf8_lossy(&o.stdout), &host()))?
+}
+
+/// The cwd is inside a git work tree at all (so asking GitHub which repo it is can make sense).
+pub fn in_git_repo() -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
 /// The GitHub host `gh` talks to by default.
 pub fn host() -> String {
     std::env::var("GH_HOST")
@@ -1004,48 +1028,29 @@ fn remotes_include(remotes: &str, repo: &str) -> bool {
 }
 
 /// (rows, more than that) of one list tab, for the panel titles.
-pub fn count(repo: &str, global: bool, panel: usize, tab: usize) -> Result<(usize, bool), String> {
-    let n = list(repo, global, panel, tab, false)?.len();
+pub fn count(repo: &str, panel: usize, tab: usize) -> Result<(usize, bool), String> {
+    let n = list(repo, panel, tab, false)?.len();
     Ok((n, n >= cap(panel)))
 }
 
 /// Panels: 0 Status, 1 Pull requests, 2 Issues, 3 Actions, 4 Branches, 5 Releases, 6 Notifications, 7 Tags.
 /// In the global view panels 1-2 search across all repos and the repo-only ones are empty.
 /// `fresh` skips the on-disk cache (the user asked for a refresh).
-pub fn list(
-    repo: &str,
-    global: bool,
-    panel: usize,
-    tab: usize,
-    fresh: bool,
-) -> Result<Vec<Item>, String> {
-    let mut v = list_raw(repo, global, panel, tab, fresh)?;
+pub fn list(repo: &str, panel: usize, tab: usize, fresh: bool) -> Result<Vec<Item>, String> {
+    let mut v = list_raw(repo, panel, tab, fresh)?;
     v.iter_mut().for_each(clean_item);
     Ok(v)
 }
 
-fn list_raw(
-    repo: &str,
-    global: bool,
-    panel: usize,
-    tab: usize,
-    fresh: bool,
-) -> Result<Vec<Item>, String> {
+fn list_raw(repo: &str, panel: usize, tab: usize, fresh: bool) -> Result<Vec<Item>, String> {
     let limit = format!("--limit={LIMIT}");
     if panel == 6 {
         let all = parse_notifications(&gh(["api", "notifications"])?)?;
         // Scoped to the current repo unless in the global view.
         return Ok(all
             .into_iter()
-            .filter(|n| global || n.repo.eq_ignore_ascii_case(repo))
+            .filter(|n| n.repo.eq_ignore_ascii_case(repo))
             .collect());
-    }
-    if global {
-        return if matches!(panel, 1 | 2) {
-            search(panel, tab)
-        } else {
-            Ok(vec![])
-        };
     }
     match panel {
         0 => Ok(vec![Item {
@@ -1922,7 +1927,7 @@ pub fn needs_fetch(kind: Kind, tab: Tab) -> bool {
     !matches!(
         (kind, tab),
         (
-            Kind::Issue | Kind::Workflow | Kind::Branch | Kind::Other,
+            Kind::Issue | Kind::Workflow | Kind::Branch | Kind::Repo | Kind::Other,
             Tab::Overview
         )
     )
@@ -2697,6 +2702,39 @@ pub fn checkout(repo: &str, n: u64) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_local_repo_comes_from_git_remotes_without_an_api_call() {
+        let r = |s: &str| repo_from_remotes(s, "github.com");
+        assert_eq!(
+            r(
+                "origin\thttps://github.com/cli/cli.git (fetch)\norigin\thttps://github.com/cli/cli.git (push)\n"
+            ),
+            Some("cli/cli".into())
+        );
+        assert_eq!(
+            r("origin\tgit@github.com:o/r.git (fetch)\n"),
+            Some("o/r".into())
+        );
+        assert_eq!(
+            r("origin\tssh://git@github.com/o/r (fetch)\n"),
+            Some("o/r".into())
+        );
+        assert_eq!(
+            r(
+                "up\thttps://github.com/up/stream (fetch)\norigin\thttps://github.com/me/fork (fetch)\n"
+            ),
+            Some("me/fork".into()),
+            "origin first"
+        );
+        assert_eq!(r("origin\thttps://gitlab.com/o/r (fetch)\n"), None);
+        assert_eq!(r("origin\thttps://github.com/o/r/extra (fetch)\n"), None);
+        assert_eq!(r(""), None);
+        assert_eq!(
+            repo_from_remotes("origin\thttps://ghe.corp/o/r (fetch)\n", "ghe.corp"),
+            Some("o/r".into())
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_hung_gh_is_killed_at_the_deadline_and_on_quit() {
@@ -2918,8 +2956,8 @@ mod tests {
     fn slow_lookups_are_cached_privately_and_refresh_skips_the_cache() {
         let shim = crate::testshim::Shim::new();
         shim.set("rest.out", r#"[{"name":"v1","commit":{"sha":"abc1234"}}]"#);
-        list("o/r", false, 7, 0, false).unwrap();
-        list("o/r", false, 7, 0, true).unwrap();
+        list("o/r", 7, 0, false).unwrap();
+        list("o/r", 7, 0, true).unwrap();
         form_data("o/r", None, None);
         let calls = shim.calls();
         assert!(
@@ -3505,8 +3543,8 @@ mod tests {
             (3, 1),
             (4, 0),
         ] {
-            let items = list(&repo, false, panel, tab, true)
-                .unwrap_or_else(|e| panic!("list {panel}/{tab}: {e}"));
+            let items =
+                list(&repo, panel, tab, true).unwrap_or_else(|e| panic!("list {panel}/{tab}: {e}"));
             println!("list {panel}/{tab}: {} items", items.len());
             for it in items.iter().take(2) {
                 for t in tabs(it.kind) {

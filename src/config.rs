@@ -21,6 +21,52 @@ pub struct Config {
     pub panels: PanelsCfg,
     #[serde(skip_serializing_if = "ApiCfg::is_default")]
     pub api: ApiCfg,
+    #[serde(skip_serializing_if = "UiCfg::is_default")]
+    pub ui: UiCfg,
+}
+
+/// Where gh-pulse opens: the repo of the current directory, or the cross-repo home.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StartMode {
+    /// A repo when the directory is a clone (or `-R` is given), otherwise the global home.
+    Auto,
+    /// Always a repo; outside a clone that is an error.
+    Repo,
+    /// Always the global home (`G` reaches the repo of the directory).
+    Global,
+}
+
+impl StartMode {
+    pub fn parse(s: &str) -> Option<StartMode> {
+        match s {
+            "auto" => Some(StartMode::Auto),
+            "repo" => Some(StartMode::Repo),
+            "global" => Some(StartMode::Global),
+            _ => None,
+        }
+    }
+}
+
+/// `[ui]`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiCfg {
+    pub start: StartMode,
+}
+
+impl Default for UiCfg {
+    fn default() -> Self {
+        UiCfg {
+            start: StartMode::Auto,
+        }
+    }
+}
+
+impl UiCfg {
+    fn is_default(&self) -> bool {
+        *self == UiCfg::default()
+    }
 }
 
 /// How tab counts are fetched: `lazy` = the focused panel's other tabs after a second of idling.
@@ -114,7 +160,42 @@ pub enum PanelName {
     Repo,
     Notifications,
     Status,
+    /// Favorites / Recent repos (repo-mode and global).
+    Repos,
+    // global-home sections
+    Review,
+    Mine,
+    Assigned,
+    Involved,
 }
+
+impl PanelName {
+    fn repo_mode(self) -> bool {
+        !matches!(
+            self,
+            PanelName::Review | PanelName::Mine | PanelName::Assigned | PanelName::Involved
+        )
+    }
+
+    fn global_mode(self) -> bool {
+        matches!(
+            self,
+            PanelName::Review
+                | PanelName::Mine
+                | PanelName::Assigned
+                | PanelName::Involved
+                | PanelName::Repos
+                | PanelName::Files
+        )
+    }
+
+    pub fn word(self) -> String {
+        format!("{self:?}").to_lowercase()
+    }
+}
+
+const REPO_NAMES: &str = "prs, files, issues, actions, repo, notifications, status, repos";
+const GLOBAL_NAMES: &str = "review, mine, assigned, involved, repos, files";
 
 /// One list tab of a panel: `id` is what `gh::list` understands, `short` is the squeezed label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +256,8 @@ pub struct PanelsCfg {
     pub show: Vec<PanelName>,
     /// Collapse panels with nothing in any tab to one line.
     pub hide_empty: bool,
+    /// The global home's panels, in display order: any of review, mine, assigned, involved, repos, files.
+    pub global: Vec<PanelName>,
     pub prs: PanelCfg<PrTab>,
     pub issues: PanelCfg<IssueTab>,
     pub actions: PanelCfg<ActionTab>,
@@ -192,6 +275,12 @@ impl Default for PanelsCfg {
                 PanelName::Repo,
             ],
             hide_empty: false,
+            global: vec![
+                PanelName::Review,
+                PanelName::Mine,
+                PanelName::Assigned,
+                PanelName::Repos,
+            ],
             prs: Default::default(),
             issues: Default::default(),
             actions: Default::default(),
@@ -237,6 +326,37 @@ impl PanelsCfg {
             .collect()
     }
 
+    /// The global home's panels (`files` needs a PR section).
+    pub fn global_layout(&self) -> Vec<PanelSpec> {
+        let td = |id, label, short| TabDef { id, label, short };
+        let prs = self
+            .global
+            .iter()
+            .any(|n| matches!(n, PanelName::Review | PanelName::Mine | PanelName::Involved));
+        self.global
+            .iter()
+            .copied()
+            .filter(|n| prs || *n != PanelName::Files)
+            .map(|name| {
+                let tabs = match name {
+                    PanelName::Mine => vec![
+                        td(0, "Open", "Open"),
+                        td(1, "Merged", "Mrg"),
+                        td(2, "Closed", "Cls"),
+                    ],
+                    PanelName::Assigned => vec![
+                        td(0, "Assigned", "Asg"),
+                        td(1, "Mine", "Mine"),
+                        td(2, "Mentioned", "Ment"),
+                    ],
+                    PanelName::Repos => vec![td(0, "Favorites", "Fav"), td(1, "Recent", "Rec")],
+                    _ => vec![],
+                };
+                PanelSpec { name, tabs, tab: 0 }
+            })
+            .collect()
+    }
+
     pub fn layout(&self) -> Vec<PanelSpec> {
         self.effective()
             .into_iter()
@@ -256,6 +376,44 @@ impl PanelsCfg {
     /// (section header, key inside it, message): enough to point at the offending line.
     fn check(&self) -> Result<(), (&'static str, &'static str, String)> {
         let lower = |x: &dyn std::fmt::Debug| format!("{x:?}").to_lowercase();
+        for n in &self.show {
+            if !n.repo_mode() {
+                return Err((
+                    "[panels]",
+                    "show",
+                    format!(
+                        "panels.show: {} is a global-home panel (list it in `global`); valid here: {REPO_NAMES}",
+                        n.word()
+                    ),
+                ));
+            }
+        }
+        for (i, n) in self.global.iter().enumerate() {
+            if !n.global_mode() {
+                return Err((
+                    "[panels]",
+                    "global",
+                    format!(
+                        "panels.global: {} is a repo panel (list it in `show`); valid here: {GLOBAL_NAMES}",
+                        n.word()
+                    ),
+                ));
+            }
+            if self.global[..i].contains(n) {
+                return Err((
+                    "[panels]",
+                    "global",
+                    format!("panels.global: {} listed twice", n.word()),
+                ));
+            }
+        }
+        if self.global_layout().is_empty() {
+            return Err((
+                "[panels]",
+                "global",
+                "panels.global needs at least one panel (files only works together with review, mine or involved)".into(),
+            ));
+        }
         for (i, n) in self.show.iter().enumerate() {
             if self.show[..i].contains(n) {
                 return Err((
@@ -471,10 +629,12 @@ pub enum Act {
     Global,
     Browser,
     Inbox,
+    Scope,
+    SwitchRepoContext,
 }
 
 impl Act {
-    pub const ALL: [Act; 17] = [
+    pub const ALL: [Act; 19] = [
         Act::Quit,
         Act::Help,
         Act::Refresh,
@@ -492,6 +652,8 @@ impl Act {
         Act::Global,
         Act::Browser,
         Act::Inbox,
+        Act::Scope,
+        Act::SwitchRepoContext,
     ];
 
     pub fn name(self) -> &'static str {
@@ -513,6 +675,8 @@ impl Act {
             Act::Global => "global",
             Act::Browser => "repo_browser",
             Act::Inbox => "inbox",
+            Act::Scope => "scope",
+            Act::SwitchRepoContext => "switch_repo_context",
         }
     }
 
@@ -535,6 +699,8 @@ impl Act {
             Act::Global => &["G"],
             Act::Browser => &["B", "ctrl-r"],
             Act::Inbox => &["N"],
+            Act::Scope => &["s"],
+            Act::SwitchRepoContext => &["S"],
         }
     }
 }
@@ -794,7 +960,7 @@ mod tests {
         assert_eq!(tabs, [4, 0, 3, 2, 3]);
         assert!(!c.panels.hide_empty);
         // the inbox key is part of the closed key set
-        assert_eq!(Act::ALL.len(), 17);
+        assert_eq!(Act::ALL.len(), 19);
         assert_eq!(
             Keymap::build(&BTreeMap::new()).unwrap().label(Act::Inbox),
             "N"
@@ -963,5 +1129,103 @@ mod tests {
         save_to(&path, &Config::default()).unwrap();
         assert!(!std::fs::read_to_string(&path).unwrap().contains("api"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ui_start_defaults_to_auto_and_rejects_unknown_modes() {
+        assert_eq!(parse("", "t").unwrap().ui.start, StartMode::Auto);
+        for (v, m) in [
+            ("auto", StartMode::Auto),
+            ("repo", StartMode::Repo),
+            ("global", StartMode::Global),
+        ] {
+            assert_eq!(
+                parse(&format!("[ui]\nstart = \"{v}\"\n"), "t")
+                    .unwrap()
+                    .ui
+                    .start,
+                m
+            );
+        }
+        let e = parse("ascii = true\n[ui]\nstart = \"home\"\n", "cfg").unwrap_err();
+        assert!(
+            e.starts_with("cfg:3:") && e.contains("auto") && e.contains("global"),
+            "{e}"
+        );
+        let e = parse("[ui]\nstat = \"auto\"\n", "cfg").unwrap_err();
+        assert!(e.starts_with("cfg:2:") && e.contains("stat"), "{e}");
+        // a non-default value survives the app's own saves; the default is not written
+        let dir = std::env::temp_dir().join(format!("gh-pulse-ui-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let c = parse("[ui]\nstart = \"global\"\n", "t").unwrap();
+        save_to(&path, &c).unwrap();
+        assert_eq!(load_from(&path).unwrap(), c);
+        save_to(&path, &Config::default()).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("[ui]"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_global_home_panels_are_configurable_and_validated() {
+        use PanelName::*;
+        let g = |c: &Config| -> Vec<PanelName> {
+            c.panels.global_layout().iter().map(|p| p.name).collect()
+        };
+        let c = parse("", "t").unwrap();
+        assert_eq!(
+            g(&c),
+            [Review, Mine, Assigned, Repos],
+            "Involved is off by default"
+        );
+        let tabs: Vec<_> = c
+            .panels
+            .global_layout()
+            .iter()
+            .map(|p| p.tabs.len())
+            .collect();
+        assert_eq!(tabs, [0, 3, 3, 2]);
+        let c = parse(
+            "[panels]\nglobal = [\"repos\", \"involved\", \"review\", \"files\"]\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(g(&c), [Repos, Involved, Review, Files]);
+        // files needs a PR section
+        let c = parse("[panels]\nglobal = [\"assigned\", \"files\"]\n", "t").unwrap();
+        assert_eq!(g(&c), [Assigned]);
+        // repo-mode lists may now include `repos`, but not the global sections (and vice versa)
+        let c = parse("[panels]\nshow = [\"prs\", \"repos\"]\n", "t").unwrap();
+        assert_eq!(
+            c.panels.layout().iter().map(|p| p.name).collect::<Vec<_>>(),
+            [Prs, Repos]
+        );
+        let e = parse("[panels]\nshow = [\"prs\", \"review\"]\n", "cfg").unwrap_err();
+        assert!(
+            e.starts_with("cfg:2:") && e.contains("global-home panel") && e.contains("repos"),
+            "{e}"
+        );
+        let e = parse("[panels]\nglobal = [\"review\", \"actions\"]\n", "cfg").unwrap_err();
+        assert!(
+            e.starts_with("cfg:2:") && e.contains("repo panel") && e.contains("involved"),
+            "{e}"
+        );
+        let e = parse("[panels]\nglobal = [\"mine\", \"mine\"]\n", "cfg").unwrap_err();
+        assert!(e.contains("mine listed twice"), "{e}");
+        let e = parse("[panels]\nglobal = []\n", "cfg").unwrap_err();
+        assert!(e.starts_with("cfg:2:") && e.contains("at least one"), "{e}");
+        let e = parse("[panels]\nglobal = [\"nope\"]\n", "cfg").unwrap_err();
+        assert!(
+            e.starts_with("cfg:2:") && e.contains("nope") && e.contains("review"),
+            "{e}"
+        );
+        // the new actions are part of the closed key set with their defaults
+        let km = Keymap::build(&BTreeMap::new()).unwrap();
+        assert_eq!(
+            (km.label(Act::Scope), km.label(Act::SwitchRepoContext)),
+            ("s".into(), "S".into())
+        );
+        let mut over = BTreeMap::new();
+        over.insert("scope".to_string(), Keys::One("z".into()));
+        assert_eq!(Keymap::build(&over).unwrap().label(Act::Scope), "z");
     }
 }

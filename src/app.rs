@@ -4,6 +4,7 @@ use crate::config::{self, Act, Config, Keymap, PanelName, PanelsCfg, TabDef};
 use crate::diff::{self, DiffMode};
 use crate::form::{self, Form};
 use crate::gh::{self, Data, FilesData, Item, Kind, Tab};
+use crate::global::{self, Scope, Section};
 use crate::pool::{self, Prio};
 use crate::rate::{self, RateState};
 use crate::state::Viewed;
@@ -20,6 +21,14 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
+
+/// Every list load gets a number nobody else has had: panels of different homes (a repo, then
+/// another repo, the global home) can't mistake one another's late replies for their own.
+static SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn next_seq() -> u64 {
+    SEQ.fetch_add(1, Relaxed) + 1
+}
 
 /// Seconds the repo's header facts stay cached.
 const META_TTL: u64 = 300;
@@ -81,12 +90,93 @@ pub enum PK {
     /// Branches / Tags / Releases as list tabs.
     Repo,
     Notifs,
+    // global-home sections (searches across repos)
+    Review,
+    MyPrs,
+    Assigned,
+    Involved,
+    /// Favorites / Recent repos.
+    Repos,
 }
 
 impl PK {
     pub fn derived(self) -> bool {
         matches!(self, PK::Files | PK::Commits | PK::Checks | PK::Comments)
     }
+
+    /// Lists whose rows are pull requests (the Files panel follows the one you were last in).
+    pub fn is_pr_list(self) -> bool {
+        matches!(self, PK::Prs | PK::Review | PK::MyPrs | PK::Involved)
+    }
+
+    /// The global sections: a GitHub search each, loaded when first focused, never counted in the background.
+    pub fn is_global_search(self) -> bool {
+        matches!(self, PK::Review | PK::MyPrs | PK::Assigned | PK::Involved)
+    }
+}
+
+/// The home that is not on screen (repo or global) with what it needs to come back as it was:
+/// cursor, tab, filter, and for a repo its name and facts. Empty `panels` means "not built yet".
+struct Side {
+    panels: Vec<Panel>,
+    focus: usize,
+    repo: String,
+    meta: Option<gh::RepoMeta>,
+    counts: HashMap<CountKey, (usize, bool)>,
+    branch: String,
+    cwd_branch: Option<String>,
+    filter: String,
+    pr_src: usize,
+    from_global: bool,
+}
+
+impl Side {
+    fn empty(repo: String) -> Side {
+        Side {
+            panels: vec![],
+            focus: 0,
+            repo,
+            meta: None,
+            counts: HashMap::new(),
+            branch: String::new(),
+            cwd_branch: None,
+            filter: String::new(),
+            pr_src: 0,
+            from_global: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Loc {
+    Active,
+    Ctx,
+    Other,
+}
+
+/// What choosing a row in the scope picker does.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScopeChoice {
+    Set(Scope),
+    Stage(ScopeStage),
+}
+
+/// The `s` picker for the global home's scope.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ScopeStage {
+    Top,
+    Orgs,
+    Repos,
+}
+
+pub struct ScopePicker {
+    pub stage: ScopeStage,
+    pub cursor: usize,
+    /// Type-ahead in the Orgs and Repos stages.
+    pub query: String,
+    /// Repo names the Repos stage filters (favorites, recent, the cached repo list): read once on
+    /// entering the stage, not on every frame and key.
+    pub names: Vec<String>,
 }
 
 /// "Drill-in" mode: the left column shows the PR's own Files / Checks / Comments.
@@ -111,6 +201,10 @@ pub struct Panel {
     stamp: Arc<AtomicU64>,
     /// Not loaded yet: the REST-backed panels wait for their first focus (saves startup calls).
     pub unloaded: bool,
+    /// Rows left out because their repo is hidden (global sections).
+    pub hidden: usize,
+    /// Favorites a favorites-scoped search could not include.
+    pub not_shown: usize,
 }
 
 impl Panel {
@@ -127,13 +221,15 @@ impl Panel {
             seq: 0,
             stamp: Arc::new(AtomicU64::new(0)),
             unloaded: false,
+            hidden: 0,
+            not_shown: 0,
         }
     }
 
     /// Searches (GitHub's search API / GraphQL search) are the tightest-limited lists: their counts
     /// are never fetched in the background.
     fn search_backed(kind: PK, id: usize) -> bool {
-        matches!((kind, id), (PK::Prs | PK::Issues, 0 | 1))
+        kind.is_global_search() || matches!((kind, id), (PK::Prs | PK::Issues, 0 | 1))
     }
 
     /// The `gh::list` id of the active tab.
@@ -248,6 +344,7 @@ pub enum Modal {
     },
     Confirm(Confirm),
     Form(Box<Form>),
+    Scope(ScopePicker),
 }
 
 /// Screen regions recorded by the last draw, for mouse hit-testing.
@@ -292,6 +389,12 @@ struct RepoMsg {
 /// Seconds the repo list stays fresh; older cached rows still show at once, then refresh.
 const REPOS_TTL: u64 = 600;
 
+// How many times the repo-list cache was read (tests assert the picker does not re-read per key).
+#[cfg(test)]
+thread_local! {
+    static READS: Cell<usize> = const { Cell::new(0) };
+}
+
 /// The repo list as cached, with who it was fetched as.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CachedRepos {
@@ -307,6 +410,8 @@ fn repos_key(host: &str, login: &str) -> String {
 
 /// Cached rows and their age, for this host and login only (and re-cleaned: the disk is not trusted).
 fn read_repos() -> Option<(CachedRepos, u64)> {
+    #[cfg(test)]
+    READS.with(|r| r.set(r.get() + 1));
     let (host, login) = gh::identity()?;
     let st = crate::cache::Store::default_if_enabled()?;
     let (mut c, age): (CachedRepos, u64) = st.read(&repos_key(&host, &login), rate::now())?;
@@ -409,10 +514,10 @@ enum Msg {
     Done(Result<String, String>, Then),
     FormData(u64, Box<gh::FormData>),
     /// The branch checked out in the working directory, when it is a clone of the repo.
-    Branch(u64, Option<String>),
+    Branch(String, Option<String>),
     Repos(u64, Result<RepoMsg, String>),
     /// Repo facts for the header (generation of the header lookup).
-    Meta(u64, gh::RepoMeta),
+    Meta(String, gh::RepoMeta),
     /// (list generation, panel, tab id, (rows, more)) for the other tabs' counts.
     Count(u64, CountKey, Result<(usize, bool), String>),
     /// Unread notifications, for the badge (and the inbox when open).
@@ -422,7 +527,11 @@ enum Msg {
     /// A queued detail fetch that was dropped before it started: forget its placeholder.
     Dropped(String, Tab, u64),
     /// The batched startup request failed (not a rate limit): load the panels one by one instead.
-    StartupFallback(u64),
+    StartupFallback(String),
+    /// A global section's side facts, sent just before its list: (panel, seq, hidden rows, favorites left out).
+    GMeta(PK, usize, u64, usize, usize, Option<String>),
+    /// Your organizations, for the scope picker.
+    Orgs(Result<Vec<String>, String>),
     /// Who reacted to one comment: (item key, comment id, names or the error).
     Reactors(String, String, u64, Result<Vec<gh::Reaction>, String>),
 }
@@ -482,7 +591,21 @@ pub struct App {
     pub help_scroll: usize,
     /// Set by the renderer: how far the help popup can scroll.
     pub help_max: Cell<usize>,
+    /// The global home is on screen (otherwise a repo).
     pub global: bool,
+    /// The other home, parked.
+    other: Option<Side>,
+    /// What the global sections are narrowed to.
+    pub scope: Scope,
+    /// Reached the repo from the global home: the header says so and `G` goes back.
+    pub from_global: bool,
+    /// Where the scope and the recent repos are persisted (None in tests).
+    state_dir: Option<PathBuf>,
+    recent: crate::state::Recent,
+    /// Your organizations once fetched (scope picker).
+    pub orgs: Option<Vec<String>>,
+    /// The PR list the Files panel follows (the one you were last in).
+    pr_src: usize,
     pub show_log: bool,
     pub modal: Option<Modal>,
     pub status: String,
@@ -631,7 +754,15 @@ fn derive_items(kind: PK, pr: &Item, d: &Data) -> Vec<Item> {
 }
 
 fn build_panels(cfg: &PanelsCfg) -> Vec<Panel> {
-    cfg.layout()
+    panels_from(cfg.layout())
+}
+
+fn build_global_panels(cfg: &PanelsCfg) -> Vec<Panel> {
+    panels_from(cfg.global_layout())
+}
+
+fn panels_from(specs: Vec<config::PanelSpec>) -> Vec<Panel> {
+    specs
         .into_iter()
         .map(|s| {
             let (kind, title) = match s.name {
@@ -643,6 +774,11 @@ fn build_panels(cfg: &PanelsCfg) -> Vec<Panel> {
                 PanelName::Repo => (PK::Repo, ""),
                 PanelName::Notifications => (PK::Notifs, "Notifications"),
                 PanelName::Status => (PK::Status, "Status"),
+                PanelName::Repos => (PK::Repos, "Repos"),
+                PanelName::Review => (PK::Review, "Review requested"),
+                PanelName::Mine => (PK::MyPrs, "My PRs"),
+                PanelName::Assigned => (PK::Assigned, "Issues"),
+                PanelName::Involved => (PK::Involved, "Involved"),
             };
             let mut p = Panel::new(kind, title, s.tabs);
             p.tab = s.tab;
@@ -657,13 +793,21 @@ fn step(cur: usize, d: isize, max: usize) -> usize {
 
 impl App {
     /// The real entry point: config and keymap come from the user's config file.
-    pub fn from_config(repo: String, theme: Theme, cfg: Config, keys: Keymap) -> Self {
+    pub fn from_config(
+        repo: Option<String>,
+        global: bool,
+        theme: Theme,
+        cfg: Config,
+        keys: Keymap,
+    ) -> Self {
         gh::set_sync_viewed(cfg.sync_viewed);
-        let mut app = Self::build(repo, theme, true, cfg);
+        let mut app = Self::build_start(repo, global, theme, true, cfg);
         (app.keys, app.cfg_path) = (keys, config::path());
         let (viewed, warn) = Viewed::load(crate::state::path());
         app.viewed = viewed;
-        app.status = warn.unwrap_or_default();
+        if let Some(w) = warn {
+            app.status = w;
+        }
         app
     }
 
@@ -673,9 +817,26 @@ impl App {
         Self::build(repo, theme, load, Config::default())
     }
 
+    #[cfg(test)]
     pub fn build(repo: String, theme: Theme, load: bool, cfg: Config) -> Self {
+        Self::build_start(Some(repo), false, theme, load, cfg)
+    }
+
+    /// `repo`: the repo context (the one shown, or the one `G` leads to); `global`: open the home.
+    pub fn build_start(
+        repo: Option<String>,
+        global: bool,
+        theme: Theme,
+        load: bool,
+        cfg: Config,
+    ) -> Self {
         let (tx, rx) = channel();
-        let panels = build_panels(&cfg.panels);
+        let panels = if global {
+            build_global_panels(&cfg.panels)
+        } else {
+            build_panels(&cfg.panels)
+        };
+        let repo_name = repo.clone().unwrap_or_default();
         let mut app = App {
             cfg,
             cfg_path: None,
@@ -685,8 +846,16 @@ impl App {
             hit: RefCell::default(),
             tick: 0,
             hl: RefCell::new(None),
-            header: format!(" {repo}"),
-            repo,
+            header: if global {
+                " all repos".to_string()
+            } else {
+                format!(" {repo_name}")
+            },
+            repo: if global {
+                String::new()
+            } else {
+                repo_name.clone()
+            },
             meta: None,
             panels,
             counts: HashMap::new(),
@@ -717,7 +886,14 @@ impl App {
             help: false,
             help_scroll: 0,
             help_max: Cell::new(0),
-            global: false,
+            global,
+            other: (global && repo.is_some()).then(|| Side::empty(repo_name)),
+            scope: Scope::All,
+            from_global: false,
+            state_dir: None,
+            recent: crate::state::Recent::new(&gh::host()),
+            orgs: None,
+            pr_src: 0,
             show_log: false,
             modal: None,
             status: String::new(),
@@ -753,24 +929,82 @@ impl App {
             tx,
             rx,
         };
+        app.pr_src = app
+            .panels
+            .iter()
+            .position(|p| p.kind.is_pr_list())
+            .unwrap_or(0);
+        if global {
+            app.rebuild_header();
+        }
         if load {
             rate::set_limits(app.cfg.api.low_quota_percent, app.cfg.api.pause_percent);
             crate::cache::set_enabled(app.cfg.api.cache);
             pool::init(app.cfg.api.max_concurrent);
             gh::set_timeout(app.cfg.api.timeout_s);
-            // REST-backed panels load when first focused; the focused one (and PRs/Issues) now
-            for p in &mut app.panels {
-                p.unloaded = !matches!(p.kind, PK::Prs | PK::Issues | PK::Files);
+            if let Some(d) = crate::state::dir() {
+                app.scope = crate::state::load_scope(&d.join("scope.json"), &gh::host())
+                    .and_then(|s| Scope::parse(&s))
+                    .unwrap_or(Scope::All);
+                app.recent = crate::state::Recent::load(&d.join("recent.json"), &gh::host());
+                // an existing directory of ours is tightened to 0700 now; a foreign or linked one is refused
+                match crate::cache::ensure_dir(&d) {
+                    Ok(()) => app.state_dir = Some(d),
+                    Err(e) => app.status = format!("state not saved: {e}"),
+                }
             }
-            let f = app.focus;
-            app.panels[f].unloaded = false;
-            app.spawn_header();
-            app.start_load(false);
-            app.load_unfocused_lazy_marks();
+            if app.global {
+                app.load_global_side();
+            } else {
+                app.load_repo_side();
+            }
             app.spawn_unread(Prio::Background);
             app.spawn_rate_poll();
         }
         app
+    }
+
+    /// The repo home's first load: PRs and Issues in one request, the rest when first focused.
+    fn load_repo_side(&mut self) {
+        // REST-backed panels load when first focused; the focused one (and PRs/Issues) now
+        for p in &mut self.panels {
+            p.unloaded = !matches!(p.kind, PK::Prs | PK::Issues | PK::Files | PK::Repos);
+        }
+        let f = self.focus;
+        self.panels[f].unloaded = false;
+        self.spawn_header();
+        self.start_load(false);
+        self.load_unfocused_lazy_marks();
+        self.touch_recent();
+        for i in 0..self.panels.len() {
+            if self.panels[i].kind == PK::Repos {
+                self.load_panel(i, false);
+            }
+        }
+    }
+
+    /// The global home's first load: only the focused section searches; the others wait for focus.
+    fn load_global_side(&mut self) {
+        for p in &mut self.panels {
+            p.unloaded = true;
+        }
+        let f = self.focus;
+        self.panels[f].unloaded = false;
+        // who you are comes from gh's own config (no API call) when it is recorded there
+        if let Some((_, login)) = gh::identity() {
+            self.user = login;
+        } else if self.net {
+            let (tx, g) = (self.tx.clone(), self.hgen);
+            self.user_job(move || {
+                let _ = tx.send(Msg::User(g, gh::user()));
+            });
+        }
+        self.rebuild_header();
+        for i in 0..self.panels.len() {
+            if i == f || self.panels[i].kind == PK::Repos {
+                self.load_panel(i, false);
+            }
+        }
     }
 
     /// Panels the user hasn't looked at keep their placeholder; the focused one loads now.
@@ -835,7 +1069,7 @@ impl App {
     /// Local part of the header (the cwd's branch, when the directory is a clone of this repo).
     fn spawn_header(&mut self) {
         self.hgen += 1;
-        let (tx, repo, g) = (self.tx.clone(), self.repo.clone(), self.hgen);
+        let (tx, repo) = (self.tx.clone(), self.repo.clone());
         self.user_job(move || {
             let branch = gh::cwd_is_clone_of(&repo)
                 .then(|| {
@@ -846,7 +1080,7 @@ impl App {
                         .unwrap_or_default()
                 })
                 .filter(|b| !b.is_empty());
-            let _ = tx.send(Msg::Branch(g, branch));
+            let _ = tx.send(Msg::Branch(repo, branch));
         });
     }
 
@@ -856,7 +1090,29 @@ impl App {
         } else {
             format!("  user: {}", self.user)
         };
-        self.header = format!(" {}  branch: {}{user}", self.repo, self.branch);
+        self.header = if self.global {
+            format!(" all repos  scope: {}{user}", self.scope.label())
+        } else if self.from_global {
+            format!(
+                " all repos \u{203a} {}  branch: {}{user}",
+                self.repo, self.branch
+            )
+        } else {
+            format!(" {}  branch: {}{user}", self.repo, self.branch)
+        };
+    }
+
+    /// Remember the repo you are in (Recent, newest first), persisted next to the other state.
+    fn touch_recent(&mut self) {
+        if self.repo.is_empty() {
+            return;
+        }
+        self.recent.touch(&self.repo.clone());
+        if let Some(d) = &self.state_dir
+            && let Err(e) = self.recent.save(&d.join("recent.json"))
+        {
+            self.status = format!("recent repos not saved: {e}");
+        }
     }
 
     /// One GraphQL request for the PR and Issues lists, the viewer and the repo facts (cached for
@@ -880,7 +1136,7 @@ impl App {
             let p = &mut self.panels[i];
             p.loading = true;
             p.error = None;
-            p.seq += 1;
+            p.seq = next_seq();
             p.unloaded = false;
             p.stamp.store(p.seq, Relaxed);
             let tab = p.tab_id();
@@ -919,7 +1175,7 @@ impl App {
                     }
                     if let Some(m) = st.meta {
                         write_meta(&repo, &m, &st.user);
-                        let _ = tx.send(Msg::Meta(g, m));
+                        let _ = tx.send(Msg::Meta(repo.clone(), m));
                     }
                     let _ = tx.send(Msg::User(g, st.user));
                     if let Some(n) = st.open_prs {
@@ -932,7 +1188,7 @@ impl App {
                     }
                 }
                 Err(_) => {
-                    let _ = tx.send(Msg::StartupFallback(g));
+                    let _ = tx.send(Msg::StartupFallback(repo));
                 }
             },
             // lost (queue full, panic): the lists must not sit on "loading..."
@@ -960,7 +1216,7 @@ impl App {
         self.user_job(move || {
             let _ = tx.send(Msg::User(g, gh::user()));
             if let Ok(m) = gh::repo_meta(&repo) {
-                let _ = tx.send(Msg::Meta(g, m));
+                let _ = tx.send(Msg::Meta(repo, m));
             }
         });
     }
@@ -1052,6 +1308,11 @@ impl App {
     }
 
     fn load_panel(&mut self, i: usize, fresh: bool) {
+        match self.panels[i].kind {
+            k if k.is_global_search() => return self.load_global(i),
+            PK::Repos => return self.load_repos_panel(i),
+            _ => {}
+        }
         let p = &mut self.panels[i];
         let Some((src, tab_id)) = p.source() else {
             return;
@@ -1059,18 +1320,13 @@ impl App {
         p.loading = true;
         p.unloaded = false;
         p.error = None;
-        p.seq += 1;
+        p.seq = next_seq();
         p.stamp.store(p.seq, Relaxed);
         if !self.net {
             return;
         }
         let (seq, kind, tab, stamp) = (p.seq, p.kind, p.tab, p.stamp.clone());
-        let (tx, tx2, repo, global) = (
-            self.tx.clone(),
-            self.tx.clone(),
-            self.repo.clone(),
-            self.global,
-        );
+        let (tx, tx2, repo) = (self.tx.clone(), self.tx.clone(), self.repo.clone());
         // a list the user already moved past (another tab, a newer load) never starts
         self.queue(
             Prio::User,
@@ -1080,7 +1336,7 @@ impl App {
                     kind,
                     tab,
                     seq,
-                    gh::list(&repo, global, src, tab_id, fresh),
+                    gh::list(&repo, src, tab_id, fresh),
                 ));
             },
             // lost (queue full, panic): the panel must not sit on "loading..."
@@ -1093,6 +1349,102 @@ impl App {
                 ));
             },
         );
+    }
+
+    /// A global section: one search per scope chunk, run at user priority when the section is focused,
+    /// reloaded or its scope changed. Hidden repos are dropped inside the job.
+    fn load_global(&mut self, i: usize) {
+        let kind = self.panels[i].kind;
+        let sec = match kind {
+            PK::Review => Section::Review,
+            PK::MyPrs => Section::MyPrs,
+            PK::Assigned => Section::Assigned,
+            _ => Section::Involved,
+        };
+        let tab_id = self.panels[i].tab_id();
+        // the search API allows 30 requests a minute: never start a refresh the rest of the minute can't pay for
+        let needed = global::searches_needed(sec, tab_id, &self.scope, &self.cfg.repos.favorites);
+        if let Some(b) = self.rate.search.filter(|b| rate::now() < b.reset)
+            && (b.remaining as usize) < needed
+        {
+            let msg = format!("search quota low, resets {}", rate::clock(b.reset));
+            let p = &mut self.panels[i];
+            (p.loading, p.unloaded) = (false, false);
+            if p.items.is_empty() {
+                p.error = Some(msg.clone());
+            }
+            self.status = msg;
+            return;
+        }
+        let p = &mut self.panels[i];
+        p.loading = true;
+        p.unloaded = false;
+        p.error = None;
+        p.seq = next_seq();
+        p.stamp.store(p.seq, Relaxed);
+        let (seq, tab, stamp) = (p.seq, p.tab, p.stamp.clone());
+        if !self.net {
+            return;
+        }
+        let (scope, favs, hidden) = (
+            self.scope.clone(),
+            self.cfg.repos.favorites.clone(),
+            self.cfg.repos.clone(),
+        );
+        let quota = self
+            .rate
+            .search
+            .filter(|b| rate::now() < b.reset)
+            .map(|b| global::Quota {
+                remaining: b.remaining,
+                limit: b.limit,
+            });
+        if scope == Scope::Favorites && !favs.iter().any(|f| crate::state::valid_repo(f)) {
+            self.status = "no favorites yet: press f on a repo in the Repos panel".into();
+        }
+        let (tx, tx2) = (self.tx.clone(), self.tx.clone());
+        self.queue(
+            Prio::User,
+            move || stamp.load(Relaxed) != seq,
+            move || match global::fetch_section(sec, tab_id, &scope, &favs, &hidden, quota) {
+                Ok(l) => {
+                    let _ = tx.send(Msg::GMeta(kind, tab, seq, l.hidden, l.not_shown, l.note));
+                    let _ = tx.send(Msg::List(kind, tab, seq, Ok(l.items)));
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::List(kind, tab, seq, Err(e)));
+                }
+            },
+            move || {
+                let _ = tx2.send(Msg::List(
+                    kind,
+                    tab,
+                    seq,
+                    Err("could not load; try again (r)".into()),
+                ));
+            },
+        );
+    }
+
+    /// The Repos panel is local: favorites from the config, recent repos from the state file, details
+    /// from the cached repo list. No API call.
+    fn load_repos_panel(&mut self, i: usize) {
+        let known = read_repos().map(|(c, _)| c.rows).unwrap_or_default();
+        let names: Vec<String> = if self.panels[i].tab_id() == 0 {
+            self.cfg.repos.favorites.clone()
+        } else {
+            self.recent.repos.clone()
+        };
+        let items = global::repo_items(
+            &names,
+            &known,
+            &self.cfg.repos,
+            rate::now() as i64,
+            &gh::host(),
+        );
+        let p = &mut self.panels[i];
+        p.cursor = p.cursor.min(items.len().saturating_sub(1));
+        (p.items, p.loading, p.unloaded, p.error) = (items, false, false, None);
     }
 
     /// Counts for tabs that aren't showing. `lazy` (default): the focused panel's other tabs once
@@ -1138,12 +1490,12 @@ impl App {
             self.repo.clone(),
             self.cgen,
         );
-        let (gen_a, global) = (self.cgen_a.clone(), self.global);
+        let gen_a = self.cgen_a.clone();
         self.queue(
             Prio::Background,
             move || gen_a.load(Relaxed) != g,
             move || {
-                let _ = tx.send(Msg::Count(g, key, gh::count(&repo, global, src, tab)));
+                let _ = tx.send(Msg::Count(g, key, gh::count(&repo, src, tab)));
             },
             move || {
                 let _ = tx2.send(Msg::Count(g, key, Err("dropped".into())));
@@ -1154,10 +1506,31 @@ impl App {
     /// The panel of this kind, in the active set or the one parked while drilled in.
     fn panel_mut(&mut self, k: PK) -> Option<&mut Panel> {
         let parked = self.ctx.as_mut().map(|c| &mut c.saved);
+        let other = self.other.as_mut().map(|s| &mut s.panels);
         self.panels
             .iter_mut()
             .chain(parked.into_iter().flatten())
+            .chain(other.into_iter().flatten())
             .find(|p| p.kind == k)
+    }
+
+    /// Where the panel that asked for list `seq` lives now: on screen, behind a drill-in, or parked
+    /// with the other home. A reply that matches none of them is for something that is gone.
+    fn locate(&self, kind: PK, tab: usize, seq: u64) -> Option<(Loc, usize)> {
+        let find = |ps: &[Panel]| {
+            ps.iter()
+                .position(|p| p.kind == kind && p.seq == seq && p.tab == tab)
+        };
+        if let Some(i) = find(&self.panels) {
+            return Some((Loc::Active, i));
+        }
+        if let Some(i) = self.ctx.as_ref().and_then(|c| find(&c.saved)) {
+            return Some((Loc::Ctx, i));
+        }
+        self.other
+            .as_ref()
+            .and_then(|o| find(&o.panels))
+            .map(|i| (Loc::Other, i))
     }
 
     #[cfg(test)]
@@ -1224,27 +1597,22 @@ impl App {
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 Msg::List(kind, tab, seq, res) => {
-                    let (global, hidden) = (self.global, self.cfg.repos.clone());
                     let (pending, cur) = (self.pending_select.clone(), self.repo.clone());
-                    let Some(p) = self.panel_mut(kind) else {
+                    let Some((loc, idx)) = self.locate(kind, tab, seq) else {
                         continue;
                     };
-                    if p.tab != tab || p.seq != seq {
-                        continue;
-                    }
+                    let p = match loc {
+                        Loc::Active => &mut self.panels[idx],
+                        Loc::Ctx => &mut self.ctx.as_mut().expect("located there").saved[idx],
+                        Loc::Other => &mut self.other.as_mut().expect("located there").panels[idx],
+                    };
                     p.loading = false;
                     let consumed = pending.as_ref().is_some_and(|x| x.0 == kind);
                     let key = (kind, p.tab_id());
                     let cap = p.source().map_or(gh::LIMIT, |s| gh::cap(s.0));
                     let (mut found, mut rec) = (false, None);
                     match res {
-                        Ok(mut items) => {
-                            // hidden repos disappear from the cross-repo (global) results
-                            let cross_repo = (global && matches!(p.kind, PK::Prs | PK::Issues))
-                                || p.kind == PK::Notifs;
-                            if cross_repo {
-                                items.retain(|i| !hidden.is_hidden(&i.repo));
-                            }
+                        Ok(items) => {
                             p.cursor = p.cursor.min(items.len().saturating_sub(1));
                             if let Some((pk, n, repo)) = pending
                                 && pk == p.kind
@@ -1272,8 +1640,15 @@ impl App {
                         self.pending_select = None;
                     }
                     if let Some(r) = rec {
-                        self.cpending.remove(&key);
-                        self.counts.insert(key, r);
+                        // a parked home keeps its own counts
+                        if loc == Loc::Other {
+                            if let Some(o) = self.other.as_mut() {
+                                o.counts.insert(key, r);
+                            }
+                        } else {
+                            self.cpending.remove(&key);
+                            self.counts.insert(key, r);
+                        }
                     }
                 }
                 Msg::Count(g, key, res) => {
@@ -1292,9 +1667,11 @@ impl App {
                         }
                     }
                 }
-                Msg::Meta(g, m) => {
-                    if g == self.hgen {
+                Msg::Meta(repo, m) => {
+                    if !self.global && self.repo == repo {
                         self.meta = Some(m);
+                    } else if let Some(o) = self.other.as_mut().filter(|o| o.repo == repo) {
+                        o.meta = Some(m);
                     }
                 }
                 Msg::Inbox(seq, res) => {
@@ -1373,11 +1750,14 @@ impl App {
                     }
                     self.reload_all();
                 }
-                Msg::Branch(g, b) => {
-                    if g == self.hgen {
+                Msg::Branch(repo, b) => {
+                    if !self.global && self.repo == repo {
                         self.branch = b.clone().unwrap_or_default();
                         self.cwd_branch = b;
                         self.rebuild_header();
+                    } else if let Some(o) = self.other.as_mut().filter(|o| o.repo == repo) {
+                        o.branch = b.clone().unwrap_or_default();
+                        o.cwd_branch = b;
                     }
                 }
                 Msg::FormData(seq, d) => {
@@ -1433,6 +1813,36 @@ impl App {
                         (b.loading, b.error) = (false, Some(e));
                     }
                 }
+                Msg::GMeta(kind, tab, seq, hidden, not_shown, note) => {
+                    if let Some((loc, idx)) = self.locate(kind, tab, seq) {
+                        let p = match loc {
+                            Loc::Active => &mut self.panels[idx],
+                            Loc::Ctx => &mut self.ctx.as_mut().expect("located there").saved[idx],
+                            Loc::Other => {
+                                &mut self.other.as_mut().expect("located there").panels[idx]
+                            }
+                        };
+                        (p.hidden, p.not_shown) = (hidden, not_shown);
+                        if loc != Loc::Other {
+                            if let Some(n) = note {
+                                self.status = n;
+                            } else if not_shown > 0 {
+                                self.status = format!(
+                                    "(+{not_shown} favorites not shown \u{2014} narrow the scope with s)"
+                                );
+                            }
+                        }
+                    }
+                }
+                Msg::Orgs(res) => match res {
+                    Ok(v) => {
+                        self.orgs = Some(v.into_iter().filter(|o| global::valid_owner(o)).collect())
+                    }
+                    Err(e) => {
+                        self.orgs = Some(vec![]);
+                        self.status = format!("could not list your organizations: {e}");
+                    }
+                },
                 Msg::User(g, u) => {
                     if g == self.hgen && !u.is_empty() {
                         self.user = u;
@@ -1446,8 +1856,8 @@ impl App {
                         self.cache.remove(&(key, tab));
                     }
                 }
-                Msg::StartupFallback(g) => {
-                    if g == self.hgen {
+                Msg::StartupFallback(repo) => {
+                    if !self.global && self.repo == repo {
                         self.fallback_start();
                     }
                 }
@@ -1538,7 +1948,7 @@ impl App {
         if self.last_more.is_some_and(|t| t.elapsed() < gh::PAGE_GAP) {
             return;
         }
-        let Some(it) = self.selected().cloned() else {
+        let Some(it) = self.selected().cloned().filter(Item::repo_ok) else {
             return;
         };
         let key = (it.key(), Tab::Comments);
@@ -1597,6 +2007,15 @@ impl App {
             return;
         }
         let key = (it.key(), tab);
+        // a repo name that isn't plain owner/name is shown (neutralized) but never sent to gh
+        if !it.repo_ok() {
+            self.cache.entry(key).or_insert_with(|| {
+                Load::Done(Err(
+                    "this repo's name looks unsafe: not contacting GitHub for it".into(),
+                ))
+            });
+            return;
+        }
         // added to what queued jobs still want right away; the set is replaced (never cleared first)
         // when the tick ends, so a job can't be judged stale in between
         self.want_now.insert(key.clone());
@@ -1615,12 +2034,13 @@ impl App {
             return;
         }
         self.cache.insert(key.clone(), Load::Loading);
-        let (tx, tx2, repo, g) = (
-            self.tx.clone(),
-            self.tx.clone(),
-            self.repo.clone(),
-            self.dgen,
-        );
+        // an item carries its repo (every row of the global home does): that, not the app's repo
+        let repo = if it.repo.is_empty() {
+            self.repo.clone()
+        } else {
+            it.repo.clone()
+        };
+        let (tx, tx2, g) = (self.tx.clone(), self.tx.clone(), self.dgen);
         let (wanted, gen_a, k2) = (self.wanted.clone(), self.dgen_a.clone(), key.clone());
         let key3 = key.clone();
         self.queue(
@@ -1704,7 +2124,7 @@ impl App {
         let kind = self.panels[self.focus].kind;
         // The PR behind Files/Checks/Comments: only fetched while the user is working on PRs.
         if let Some(pr) = self.pr_item().filter(|p| p.kind == Kind::Pr).cloned()
-            && (self.ctx.is_some() || matches!(kind, PK::Prs | PK::Files))
+            && (self.ctx.is_some() || kind.is_pr_list() || kind == PK::Files)
         {
             self.fetch(pr.clone(), Tab::Diff);
             if self.ctx.is_some() {
@@ -1800,6 +2220,20 @@ impl App {
     /// Count of tab `ti` of panel `i`: live for the showing tab, as fetched for the others.
     pub fn tab_count(&self, i: usize, ti: usize) -> Option<(usize, bool)> {
         let p = &self.panels[i];
+        // the Repos panel is local: both of its counts are known without asking anyone
+        if p.kind == PK::Repos {
+            let n = match p.tabs.get(ti)?.id {
+                0 => self
+                    .cfg
+                    .repos
+                    .favorites
+                    .iter()
+                    .filter(|f| crate::state::valid_repo(f))
+                    .count(),
+                _ => self.recent.repos.len(),
+            };
+            return Some((n, false));
+        }
         if ti == p.tab {
             self.active_count(i)
         } else {
@@ -1852,12 +2286,21 @@ impl App {
             .copied()
     }
 
+    /// The PR list the Files panel follows: the one last focused, else the first there is.
+    fn pr_panel(&self) -> Option<usize> {
+        self.panels
+            .get(self.pr_src)
+            .filter(|p| p.kind.is_pr_list())
+            .map(|_| self.pr_src)
+            .or_else(|| self.panels.iter().position(|p| p.kind.is_pr_list()))
+    }
+
     /// The pull request the Files/Checks/Comments panels describe.
     pub fn pr_item(&self) -> Option<&Item> {
         match &self.ctx {
             Some(c) => Some(&c.pr),
             None => self
-                .panel_idx(PK::Prs)
+                .pr_panel()
                 .and_then(|i| self.selected_in(i))
                 .filter(|p| p.kind == Kind::Pr),
         }
@@ -1957,7 +2400,7 @@ impl App {
     /// Selecting another PR restarts the Files panel at its first file.
     fn after_select(&mut self) {
         match self.panels[self.focus].kind {
-            PK::Prs => {
+            k if k.is_pr_list() => {
                 self.set_file(0);
                 self.sync_derived();
             }
@@ -2114,6 +2557,9 @@ impl App {
     fn set_focus(&mut self, i: usize) {
         self.focus = i % self.panels.len();
         self.detail_focus = false;
+        if self.panels[self.focus].kind.is_pr_list() && self.ctx.is_none() {
+            self.pr_src = self.focus;
+        }
         if self.panels[self.focus].unloaded && self.ctx.is_none() {
             self.load_panel(self.focus, false);
         }
@@ -2270,6 +2716,7 @@ impl App {
             KeyCode::Esc => self.filter.clear(),
             KeyCode::Char('w') if self.diff_active() => self.wrap = !self.wrap,
             KeyCode::Char('v') if self.cur_tab() == Tab::Diff => self.toggle_viewed(),
+            KeyCode::Char('H') if self.on_repo_row() => self.toggle_hide(),
             KeyCode::Char('l') | KeyCode::Right if self.selected().is_some() => {
                 self.detail_focus = true
             }
@@ -2354,6 +2801,10 @@ impl App {
 
     /// `filter` narrows to matching actions and jumps straight in when only one matches.
     fn open_menu(&mut self, filter: Option<&str>) {
+        if self.selected().is_some_and(|i| !i.repo_ok()) {
+            self.status = "this repo's name looks unsafe: actions are disabled for it".into();
+            return;
+        }
         let mut items = act::actions(
             self.selected(),
             self.panels[self.focus].source().map_or(99, |s| s.0),
@@ -2441,6 +2892,7 @@ impl App {
             Act::Open => self.open(),
             Act::CopyUrl => self.copy(),
             Act::Checkout => self.checkout(),
+            Act::Zoom if self.on_repo_row() => self.toggle_favorite(),
             Act::Zoom => self.zoom = !self.zoom,
             Act::Browser => self.open_browser(false),
             Act::Inbox => self.open_inbox(),
@@ -2450,16 +2902,47 @@ impl App {
                     && self.ctx.is_none()
                     && self.dk().is_none()
                 {
-                    self.global = !self.global;
-                    self.reload(false);
+                    self.toggle_home();
                 } else if k.code == KeyCode::Char('G') {
                     // Derived panels and drill-in: G is "last row" like End; say why it isn't the toggle.
                     self.nav(isize::MAX);
                     if !self.detail_focus && self.log.is_none() {
-                        self.status = "G jumps to the last row here; the global view toggles from the PR/Issues lists".into();
+                        self.status =
+                            "G jumps to the last row here; the global home toggles from the lists"
+                                .into();
                     }
                 } else {
-                    self.status = "the global view toggles from the PR/Issues lists".into();
+                    self.status = "the global home toggles from the lists".into();
+                }
+            }
+            Act::Scope => {
+                if self.on_repo_row() {
+                    let r = self
+                        .selected_in(self.focus)
+                        .map(|i| i.repo.clone())
+                        .unwrap_or_default();
+                    self.set_scope(Scope::Repo(r));
+                    if !self.global {
+                        self.toggle_home();
+                    }
+                } else if self.global {
+                    self.modal = Some(Modal::Scope(ScopePicker {
+                        stage: ScopeStage::Top,
+                        cursor: 0,
+                        query: String::new(),
+                        names: vec![],
+                    }));
+                } else {
+                    self.status =
+                        "scope narrows the global home: press G, or s on a repo in the Repos panel"
+                            .into();
+                }
+            }
+            Act::SwitchRepoContext => {
+                if self.on_repo_row() {
+                    self.open_repo_row();
+                } else {
+                    self.open_repo_context();
                 }
             }
         }
@@ -2577,15 +3060,22 @@ impl App {
         if it.number == 0 {
             return self.open_url(it.url);
         }
+        // from the global home (or another repo) the item's repo becomes the app's repo first
+        let switch = self.global || !it.repo.eq_ignore_ascii_case(&self.repo);
+        if !switch && self.panel_idx(pk).is_none() {
+            self.status =
+                "that panel is hidden in [panels]; press o to open it in the browser".into();
+            return;
+        }
+        self.inbox = None;
+        if switch {
+            self.go_repo(it.repo.clone());
+        }
         let Some(idx) = self.panel_idx(pk) else {
             self.status =
                 "that panel is hidden in [panels]; press o to open it in the browser".into();
             return;
         };
-        self.inbox = None;
-        if !it.repo.eq_ignore_ascii_case(&self.repo) {
-            self.switch_repo(it.repo.clone());
-        }
         // the lists only hold open items: look in the broadest open tab
         self.pending_select = Some((pk, it.number, self.repo.clone()));
         let p = &mut self.panels[idx];
@@ -2610,7 +3100,7 @@ impl App {
             Out::None => {}
             Out::Close => self.browser = None,
             Out::Reload => self.open_browser(true),
-            Out::Switch(r) => self.switch_repo(r),
+            Out::Switch(r) => self.go_repo(r),
             Out::Fav(r) => {
                 let on = self.cfg.repos.toggle_fav(&r);
                 self.status = format!(
@@ -2623,10 +3113,13 @@ impl App {
                 }
             }
             Out::Hide(r) => {
+                let before = self.cfg.repos.clone();
                 let on = self.cfg.repos.toggle_hidden(&r);
-                self.status = format!("{} {r}", if on { "hidden:" } else { "unhidden:" });
-                if !self.save_cfg() {
-                    self.cfg.repos.toggle_hidden(&r);
+                if self.save_cfg() {
+                    self.status = format!("{} {r}", if on { "hidden:" } else { "unhidden:" });
+                    self.hidden_changed(&r, on);
+                } else {
+                    self.cfg.repos = before;
                 }
             }
         }
@@ -2637,28 +3130,412 @@ impl App {
         self.browser = None;
         self.exit_ctx();
         self.repo = repo;
+        self.touch_recent();
         (self.cwd_branch, self.pending_select) = (None, None);
-        self.global = false;
         (self.branch, self.meta) = (String::new(), None);
         self.rebuild_header();
         let focus = self.focus;
         for (i, p) in self.panels.iter_mut().enumerate() {
             p.cursor = 0;
             // REST-backed panels are looked at again before they are fetched again
-            p.unloaded = i != focus && !matches!(p.kind, PK::Prs | PK::Issues | PK::Files);
+            p.unloaded =
+                i != focus && !matches!(p.kind, PK::Prs | PK::Issues | PK::Files | PK::Repos);
         }
+        self.refresh_repos_panels();
         self.reset_view();
         self.spawn_header();
         self.reload(false);
     }
 
+    /// Park the home on screen so the other can take its place.
+    fn take_side(&mut self) -> Side {
+        Side {
+            panels: std::mem::take(&mut self.panels),
+            focus: self.focus,
+            repo: std::mem::take(&mut self.repo),
+            meta: self.meta.take(),
+            counts: std::mem::take(&mut self.counts),
+            branch: std::mem::take(&mut self.branch),
+            cwd_branch: self.cwd_branch.take(),
+            filter: std::mem::take(&mut self.filter),
+            pr_src: self.pr_src,
+            from_global: self.from_global,
+        }
+    }
+
+    /// Show `side`, building its panels first when it has none yet; true when it was built.
+    fn put_side(&mut self, side: Side, to_global: bool) -> bool {
+        let built = side.panels.is_empty();
+        self.panels = match (built, to_global) {
+            (false, _) => side.panels,
+            (true, true) => build_global_panels(&self.cfg.panels),
+            (true, false) => build_panels(&self.cfg.panels),
+        };
+        self.focus = if built {
+            0
+        } else {
+            side.focus.min(self.panels.len() - 1)
+        };
+        self.repo = side.repo;
+        self.meta = side.meta;
+        self.counts = side.counts;
+        self.branch = side.branch;
+        self.cwd_branch = side.cwd_branch;
+        self.filter = side.filter;
+        self.from_global = side.from_global;
+        self.pr_src = if built {
+            self.panels
+                .iter()
+                .position(|p| p.kind.is_pr_list())
+                .unwrap_or(0)
+        } else {
+            side.pr_src
+        };
+        self.global = to_global;
+        built
+    }
+
+    /// `G`: swap between the repo and the global home, each exactly as it was left (cursor, tab, filter).
+    fn toggle_home(&mut self) {
+        let to_global = !self.global;
+        let next = match self.other.take() {
+            Some(s) if to_global || !s.repo.is_empty() => s,
+            Some(s) => {
+                self.other = Some(s);
+                self.status = "no repo yet: press S on an item, or Enter on a repo".into();
+                return;
+            }
+            None if to_global => Side::empty(String::new()),
+            None => {
+                self.status = "no repo yet: press S on an item, or Enter on a repo".into();
+                return;
+            }
+        };
+        self.browser = None;
+        let cur = self.take_side();
+        let built = self.put_side(next, to_global);
+        self.other = Some(cur);
+        // counts in flight belong to the home that just left
+        self.cgen += 1;
+        self.cgen_a.store(self.cgen, Relaxed);
+        (self.cpending, self.count_failed) = (HashSet::new(), HashSet::new());
+        self.detail_focus = false;
+        self.reset_view();
+        self.rebuild_header();
+        if built && to_global {
+            self.load_global_side();
+        } else if built {
+            self.load_repo_side();
+        } else {
+            let f = self.focus;
+            if self.panels[f].unloaded {
+                self.load_panel(f, false);
+            }
+        }
+    }
+
+    /// Open `repo` as the app's repo (from the browser, an inbox item, `S`, a Repos row). From the
+    /// global home that puts the repo on screen with `G` leading back; from a repo it just switches.
+    fn go_repo(&mut self, repo: String) {
+        if !self.global {
+            return self.switch_repo(repo);
+        }
+        let keep = self
+            .other
+            .as_ref()
+            .is_some_and(|s| s.repo.eq_ignore_ascii_case(&repo) && !s.panels.is_empty());
+        if !keep {
+            self.other = Some(Side::empty(repo));
+        }
+        self.toggle_home();
+        self.from_global = true;
+        self.rebuild_header();
+    }
+
+    /// `S`: the selected item's repo as the app's repo.
+    fn open_repo_context(&mut self) {
+        if !self.global {
+            self.status = "already in a repo; G goes to the global home".into();
+            return;
+        }
+        match self.selected().map(|i| i.repo.clone()) {
+            Some(r) if crate::state::valid_repo(&r) => self.go_repo(r),
+            _ => self.status = "nothing selected to open".into(),
+        }
+    }
+
+    /// Narrow the global home. Persisted (state dir, not config); sections reload when next focused.
+    fn set_scope(&mut self, scope: Scope) {
+        self.scope = scope;
+        if let Some(d) = &self.state_dir
+            && let Err(e) =
+                crate::state::save_scope(&d.join("scope.json"), &gh::host(), &self.scope.key())
+        {
+            self.status = format!("scope not remembered: {e}");
+        }
+        let stale = |panels: &mut Vec<Panel>| {
+            for p in panels.iter_mut().filter(|p| p.kind.is_global_search()) {
+                (p.unloaded, p.cursor, p.hidden, p.not_shown) = (true, 0, 0, 0);
+                p.items.clear();
+            }
+        };
+        if self.global {
+            stale(&mut self.panels);
+            let f = self.focus;
+            if self.panels[f].kind.is_global_search() {
+                self.load_panel(f, false);
+            }
+        } else if let Some(o) = self.other.as_mut() {
+            stale(&mut o.panels);
+        }
+        self.reset_view();
+        self.rebuild_header();
+    }
+
+    fn fetch_orgs(&mut self) {
+        if self.orgs.is_some() {
+            return;
+        }
+        let tx = self.tx.clone();
+        let tx2 = tx.clone();
+        self.user_job_or(
+            move || {
+                let _ = tx.send(Msg::Orgs(global::orgs()));
+            },
+            move || {
+                let _ = tx2.send(Msg::Orgs(Err("request lost".into())));
+            },
+        );
+    }
+
+    /// Rows the picker offers at its current stage: (label, what choosing it does).
+    pub fn scope_choices(&self, p: &ScopePicker) -> Vec<(String, ScopeChoice)> {
+        let q = p.query.to_lowercase();
+        let has = |s: &str| q.is_empty() || s.to_lowercase().contains(&q);
+        match p.stage {
+            ScopeStage::Top => vec![
+                ("All repos".into(), ScopeChoice::Set(Scope::All)),
+                (
+                    format!("Favorites ({})", self.cfg.repos.favorites.len()),
+                    ScopeChoice::Set(Scope::Favorites),
+                ),
+                ("Org...".into(), ScopeChoice::Stage(ScopeStage::Orgs)),
+                ("Repo...".into(), ScopeChoice::Stage(ScopeStage::Repos)),
+            ],
+            ScopeStage::Orgs => self
+                .orgs
+                .iter()
+                .flatten()
+                .filter(|o| has(o))
+                .map(|o| (o.clone(), ScopeChoice::Set(Scope::Org(o.clone()))))
+                .collect(),
+            ScopeStage::Repos => {
+                let mut names: Vec<String> = vec![];
+                for n in &p.names {
+                    if has(n) && !names.iter().any(|x| x.eq_ignore_ascii_case(n)) {
+                        names.push(n.clone());
+                    }
+                }
+                names.truncate(50);
+                let mut v: Vec<(String, ScopeChoice)> = names
+                    .into_iter()
+                    .map(|n| (n.clone(), ScopeChoice::Set(Scope::Repo(n))))
+                    .collect();
+                // a full owner/name typed in is accepted even when no list knows it
+                if crate::state::valid_repo(&p.query)
+                    && !v.iter().any(|(n, _)| n.eq_ignore_ascii_case(&p.query))
+                {
+                    v.insert(
+                        0,
+                        (
+                            format!("use {}", p.query),
+                            ScopeChoice::Set(Scope::Repo(p.query.clone())),
+                        ),
+                    );
+                }
+                v
+            }
+        }
+    }
+
+    /// Candidates for the Repos stage; one disk read of the cached repo list.
+    fn scope_repo_names(&self) -> Vec<String> {
+        let known = read_repos().map(|(c, _)| c.rows).unwrap_or_default();
+        let mut names: Vec<String> = vec![];
+        for n in self
+            .cfg
+            .repos
+            .favorites
+            .iter()
+            .chain(self.recent.repos.iter())
+            .chain(known.iter().map(|r| &r.name))
+        {
+            if crate::state::valid_repo(n) && !names.iter().any(|x| x.eq_ignore_ascii_case(n)) {
+                names.push(n.clone());
+            }
+        }
+        names
+    }
+
+    fn scope_key(&mut self, mut p: ScopePicker, k: KeyEvent) -> Option<Modal> {
+        let typing = p.stage != ScopeStage::Top;
+        let n = self.scope_choices(&p).len();
+        match k.code {
+            KeyCode::Esc => return None,
+            KeyCode::Down => p.cursor = (p.cursor + 1).min(n.saturating_sub(1)),
+            KeyCode::Up => p.cursor = p.cursor.saturating_sub(1),
+            KeyCode::Char('j') if !typing => p.cursor = (p.cursor + 1).min(n.saturating_sub(1)),
+            KeyCode::Char('k') if !typing => p.cursor = p.cursor.saturating_sub(1),
+            KeyCode::Backspace if typing && p.query.is_empty() => {
+                (p.stage, p.cursor) = (ScopeStage::Top, 0)
+            }
+            KeyCode::Backspace if typing => {
+                p.query.pop();
+                p.cursor = 0;
+            }
+            KeyCode::Char(c) if typing && !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                p.query.push(c);
+                p.cursor = 0;
+            }
+            KeyCode::Enter => {
+                let choices = self.scope_choices(&p);
+                match choices.get(p.cursor).map(|c| c.1.clone()) {
+                    Some(ScopeChoice::Set(s)) => {
+                        self.set_scope(s);
+                        return None;
+                    }
+                    Some(ScopeChoice::Stage(st)) => {
+                        (p.stage, p.cursor, p.query) = (st, 0, String::new());
+                        match st {
+                            ScopeStage::Orgs => self.fetch_orgs(),
+                            ScopeStage::Repos => p.names = self.scope_repo_names(),
+                            ScopeStage::Top => {}
+                        }
+                    }
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+        Some(Modal::Scope(p))
+    }
+
+    /// `Enter` / `S` on a Repos row: that repo becomes the app's repo.
+    fn open_repo_row(&mut self) {
+        if let Some(r) = self.selected_in(self.focus).map(|i| i.repo.clone()) {
+            self.go_repo(r);
+        }
+    }
+
+    /// `f` on a Repos row: add or remove the favorite (the same list the repo browser edits).
+    fn toggle_favorite(&mut self) {
+        let Some(r) = self.selected_in(self.focus).map(|i| i.repo.clone()) else {
+            return;
+        };
+        let before = self.cfg.repos.clone();
+        let on = self.cfg.repos.toggle_fav(&r);
+        if !self.save_cfg() {
+            self.cfg.repos = before; // refused: keep memory and file in agreement
+            return;
+        }
+        let (verb, prep) = if on {
+            ("added", "to")
+        } else {
+            ("removed", "from")
+        };
+        self.status = format!("{verb} {r} {prep} favorites");
+        self.refresh_repos_panels();
+        if self.scope == Scope::Favorites {
+            let s = self.scope.clone();
+            self.set_scope(s);
+        }
+    }
+
+    /// `H` on a Repos row: hide or unhide the repo everywhere.
+    fn toggle_hide(&mut self) {
+        let Some(r) = self.selected_in(self.focus).map(|i| i.repo.clone()) else {
+            return;
+        };
+        let before = self.cfg.repos.clone();
+        let on = self.cfg.repos.toggle_hidden(&r);
+        if !self.save_cfg() {
+            self.cfg.repos = before;
+            return;
+        }
+        self.status = format!("{} {r}", if on { "hidden:" } else { "unhidden:" });
+        self.hidden_changed(&r, on);
+    }
+
+    /// The hidden list changed (here or in the repo browser): loaded sections lose a newly hidden
+    /// repo's rows in memory (no search spent). An unhidden repo's rows were filtered out of what we
+    /// hold, so the sections are searched again - the focused one now, the rest when focused - and
+    /// the quota check in `load_global` decides whether that may happen yet.
+    fn hidden_changed(&mut self, r: &str, now_hidden: bool) {
+        if now_hidden {
+            let drop_rows = |panels: &mut Vec<Panel>| {
+                for p in panels.iter_mut().filter(|p| p.kind.is_global_search()) {
+                    let before = p.items.len();
+                    p.items.retain(|i| !i.repo.eq_ignore_ascii_case(r));
+                    p.hidden += before - p.items.len();
+                    p.cursor = p.cursor.min(p.items.len().saturating_sub(1));
+                }
+            };
+            drop_rows(&mut self.panels);
+            if let Some(o) = self.other.as_mut() {
+                drop_rows(&mut o.panels);
+            }
+            self.reset_view();
+        } else {
+            let s = self.scope.clone();
+            self.set_scope(s);
+        }
+    }
+
+    fn refresh_repos_panels(&mut self) {
+        for i in 0..self.panels.len() {
+            if self.panels[i].kind == PK::Repos {
+                self.load_repos_panel(i);
+            }
+        }
+    }
+
+    /// The favorites scope is on but there is nothing to search for.
+    pub fn favorites_missing(&self) -> bool {
+        self.scope == Scope::Favorites
+            && !self
+                .cfg
+                .repos
+                .favorites
+                .iter()
+                .any(|f| crate::state::valid_repo(f))
+    }
+
+    /// The selected row is a repo in the Repos panel (list focus).
+    fn on_repo_row(&self) -> bool {
+        self.panels[self.focus].kind == PK::Repos
+            && !self.detail_focus
+            && self.ctx.is_none()
+            && self.selected_in(self.focus).is_some()
+    }
+
     /// `r`: just the selected item (its cached details) and the list tab it sits in.
     fn refresh_selected(&mut self) {
+        // a search for this section is already out: asking again would only spend the minute's budget
+        let p = &self.panels[self.focus];
+        if self.ctx.is_none() && p.kind.is_global_search() && p.loading {
+            self.status = "already searching".into();
+            return;
+        }
         let key = self.selected().map(Item::key);
         if let Some(k) = &key {
             self.cache.retain(|(ik, _), _| ik != k);
         }
-        if self.ctx.is_none() && self.panels[self.focus].source().is_some() {
+        let k = self.panels[self.focus].kind;
+        if self.ctx.is_none()
+            && (self.panels[self.focus].source().is_some()
+                || k.is_global_search()
+                || k == PK::Repos)
+        {
             self.load_panel(self.focus, true);
         }
         self.status = match key {
@@ -2695,6 +3572,7 @@ impl App {
             }
         };
         match m {
+            Modal::Scope(p) => self.scope_key(p, k),
             Modal::Menu(mut items, i) => match k.code {
                 KeyCode::Esc | KeyCode::Char('q') => None,
                 KeyCode::Enter => self.pick(items.swap_remove(i)),
@@ -3004,8 +3882,11 @@ impl App {
             self.toggle_card(false);
             return;
         }
+        if self.on_repo_row() {
+            return self.open_repo_row();
+        }
         if !self.detail_focus {
-            if self.ctx.is_none() && self.panels[self.focus].kind == PK::Prs {
+            if self.ctx.is_none() && self.panels[self.focus].kind.is_pr_list() {
                 self.enter_ctx();
             } else {
                 self.detail_focus = self.selected().is_some();
@@ -3094,6 +3975,9 @@ impl App {
 
     fn checkout(&mut self) {
         match self.selected() {
+            Some(it) if !it.repo_ok() => {
+                self.status = "this repo's name looks unsafe: not checking it out".into()
+            }
             Some(it) if it.kind == Kind::Pr => {
                 let (repo, n) = (it.repo.clone(), it.number);
                 self.bg(move || gh::checkout(&repo, n));
@@ -3215,11 +4099,16 @@ mod tests {
         a.switch_repo("x/y".into());
         assert!(a.cwd_branch.is_none() && a.pending_select.is_none());
         let stale = a.hgen - 1;
-        a.tx.send(Msg::Branch(stale, Some("old".into()))).unwrap();
+        a.tx.send(Msg::Branch("o/r".into(), Some("old".into())))
+            .unwrap();
         a.tx.send(Msg::User(stale, "mallory".into())).unwrap();
         a.poll();
-        assert!(a.cwd_branch.is_none() && !a.header.contains("mallory"));
-        a.tx.send(Msg::Branch(a.hgen, Some("new".into()))).unwrap();
+        assert!(
+            a.cwd_branch.is_none() && !a.header.contains("mallory"),
+            "a reply for the repo we left"
+        );
+        a.tx.send(Msg::Branch("x/y".into(), Some("new".into())))
+            .unwrap();
         a.poll();
         assert_eq!(a.cwd_branch.as_deref(), Some("new"));
     }
@@ -4239,5 +5128,1024 @@ mod tests {
         // a reload forgets the failure
         a.reload(false);
         assert!(a.count_failed.is_empty());
+    }
+
+    fn gitem(repo: &str, n: u64) -> Item {
+        Item {
+            number: n,
+            title: format!("{repo} item {n}"),
+            repo: repo.into(),
+            state: "open".into(),
+            kind: Kind::Pr,
+            url: format!("https://github.com/{repo}/pull/{n}"),
+            ..Default::default()
+        }
+    }
+
+    /// The global home, with `o/r` as the repo `G` leads to; nothing is fetched.
+    fn home() -> App {
+        let mut a = App::build_start(
+            Some("o/r".into()),
+            true,
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+            Config::default(),
+        );
+        a.panels[0].items = vec![gitem("a/b", 1), gitem("c/d", 2), gitem("e/f", 3)];
+        a
+    }
+
+    fn press(a: &mut App, c: char) {
+        a.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn the_global_home_has_its_own_panels_and_header() {
+        let a = home();
+        assert!(a.global);
+        let kinds: Vec<_> = a.panels.iter().map(|p| p.kind).collect();
+        assert_eq!(kinds, [PK::Review, PK::MyPrs, PK::Assigned, PK::Repos]);
+        assert!(
+            a.header.contains("all repos") && a.header.contains("scope: all"),
+            "{}",
+            a.header
+        );
+        assert!(
+            !a.header.contains("o/r"),
+            "no repo facts in the global header"
+        );
+        // sections are searches: never counted in the background
+        assert!(a.panels.iter().take(3).all(|p| p.kind.is_global_search()));
+        assert!(!a.count_wanted(1, 1) && !a.count_wanted(2, 2));
+    }
+
+    #[test]
+    fn g_swaps_homes_and_each_remembers_its_cursor_tab_and_focus() {
+        let mut a = home();
+        a.panels[0].cursor = 2;
+        press(&mut a, '2'); // My PRs
+        press(&mut a, '}'); // its Merged tab
+        a.panels[1].items = vec![gitem("a/b", 9)];
+        assert_eq!((a.focus, a.panels[1].tab), (1, 1));
+        press(&mut a, 'G');
+        assert!(!a.global);
+        assert_eq!(a.repo, "o/r");
+        assert_eq!(a.panels[0].kind, PK::Prs);
+        assert!(
+            a.header.contains("o/r") && a.header.contains("branch"),
+            "{}",
+            a.header
+        );
+        a.panels[0].items = vec![gitem("o/r", 1), gitem("o/r", 2)];
+        a.panels[0].cursor = 1;
+        press(&mut a, '3'); // Issues
+        press(&mut a, 'G');
+        assert!(a.global);
+        assert_eq!(
+            (a.focus, a.panels[1].tab, a.panels[0].cursor),
+            (1, 1, 2),
+            "global as it was left"
+        );
+        assert_eq!(a.panels[1].items.len(), 1);
+        press(&mut a, 'G');
+        assert_eq!(
+            (a.focus, a.panels[0].cursor),
+            (2, 1),
+            "and the repo as it was left"
+        );
+        assert_eq!(a.panels[0].items.len(), 2);
+    }
+
+    #[test]
+    fn without_a_repo_there_is_nothing_for_g_to_lead_to() {
+        let mut a = App::build_start(
+            None,
+            true,
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+            Config::default(),
+        );
+        press(&mut a, 'G');
+        assert!(a.global && a.status.contains("no repo yet"), "{}", a.status);
+        // but an item's repo can be opened, and then G leads back
+        a.panels[0].items = vec![gitem("x/y", 4)];
+        press(&mut a, 'S');
+        assert!(!a.global && a.repo == "x/y" && a.from_global);
+        assert!(a.header.contains("all repos \u{203a} x/y"), "{}", a.header);
+        press(&mut a, 'G');
+        assert!(a.global && a.panels[0].items.len() == 1);
+    }
+
+    #[test]
+    fn s_in_a_repo_explains_and_s_in_the_home_opens_the_picker() {
+        let mut a = App::with(
+            "o/r".into(),
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+        );
+        press(&mut a, 's');
+        assert!(
+            a.modal.is_none() && a.status.contains("global home"),
+            "{}",
+            a.status
+        );
+        let mut h = home();
+        press(&mut h, 's');
+        assert!(matches!(h.modal, Some(Modal::Scope(_))));
+    }
+
+    #[test]
+    fn the_scope_picker_sets_persists_and_reloads_the_sections() {
+        let dir = std::env::temp_dir().join(format!("gh-pulse-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut a = home();
+        a.state_dir = Some(dir.clone());
+        a.cfg.repos.favorites = vec!["a/b".into()];
+        let saved = || crate::state::load_scope(&dir.join("scope.json"), "github.com");
+        // Favorites
+        press(&mut a, 's');
+        press(&mut a, 'j');
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(a.modal.is_none() && a.scope == Scope::Favorites);
+        assert_eq!(saved().as_deref(), Some("favorites"));
+        assert!(a.header.contains("scope: favorites"));
+        assert!(
+            a.panels[0].loading && a.panels[0].items.is_empty(),
+            "the focused section reloads"
+        );
+        assert!(
+            a.panels[1].unloaded && a.panels[2].unloaded,
+            "the others when focused"
+        );
+        // Org: the list arrives from a message, typing filters it
+        press(&mut a, 's');
+        for _ in 0..2 {
+            a.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        a.tx.send(Msg::Orgs(Ok(vec![
+            "cli".into(),
+            "acme".into(),
+            "bad name".into(),
+        ])))
+        .unwrap();
+        a.poll();
+        let Some(Modal::Scope(p)) = &a.modal else {
+            panic!("still picking")
+        };
+        assert_eq!(p.stage, ScopeStage::Orgs);
+        press(&mut a, 'a');
+        let Some(Modal::Scope(p)) = &a.modal else {
+            panic!()
+        };
+        let names: Vec<_> = a.scope_choices(p).into_iter().map(|c| c.0).collect();
+        assert_eq!(names, ["acme"], "filtered by the typed text");
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(a.scope, Scope::Org("acme".into()));
+        assert_eq!(saved().as_deref(), Some("org:acme"));
+        // Repo: a typed owner/name is accepted; junk is not offered
+        press(&mut a, 's');
+        for _ in 0..3 {
+            a.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        for c in "x/y z".chars() {
+            press(&mut a, c);
+        }
+        let Some(Modal::Scope(p)) = &a.modal else {
+            panic!()
+        };
+        assert!(
+            a.scope_choices(p)
+                .iter()
+                .all(|c| !matches!(&c.1, ScopeChoice::Set(Scope::Repo(r)) if r.contains(' ')))
+        );
+        a.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        a.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(a.scope, Scope::Repo("x/y".into()));
+        assert_eq!(saved().as_deref(), Some("repo:x/y"));
+        assert!(a.header.contains("scope: repo:x/y"));
+        // Esc closes without changing anything
+        press(&mut a, 's');
+        a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(a.modal.is_none() && a.scope == Scope::Repo("x/y".into()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drilling_into_a_pr_keeps_the_global_context() {
+        let mut a = home();
+        a.panels[0].cursor = 1;
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(a.ctx.is_some() && a.global, "drill-in inside the home");
+        assert_eq!(a.ctx.as_ref().unwrap().pr.repo, "c/d");
+        a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(a.ctx.is_none() && a.global);
+        assert_eq!(
+            (a.focus, a.panels[0].cursor),
+            (0, 1),
+            "back at the same row"
+        );
+    }
+
+    #[test]
+    fn hidden_repos_are_counted_in_the_section_not_listed() {
+        let mut a = home();
+        a.panels[0].seq = 4;
+        a.tx.send(Msg::GMeta(PK::Review, 0, 4, 3, 0, None)).unwrap();
+        a.tx.send(Msg::GMeta(PK::Review, 0, 3, 99, 0, None))
+            .unwrap(); // a stale answer
+        a.poll();
+        assert_eq!(a.panels[0].hidden, 3);
+        a.tx.send(Msg::GMeta(PK::Review, 0, 4, 0, 5, None)).unwrap();
+        a.poll();
+        assert!(a.status.contains("+5 favorites not shown"), "{}", a.status);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detail_calls_for_a_row_of_the_home_carry_that_rows_repo() {
+        let shim = crate::testshim::Shim::new();
+        let mut a = home();
+        a.net = true;
+        a.panels[0].items = vec![gitem("other/repo", 7)];
+        a.last_input = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        a.ensure();
+        a.ensure(); // the Overview waits a tick
+        wait(&mut a, "the calls", |_| {
+            let c = shim.calls();
+            c.iter()
+                .any(|x| x.starts_with("pr view 7 -R other/repo --json isDraft"))
+                && c.iter()
+                    .any(|x| x.contains("pr view 7 -R other/repo --json headRefOid"))
+        });
+        assert!(
+            shim.calls()
+                .iter()
+                .filter(|c| c.starts_with("pr "))
+                .all(|c| c.contains("-R other/repo")),
+            "{:?}",
+            shim.calls()
+        );
+        // and the actions carry it too
+        let acts = crate::act::actions(a.selected(), 0, "", &a.sel());
+        let approve = acts
+            .iter()
+            .find(|x| x.label.starts_with("Approve"))
+            .unwrap();
+        assert_eq!(
+            &(approve.build)("")[..],
+            ["gh", "pr", "review", "7", "-R", "other/repo", "--approve"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_global_start_searches_only_the_focused_section_and_the_rest_on_focus() {
+        let shim = crate::testshim::Shim::new();
+        shim.set("searchprs.out", "[]");
+        shim.set("searchissues.out", "[]");
+        let mut a = App::build_start(
+            None,
+            true,
+            Theme::new(false, IconSet::Unicode, true),
+            true,
+            Config::default(),
+        );
+        wait(&mut a, "the first section", |a| !a.panels[0].loading);
+        let searches = |s: &crate::testshim::Shim| {
+            s.calls()
+                .into_iter()
+                .filter(|c| c.starts_with("search "))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(searches(&shim).len(), 1, "{:?}", shim.calls());
+        assert!(searches(&shim)[0].contains("review-requested:@me"));
+        assert!(
+            a.user == "octocat" && a.header.contains("user: octocat"),
+            "{}",
+            a.header
+        );
+        assert!(
+            !shim
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("repo view") || c.starts_with("api user")),
+            "no repo lookups: {:?}",
+            shim.calls()
+        );
+        press(&mut a, '3'); // Issues -> a search on first focus
+        wait(&mut a, "the third section", |a| !a.panels[2].loading);
+        assert_eq!(searches(&shim).len(), 2);
+        assert!(
+            searches(&shim)[1].starts_with("search issues")
+                && searches(&shim)[1].contains("assignee:@me")
+        );
+        // no background counting or polling of searches, however long it idles
+        for _ in 0..5 {
+            a.last_input = std::time::Instant::now() - std::time::Duration::from_secs(10);
+            a.ensure();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(searches(&shim).len(), 2);
+        // a changed scope reloads the focused section only
+        a.set_scope(Scope::Org("cli".into()));
+        wait(&mut a, "reload", |a| !a.panels[2].loading);
+        assert_eq!(searches(&shim).len(), 3);
+        assert!(searches(&shim)[2].ends_with("org:cli"));
+    }
+
+    #[test]
+    fn the_files_panel_follows_the_pr_list_you_were_last_in() {
+        let cfg = config::parse(
+            "[panels]\nglobal = [\"review\", \"mine\", \"files\"]\n",
+            "t",
+        )
+        .unwrap();
+        let mut a = App::build_start(
+            None,
+            true,
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+            cfg,
+        );
+        a.panels[0].items = vec![gitem("a/b", 1)];
+        a.panels[1].items = vec![gitem("c/d", 2), gitem("c/d", 3)];
+        assert_eq!(
+            a.pr_item().map(|i| i.number),
+            Some(1),
+            "the first PR list until you go elsewhere"
+        );
+        press(&mut a, '2');
+        a.panels[1].cursor = 1;
+        press(&mut a, '3'); // Files
+        assert_eq!(a.panels[a.focus].kind, PK::Files);
+        assert_eq!(
+            a.pr_item().map(|i| (i.repo.as_str(), i.number)),
+            Some(("c/d", 3))
+        );
+        // an issue row is not a PR: nothing for Files to show
+        let cfg = config::parse(
+            "[panels]\nglobal = [\"assigned\", \"review\", \"files\"]\n",
+            "t",
+        )
+        .unwrap();
+        let mut b = App::build_start(
+            None,
+            true,
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+            cfg,
+        );
+        b.panels[0].items = vec![Item {
+            kind: Kind::Issue,
+            ..gitem("a/b", 5)
+        }];
+        assert!(b.pr_item().is_none());
+    }
+
+    fn repo_row(name: &str, private: bool, lang: &str) -> RepoRow {
+        RepoRow {
+            name: name.into(),
+            owner: name.split('/').next().unwrap().into(),
+            private,
+            lang: lang.into(),
+            stars: 3,
+            pushed: "2026-01-01T00:00:00Z".into(),
+            ..Default::default()
+        }
+    }
+
+    /// The home with a config file to save to, favorites and recent repos, and a state directory.
+    fn repos_home(tag: &str) -> (App, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("gh-pulse-repos-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = home();
+        a.cfg_path = Some(dir.join("config.toml"));
+        a.state_dir = Some(dir.clone());
+        a.cfg.repos.favorites = vec!["a/b".into(), "c/d".into()];
+        a.recent.repos = vec!["e/f".into(), "a/b".into(), "g/h".into()];
+        a.refresh_repos_panels();
+        (a, dir)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_repos_panel_lists_favorites_and_recent_from_local_data_only() {
+        let shim = crate::testshim::Shim::new();
+        let store = crate::cache::Store::default_if_enabled().unwrap();
+        let c = CachedRepos {
+            host: "github.com".into(),
+            viewer: "octocat".into(),
+            rows: vec![repo_row("a/b", true, "Go")],
+            truncated: false,
+        };
+        store
+            .write(&repos_key("github.com", "octocat"), &c, rate::now())
+            .unwrap();
+        let (mut a, dir) = repos_home("local");
+        assert_eq!(a.panels[3].kind, PK::Repos);
+        let names = |a: &App| {
+            a.panels[3]
+                .items
+                .iter()
+                .map(|i| i.repo.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&a), ["a/b", "c/d"]);
+        assert_eq!(a.panels[3].items[0].state, "fav");
+        assert!(
+            a.panels[3].items[0].meta.starts_with("private \u{b7} Go"),
+            "{}",
+            a.panels[3].items[0].meta
+        );
+        assert!(
+            a.panels[3].items[1].meta.is_empty(),
+            "nothing is looked up for repos the cache doesn't know"
+        );
+        press(&mut a, '4');
+        press(&mut a, '}');
+        assert_eq!(names(&a), ["e/f", "a/b", "g/h"], "Recent, newest first");
+        assert_eq!(
+            a.panels[3].items[1].state, "fav",
+            "a favorite is starred in Recent too"
+        );
+        // both counts are known at once (title: Fav 2 / Rec 3)
+        assert_eq!(
+            (a.tab_count(3, 0), a.tab_count(3, 1)),
+            (Some((2, false)), Some((3, false)))
+        );
+        assert!(
+            shim.calls().is_empty(),
+            "no gh process for any of it: {:?}",
+            shim.calls()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enter_on_a_repo_opens_it_and_records_it_as_recent() {
+        let (mut a, dir) = repos_home("enter");
+        press(&mut a, '4');
+        a.panels[3].cursor = 1; // c/d
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!a.global && a.repo == "c/d" && a.from_global);
+        assert_eq!(a.recent.repos[0], "c/d");
+        let text = std::fs::read_to_string(dir.join("recent.json")).unwrap();
+        assert!(
+            text.contains("\"c/d\"")
+                && text.contains("github.com")
+                && !text.to_lowercase().contains("token"),
+            "{text}"
+        );
+        // S does the same from any row of the home
+        press(&mut a, 'G');
+        press(&mut a, '1');
+        press(&mut a, 'S');
+        assert_eq!(a.repo, "a/b", "the selected PR's repo");
+        assert_eq!(a.recent.repos[..2], ["a/b".to_string(), "c/d".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f_toggles_a_favorite_h_hides_and_s_scopes_the_home_to_a_repo() {
+        let (mut a, dir) = repos_home("keys");
+        press(&mut a, '4');
+        // f: the same favorites list the browser edits, saved to the config file
+        press(&mut a, 'f');
+        assert_eq!(a.cfg.repos.favorites, ["c/d"], "a/b was a favorite");
+        assert!(
+            std::fs::read_to_string(dir.join("config.toml"))
+                .unwrap()
+                .contains("c/d")
+        );
+        assert_eq!(a.panels[3].items.len(), 1);
+        assert!(
+            a.status.contains("removed a/b from favorites"),
+            "{}",
+            a.status
+        );
+        a.panels[3].tab = 1;
+        a.refresh_repos_panels();
+        a.panels[3].cursor = 0; // e/f
+        press(&mut a, 'f');
+        assert!(a.cfg.repos.is_fav("e/f"), "adding from Recent");
+        // H: hidden everywhere; loaded sections just lose its rows, no search is spent
+        a.panels[0].unloaded = false;
+        a.panels[0].items = vec![gitem("e/f", 1), gitem("a/b", 2), gitem("e/f", 3)];
+        a.panels[1].items = vec![gitem("e/f", 4)];
+        press(&mut a, 'H');
+        assert!(a.cfg.repos.is_hidden("e/f"));
+        assert!(!a.panels[0].unloaded && !a.panels[0].loading, "no reload");
+        assert_eq!(
+            a.panels[0]
+                .items
+                .iter()
+                .map(|i| i.number)
+                .collect::<Vec<_>>(),
+            [2]
+        );
+        assert_eq!(
+            (
+                a.panels[0].hidden,
+                a.panels[1].items.len(),
+                a.panels[1].hidden
+            ),
+            (2, 0, 1)
+        );
+        // unhiding cannot bring the rows back by itself: the sections are searched again
+        press(&mut a, 'H');
+        assert!(!a.cfg.repos.is_hidden("e/f") && a.panels[0].unloaded);
+        // s: scope the home to that repo
+        a.panels[3].cursor = 1; // a/b
+        press(&mut a, 's');
+        assert!(
+            a.global && a.scope == Scope::Repo("a/b".into()),
+            "{:?}",
+            a.scope
+        );
+        assert!(a.header.contains("scope: repo:a/b"));
+        assert_eq!(
+            crate::state::load_scope(&dir.join("scope.json"), "github.com").as_deref(),
+            Some("repo:a/b")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refused_config_save_leaves_favorites_alone() {
+        let (mut a, dir) = repos_home("refused");
+        std::fs::write(dir.join("config.toml"), "ascii = [broken\n").unwrap();
+        press(&mut a, '4');
+        press(&mut a, 'f');
+        assert_eq!(
+            a.cfg.repos.favorites,
+            ["a/b", "c/d"],
+            "memory and file agree"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_repos_panel_can_be_added_to_the_repo_layout_but_is_not_there_by_default() {
+        let a = App::with(
+            "o/r".into(),
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+        );
+        assert!(a.panels.iter().all(|p| p.kind != PK::Repos));
+        let cfg = config::parse("[panels]\nshow = [\"prs\", \"repos\"]\n", "t").unwrap();
+        let mut b = App::build(
+            "o/r".into(),
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+            cfg,
+        );
+        b.cfg.repos.favorites = vec!["x/y".into()];
+        b.refresh_repos_panels();
+        assert_eq!(b.panels[1].kind, PK::Repos);
+        press(&mut b, '2');
+        b.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            b.repo, "x/y",
+            "Enter switches the repo, right where you are"
+        );
+        assert!(!b.global && !b.from_global);
+    }
+
+    #[test]
+    fn an_inbox_item_opens_its_repo_from_the_global_home() {
+        let mut a = home();
+        let mut n = gitem("x/y", 9);
+        n.cmd = "77".into();
+        a.seed_inbox(vec![n]);
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(a.inbox.is_none() && !a.global && a.repo == "x/y" && a.from_global);
+        assert_eq!(a.pending_select, Some((PK::Prs, 9, "x/y".into())));
+    }
+
+    #[test]
+    fn r_reloads_the_focused_global_section_and_the_repos_panel() {
+        let mut a = home();
+        a.panels[0].seq = 3;
+        press(&mut a, 'r');
+        assert!(
+            a.panels[0].loading && a.panels[0].seq != 3,
+            "a fresh, never-reused number"
+        );
+        press(&mut a, '4');
+        a.cfg.repos.favorites = vec!["a/b".into()];
+        press(&mut a, 'r');
+        assert_eq!(a.panels[3].items.len(), 1, "the local list is rebuilt");
+    }
+
+    fn list_reply(a: &mut App, kind: PK, tab: usize, seq: u64, items: Vec<Item>) {
+        a.tx.send(Msg::List(kind, tab, seq, Ok(items))).unwrap();
+        a.poll();
+    }
+
+    #[test]
+    fn a_late_reply_from_the_repo_we_left_never_lands_in_the_repo_we_opened() {
+        let mut a = home();
+        press(&mut a, 'G'); // repo A = o/r
+        let (tab, seq_a) = (a.panels[0].tab, a.panels[0].seq);
+        press(&mut a, 'G');
+        a.panels[0].items = vec![gitem("x/y", 9)];
+        press(&mut a, 'S'); // repo B = x/y, a brand new side (A's was replaced)
+        assert_eq!(a.repo, "x/y");
+        let seq_b = a.panels[0].seq;
+        assert_ne!(seq_a, seq_b, "numbers are never reused across homes");
+        assert!(a.panels[0].loading && a.panels[0].items.is_empty());
+        // A's reply arrives before B's own: dropped, B still waiting
+        list_reply(&mut a, PK::Prs, tab, seq_a, vec![gitem("o/r", 1)]);
+        assert!(
+            a.panels[0].items.is_empty() && a.panels[0].loading,
+            "A's list did not land in B"
+        );
+        // B's reply lands; A's duplicate afterwards changes nothing
+        list_reply(&mut a, PK::Prs, tab, seq_b, vec![gitem("x/y", 2)]);
+        assert_eq!(a.panels[0].items[0].repo, "x/y");
+        assert!(!a.panels[0].loading);
+        list_reply(
+            &mut a,
+            PK::Prs,
+            tab,
+            seq_a,
+            vec![gitem("o/r", 3), gitem("o/r", 4)],
+        );
+        assert_eq!(a.panels[0].items.len(), 1);
+        assert_eq!(a.selected().unwrap().repo, "x/y", "actions would target B");
+        // facts and branch for A are dropped too (they are keyed by repo)
+        a.tx.send(Msg::Meta(
+            "o/r".into(),
+            gh::RepoMeta {
+                stars: 99,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+        a.tx.send(Msg::Branch("o/r".into(), Some("feat".into())))
+            .unwrap();
+        a.tx.send(Msg::StartupFallback("o/r".into())).unwrap();
+        a.poll();
+        assert!(a.meta.is_none() && a.cwd_branch.is_none() && !a.header.contains("feat"));
+    }
+
+    #[test]
+    fn replies_for_a_parked_home_reach_their_own_panels_and_counts() {
+        let mut a = home();
+        press(&mut a, 'G'); // repo o/r on screen, global parked
+        let g_seq = a.other.as_ref().unwrap().panels[0].seq;
+        let r_seq = a.panels[0].seq;
+        press(&mut a, 'G'); // global on screen, repo parked
+        let (gtab, rtab) = (a.panels[0].tab, 0);
+        a.panels[0].loading = true;
+        a.panels[0].seq = next_seq();
+        let live_seq = a.panels[0].seq;
+        let counts_before = a.counts.clone();
+        // the repo's list arrives while the global home is showing
+        list_reply(
+            &mut a,
+            PK::Prs,
+            rtab,
+            r_seq,
+            vec![gitem("o/r", 1), gitem("o/r", 2)],
+        );
+        let o = a.other.as_ref().unwrap();
+        assert_eq!(o.panels[0].items.len(), 2, "into the parked repo panel");
+        assert_eq!(
+            o.counts.get(&(PK::Prs, 0)),
+            Some(&(2, false)),
+            "its count in its own map"
+        );
+        assert_eq!(
+            a.counts, counts_before,
+            "the active home's counts are untouched"
+        );
+        assert!(
+            a.panels[0].items.len() == 3 && a.panels[0].loading,
+            "and nothing in the global list"
+        );
+        // an old global reply (before a scope change) is ignored; the fresh one lands
+        let _ = g_seq;
+        list_reply(
+            &mut a,
+            PK::Review,
+            gtab,
+            live_seq - 1,
+            vec![gitem("z/z", 7)],
+        );
+        assert_eq!(a.panels[0].items.len(), 3);
+        list_reply(&mut a, PK::Review, gtab, live_seq, vec![gitem("z/z", 8)]);
+        assert_eq!(a.panels[0].items[0].number, 8);
+    }
+
+    #[test]
+    fn toggling_changing_scope_and_opening_a_repo_while_loads_are_in_flight() {
+        let mut a = home();
+        let tab = a.panels[0].tab;
+        a.panels[0].loading = true;
+        a.panels[0].seq = next_seq();
+        let old = a.panels[0].seq;
+        a.set_scope(Scope::Org("cli".into())); // reloads the focused section: a new number
+        let fresh = a.panels[0].seq;
+        assert_ne!(old, fresh);
+        a.panels[0].items = vec![gitem("cli/cli", 5)];
+        press(&mut a, 'S'); // opens the row's repo; the global home is parked
+        assert!(!a.global);
+        list_reply(&mut a, PK::Review, tab, old, vec![gitem("old/scope", 1)]);
+        list_reply(&mut a, PK::Review, tab, fresh, vec![gitem("cli/cli", 2)]);
+        press(&mut a, 'G');
+        let items: Vec<_> = a.panels[0].items.iter().map(|i| i.repo.clone()).collect();
+        assert_eq!(
+            items,
+            ["cli/cli"],
+            "only the reply for the scope in force survived"
+        );
+    }
+
+    #[test]
+    fn the_scope_picker_reads_the_repo_list_once_not_per_key_or_frame() {
+        let mut a = home();
+        let reads = || READS.with(|r| r.get());
+        press(&mut a, 's');
+        for _ in 0..3 {
+            a.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        let base = reads();
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // Repo... stage
+        assert_eq!(reads(), base + 1, "read once on entering the stage");
+        for c in "abc/d".chars() {
+            press(&mut a, c);
+            let Some(Modal::Scope(p)) = &a.modal else {
+                panic!()
+            };
+            let _ = a.scope_choices(p);
+            let _ = a.scope_choices(p);
+        }
+        a.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(
+            reads(),
+            base + 1,
+            "typing and re-rendering never touch the disk"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_section_refresh_is_bounded_and_respects_the_search_budget() {
+        let shim = crate::testshim::Shim::new();
+        shim.set("searchprs.out", "[]");
+        shim.set("searchissues.out", "[]");
+        let mut a = home();
+        a.net = true;
+        a.cfg.repos.favorites = (0..16).map(|i| format!("o/r{i}")).collect();
+        a.scope = Scope::Favorites;
+        a.panels[0].kind = PK::Involved; // PRs + issues per chunk: the worst case, 4 chunks x 2
+        wait(&mut a, "start", |_| true);
+        a.load_panel(0, false);
+        wait(&mut a, "the section", |a| !a.panels[0].loading);
+        let n = shim
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("search "))
+            .count();
+        assert_eq!(
+            n, 8,
+            "never more than the 8 searches of a full favorites scope"
+        );
+        // with too little search quota left the refresh is refused, with the reset time
+        let calls = shim.calls().len();
+        a.rate.search = Some(rate::Bucket {
+            limit: 30,
+            remaining: 3,
+            reset: rate::now() + 600,
+        });
+        a.panels[0].items = vec![gitem("a/b", 1)];
+        a.load_panel(0, false);
+        assert!(
+            !a.panels[0].loading && a.panels[0].items.len() == 1,
+            "the list is kept"
+        );
+        assert!(
+            a.status.starts_with("search quota low, resets "),
+            "{}",
+            a.status
+        );
+        assert_eq!(shim.calls().len(), calls, "no search was made");
+        // an empty list shows the reason instead of a blank
+        a.panels[0].items.clear();
+        a.load_panel(0, false);
+        assert!(
+            a.panels[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("search quota low")
+        );
+        // and a window that has reset is not held against us
+        a.rate.search = Some(rate::Bucket {
+            limit: 30,
+            remaining: 0,
+            reset: rate::now() - 1,
+        });
+        a.load_panel(0, false);
+        assert!(a.panels[0].loading);
+        wait(&mut a, "the section", |a| !a.panels[0].loading);
+    }
+
+    #[test]
+    fn r_on_a_section_that_is_already_searching_does_nothing() {
+        let mut a = home();
+        a.panels[0].loading = true;
+        let seq = a.panels[0].seq;
+        press(&mut a, 'r');
+        assert_eq!(a.panels[0].seq, seq, "no second search");
+        assert_eq!(a.status, "already searching");
+        a.panels[0].loading = false;
+        press(&mut a, 'r');
+        assert_ne!(a.panels[0].seq, seq);
+    }
+
+    #[test]
+    fn a_failed_search_note_reaches_the_status_line() {
+        let mut a = home();
+        let (tab, seq) = (a.panels[0].tab, a.panels[0].seq);
+        a.tx.send(Msg::GMeta(
+            PK::Review,
+            tab,
+            seq,
+            0,
+            0,
+            Some("1 of 4 searches failed (boom); showing the rest".into()),
+        ))
+        .unwrap();
+        a.poll();
+        assert!(a.status.contains("1 of 4 searches failed"), "{}", a.status);
+    }
+
+    /// A repo browser with one hidden repo under the cursor, ready for `H`.
+    fn browser_on(a: &mut App, name: &str) {
+        let mut b = Browser::new();
+        b.rows = vec![RepoRow {
+            name: name.into(),
+            owner: "e".into(),
+            ..Default::default()
+        }];
+        (b.typing, b.loading, b.show_hidden) = (false, false, true);
+        a.browser = Some(b);
+    }
+
+    #[test]
+    fn unhiding_in_the_browser_refreshes_the_global_sections_and_hiding_trims_them() {
+        let dir = std::env::temp_dir().join(format!("gh-pulse-unhide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = home();
+        a.cfg_path = Some(dir.join("config.toml"));
+        a.cfg.repos.hidden = vec!["e/f".into()];
+        a.panels[0].items = vec![gitem("a/b", 1)];
+        (a.panels[0].hidden, a.panels[1].unloaded) = (1, false);
+        a.panels[1].items = vec![gitem("a/b", 2)];
+        browser_on(&mut a, "e/f");
+        press(&mut a, 'H'); // unhide
+        assert!(!a.cfg.repos.is_hidden("e/f"));
+        assert!(
+            a.panels[0].loading && a.panels[0].items.is_empty(),
+            "the focused section searches again"
+        );
+        assert_eq!(a.panels[0].hidden, 0, "the stale \"1 hidden\" is gone");
+        assert!(
+            a.panels[1].unloaded && a.panels[1].items.is_empty(),
+            "the others when next focused"
+        );
+        // hide it again: rows of that repo vanish in memory, the count follows, nothing is searched
+        a.panels[0].loading = false;
+        a.panels[0].items = vec![gitem("e/f", 5), gitem("a/b", 1)];
+        let seq = a.panels[0].seq;
+        browser_on(&mut a, "e/f");
+        press(&mut a, 'H');
+        assert!(a.cfg.repos.is_hidden("e/f"));
+        assert_eq!(a.panels[0].items.len(), 1);
+        assert_eq!(
+            (a.panels[0].hidden, a.panels[0].seq, a.panels[0].loading),
+            (1, seq, false)
+        );
+        // a refused config save changes nothing
+        std::fs::write(dir.join("config.toml"), "ascii = [broken\n").unwrap();
+        browser_on(&mut a, "e/f");
+        press(&mut a, 'H');
+        assert!(a.cfg.repos.is_hidden("e/f") && a.panels[0].items.len() == 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_repo_name_that_is_not_plain_owner_name_is_shown_neutralized_and_never_used() {
+        let hostile = "ev\u{202e}il/re\u{200b}po\u{2066}";
+        let mut a = home();
+        a.panels[0].items = vec![gitem(hostile, 7)];
+        let it = a.selected().unwrap().clone();
+        assert!(!it.repo_ok());
+        let shown = it.repo_display();
+        assert!(
+            shown.contains("<U+202E>") && shown.contains("<U+200B>") && shown.contains("<U+2066>"),
+            "{shown}"
+        );
+        assert!(!shown.contains('\u{202e}'));
+        // actions: none, with a reason; the menu key, approve/merge shortcuts, checkout, comments paging
+        assert!(crate::act::actions(Some(&it), 0, "", &a.sel()).is_empty());
+        press(&mut a, 'x');
+        assert!(
+            a.modal.is_none() && a.status.contains("unsafe"),
+            "{}",
+            a.status
+        );
+        a.status.clear();
+        press(&mut a, 'a');
+        assert!(a.modal.is_none() && a.status.contains("unsafe"));
+        press(&mut a, 'c');
+        assert!(a.status.contains("unsafe"), "{}", a.status);
+        // `S` refuses it too
+        a.status.clear();
+        press(&mut a, 'S');
+        assert!(a.global, "still in the home: {}", a.status);
+        // and nothing is fetched for it: the detail says why
+        a.net = true;
+        a.want_prev.insert((it.key(), Tab::Overview));
+        a.last_input = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        a.fetch(it.clone(), Tab::Overview);
+        assert!(
+            matches!(a.cache.get(&(it.key(), Tab::Overview)), Some(Load::Done(Err(e))) if e.contains("unsafe"))
+        );
+        // a well-formed one is fine
+        assert!(gitem("cli/cli", 1).repo_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nothing_is_sent_to_gh_for_an_unsafe_repo_name() {
+        let shim = crate::testshim::Shim::new();
+        let mut a = home();
+        a.net = true;
+        a.panels[0].items = vec![gitem("--repo=evil/x", 3), gitem("../..", 4)];
+        a.last_input = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        for _ in 0..3 {
+            a.ensure();
+            a.poll();
+        }
+        a.panels[0].cursor = 1;
+        for _ in 0..3 {
+            a.ensure();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            shim.calls()
+                .iter()
+                .all(|c| !c.contains("evil") && !c.contains("pr view") && !c.contains("pr diff")),
+            "{:?}",
+            shim.calls()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_loose_state_directory_is_tightened_at_start_and_a_linked_one_refused() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let shim = crate::testshim::Shim::new();
+        shim.set("searchprs.out", "[]");
+        let state = shim.dir.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let a = App::build_start(
+            None,
+            true,
+            Theme::new(false, IconSet::Unicode, true),
+            true,
+            Config::default(),
+        );
+        let mode = std::fs::metadata(&state).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "tightened because it is ours");
+        assert!(a.state_dir.is_some());
+        // a symlink where the directory should be: refused, with a notice, and nothing is saved there
+        let target = shim.dir.join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = shim.dir.join("linked-state");
+        symlink(&target, &link).unwrap();
+        crate::state::set_dir(Some(link));
+        let b = App::build_start(
+            None,
+            true,
+            Theme::new(false, IconSet::Unicode, true),
+            true,
+            Config::default(),
+        );
+        assert!(
+            b.state_dir.is_none() && b.status.starts_with("state not saved:"),
+            "{}",
+            b.status
+        );
+        assert!(std::fs::read_dir(&target).unwrap().next().is_none());
     }
 }

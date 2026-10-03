@@ -70,7 +70,7 @@ fn my_uid() -> Option<u32> {
 
 /// A real directory (not a symlink) that we own; permissions are tightened to 0700 when they aren't.
 /// Ok(false): it does not exist.
-fn validate(dir: &Path) -> Result<bool, String> {
+pub(crate) fn validate(dir: &Path) -> Result<bool, String> {
     let m = match std::fs::symlink_metadata(dir) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -91,6 +91,48 @@ fn validate(dir: &Path) -> Result<bool, String> {
         }
     }
     Ok(true)
+}
+
+/// The directory exists, is ours and private (`0700`): created that way, or tightened if it is ours;
+/// refused when it belongs to someone else or is a symlink.
+pub(crate) fn ensure_dir(dir: &Path) -> Result<(), String> {
+    if validate(dir)? {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    validate(dir).map(|_| ())
+}
+
+/// Reads a regular file that is ours, without ever following a symlink: what was opened is checked
+/// to be the very file `lstat` sees at the path, so nothing can be swapped in between.
+pub(crate) fn read_nofollow(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let m = std::fs::symlink_metadata(path).ok()?;
+    if !m.is_file() {
+        return None;
+    }
+    let mut f = std::fs::File::open(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let fm = f.metadata().ok()?;
+        if fm.dev() != m.dev() || fm.ino() != m.ino() || my_uid() != Some(fm.uid()) {
+            return None;
+        }
+    }
+    let mut s = String::new();
+    f.read_to_string(&mut s).ok()?;
+    Some(s)
 }
 
 /// What `gh` is told is `XDG_CACHE_HOME` for a cached call (it appends `/gh`); created private.
@@ -142,21 +184,7 @@ impl Store {
     }
 
     fn ensure(&self) -> Result<(), String> {
-        if validate(&self.dir)? {
-            return Ok(());
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&self.dir)
-                .map_err(|e| format!("{}: {e}", self.dir.display()))?;
-        }
-        #[cfg(not(unix))]
-        std::fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
-        validate(&self.dir).map(|_| ())
+        ensure_dir(&self.dir)
     }
 
     fn file(&self, key: &str) -> PathBuf {
@@ -175,20 +203,8 @@ impl Store {
 
     /// (value, age in seconds) as of `now`. A missing, unreadable or corrupt file is simply no entry.
     pub fn read<T: DeserializeOwned>(&self, key: &str, now: u64) -> Option<(T, u64)> {
-        let path = self.file(key);
         // a planted symlink or someone else's file is not ours to read
-        let m = std::fs::symlink_metadata(&path).ok()?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if my_uid() != Some(m.uid()) {
-                return None;
-            }
-        }
-        if !m.is_file() {
-            return None;
-        }
-        let text = std::fs::read_to_string(path).ok()?;
+        let text = read_nofollow(&self.file(key))?;
         let e: Entry<T> = serde_json::from_str(&text).ok()?;
         let age = now.saturating_sub(e.at);
         (age <= HARD_MAX_AGE).then_some((e.data, age))
@@ -223,7 +239,7 @@ impl Store {
     }
 }
 
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut o = std::fs::OpenOptions::new();
     // create_new = O_CREAT|O_EXCL: it fails on anything already there, a symlink included

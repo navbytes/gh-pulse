@@ -17,6 +17,8 @@ gh-pulse is a single binary: a synchronous ratatui event loop that talks to GitH
 | `src/pool.rs` | The worker pool every `gh` job runs on: two queues (user first), a cap on processes in flight, stale-job dropping, background work standing down under rate pressure |
 | `src/rate.rs` | Shared quota state (graphql / core / search, backoff), thresholds, the chip and pause rules (pure, take `now`) |
 | `src/cache.rs` | `0600` JSON cache in `$XDG_CACHE_HOME/gh-pulse` (repo list, repo facts) and the directory `gh --cache` uses |
+| `src/global.rs` | The global home: scopes, the exact `gh search` arguments per section / tab / favorites chunk, merge-and-sort, hidden-repo filtering with top-up, the organizations list, Repos-panel rows |
+| `src/start.rs` | The start decision (`auto` / `repo` / `global` x `-R` x clone), pure and table-tested |
 | `src/config.rs` | `config.toml` model (incl. `[panels]` layout and tab sets), validation with line numbers, atomic save, the named-action `Keymap` |
 | `src/browse.rs` | Repo browser: GraphQL page parser, filter/sort/favorite/hide logic, browser key handling |
 | `src/md.rs` | Markdown to styled, wrapped lines (pulldown-cmark): headings, code, quotes, lists, tables, folding of `<details>` and long comments |
@@ -48,6 +50,18 @@ key/mouse event -> App (state change) -> spawn thread -> gh subprocess
   ordinary `Action` through the confirm popup.
 - Files, Checks and Comments are *derived panels*: their rows are rebuilt from that cache for the selected (or
   drilled-into) PR by `sync_derived`, so they never fetch on their own.
+
+## Two homes
+
+`App` shows one home at a time (`global` flag) and parks the other in a `Side` (panels, focus, repo, facts, counts,
+filter, breadcrumb); `G` swaps them, so each comes back exactly as left. The global home's panels are searches
+(`PK::Review`, `MyPrs`, `Assigned`, `Involved`), loaded by `load_global` as user-priority pool jobs when focused;
+`PK::Repos` is built synchronously from the config, `recent.json` and the cached repo list. Items carry their repo, and
+every detail fetch and action uses `Item::repo`, so the same panes, drill-in and write actions work across repos. The
+Files panel follows the PR list you were last in (`pr_src`). Result messages for a parked home still find their panel
+(`panel_mut` looks in the parked side too). Search is never polled, and search-backed tabs are never counted. List loads draw their number from one app-wide
+counter, so a late reply from a repo you left can never be taken for the current repo's; replies that carry no list
+number (facts, branch, startup fallback) are keyed by repo name and routed to the side that owns it.
 
 ## API usage
 

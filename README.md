@@ -13,7 +13,9 @@ see, gh-pulse can see.
 
 ## Screenshots
 
-Captured from the real binary against public repos (`scripts/screenshots.py`).
+Captured from the real binary against public repos (`scripts/screenshots.py`). They show the repo home; the global
+home (cross-repo review requests, your PRs, issues and repos) uses the same layout with `owner/repo#N` rows and is not
+pictured yet.
 
 ![Split diff with syntax highlighting](docs/img/2-diff-split.png)
 *Zoomed Diff tab (`f`): auto layout picks side-by-side at width, with syntax highlighting and intra-line highlights.*
@@ -66,7 +68,12 @@ Regenerate with `GH_PULSE_SHOT_BLOCKLIST=word,word python3 scripts/screenshots.p
 - **Actions with a seatbelt**: approve, request changes, comment, merge, close, label, assign, reply to or
   resolve threads, comment on a diff line, re-run or cancel runs, create issues/releases, delete branches. Every
   one shows the exact command first.
-- **Global view**: your PRs and issues across all repositories (`G`), plus a full-screen **repo browser** (`B`) over every repo you can access, with search, sort, favorites and hide.
+- **Global home**: outside a repo (or with `--start global`) gh-pulse opens a cross-repo home: **Review requested**,
+  **My PRs** (Open / Merged / Closed), **Issues** (Assigned / Mine / Mentioned), an optional **Involved**, and a
+  **Repos** panel (Favorites / Recent). Rows read `owner/repo#N`; the detail pane, diffs, checks, comments and every
+  action work across repos without switching. `s` narrows the home to all repos, your favorites, one org or one repo;
+  `S` opens the selected item's repo (`G` goes back); hidden repos are left out. A full-screen **repo browser** (`B`)
+  covers every repo you can access, with search, sort, favorites and hide.
 - **Mouse and keyboard**: click panels, rows and tabs; wheel scrolls. `?` shows every key.
 - **Themes**: dark and light palettes, truecolor with a 256-color fallback, ASCII and Nerd Font icon sets.
 - **Create from the terminal**: new issue (labels validated, `.md` templates, body in a multi-line field), new PR
@@ -103,18 +110,23 @@ incremental and cached per file; jumping to the end of a huge diff skips the lin
 
 ## Usage
 
-Run it inside a clone of a GitHub repository, or point it at one:
+Run it inside a clone of a GitHub repository, point it at one, or run it anywhere for the global home:
 
 ```sh
-gh-pulse                       # repo of the current directory
+gh-pulse                       # in a clone: that repo. Anywhere else: the global home
 gh-pulse -R cli/cli            # any repo you can access
+gh-pulse --start global        # the global home even inside a clone (G reaches the repo)
 gh-pulse --theme light --ascii
 gh-pulse                       # then press B to browse every repo you can access
 ```
 
+Outside a repo there is no error any more: gh-pulse opens the global home (`--start repo` / `[ui] start = "repo"`
+brings the old "not in a GitHub repo" message back).
+
 | Flag | Meaning |
 |---|---|
 | `-R, --repo owner/repo` | Repo to show. Checked up front; exits with a clear message if it is not found. |
+| `--start auto\|repo\|global` | Where to open (config: `[ui] start`, default `auto`): `auto` = the current directory's repo or `-R`, otherwise the global home; `repo` = always a repo (an error outside one); `global` = always the global home. |
 | `--theme dark\|light` | Color palette (default `dark`). |
 | `--ascii` | ASCII icons and borders. Also automatic when the locale is not UTF-8. |
 | `--nerd` | Nerd Font icons. |
@@ -130,6 +142,12 @@ defaults; an invalid file stops startup with `file:line: message`. See [docs/con
 The file never contains credentials; authentication stays entirely with `gh`.
 
 ## Local state
+
+`$XDG_STATE_HOME/gh-pulse` (default `~/.local/state/gh-pulse`) holds `viewed.json` (files marked viewed), `scope.json`
+(the global home's last scope) and `recent.json` (the last 20 repos you entered, per host). Files are `0600`, written
+atomically, and a corrupt one is ignored. The directory is `0700` and must be yours (a foreign-owned or symlinked one
+is refused with a notice); files are read without following links. `scope.json` and `recent.json` remember their host.
+None of it contains credentials.
 
 Slow-changing lookups are cached under `$XDG_CACHE_HOME/gh-pulse` (default `~/.cache/gh-pulse`; a `0700` directory
 you own, files `0600`; a relative `XDG_CACHE_HOME` is ignored, and if the directory is not yours or is a symlink the
@@ -150,7 +168,11 @@ A corrupt state file is ignored with a warning, never a crash.
 
 ## Concepts
 
-- **Repo scope.** Everything is about one repository: the current directory's, or `-R`. The header shows the
+- **Two homes.** The *repo home* is about one repository; the *global home* is about you, across repos. `G` swaps
+  between them and each remembers its cursor, tab and filter; `S` (or Enter on a row of the Repos panel) opens an
+  item's repo, with `G` leading back to where you came from. The global home's scope (`s`: all / favorites / an org /
+  one repo) is remembered between runs in the state directory.
+- **Repo scope.** In the repo home everything is about one repository: the current directory's, or `-R`. The header shows the
   repo, your local branch (only when the directory is a clone of it), your user, and the repo's stars, visibility, default branch and open-PR count. `B` (or `Ctrl-r`) opens the repo browser to switch.
 - **Panels.** Numbered like lazygit; the focused one expands, the rest collapse. `[` `]` change the detail
   tab, `{` `}` change the panel's own list (e.g. Mine vs Merged); pressing the focused panel's number again also steps to
@@ -159,7 +181,10 @@ A corrupt state file is ignored with a warning, never a crash.
   file shown in the diff.
 - **Drill-in.** `Enter` on a PR replaces the left column with Files / Commits / Checks / Comments of that PR; `Esc` goes
   back and your cursor is where you left it.
-- **Global view.** `G` (list focus) swaps the PR and Issues panels to searches across all your repos.
+- **Search budget.** Each global section is one GitHub search (the search API allows 30 a minute), made when you
+  focus the section, change the scope or press `r` (favorites scope: one search per four repos, at most 16 repos).
+  Nothing searches in the background and unopened search tabs show `?`. A section never costs more than 8 searches,
+  `r` while one is running is ignored, and a refresh the rest of the minute can't pay for is refused with the reset time.
 - **Safety.** See below.
 
 ## Keybindings
@@ -210,8 +235,9 @@ at word boundaries with a `↪` marker; `w` switches to clipping. `f` zooms the 
 
 ## FAQ and troubleshooting
 
-- **"not in a GitHub repo" / "repo not found or no access".** Run inside a clone or pass `-R owner/repo`;
-  check `gh auth status` and that the account can see the repo.
+- **"not in a GitHub repo" / "repo not found or no access".** The first only appears with `--start repo`; by default
+  gh-pulse opens the global home outside a clone. For the second, pass a repo you can see with `-R owner/repo` and
+  check `gh auth status`.
 - **Panels sit on "loading...".** gh-pulse waits on `gh`; slow networks or a large account mean several
   seconds. `L` shows what is running.
 - **"Terminal too small".** The minimum is 50x12. On short terminals unfocused panels collapse to one line.

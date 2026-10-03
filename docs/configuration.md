@@ -37,8 +37,12 @@ settle_ms = 250           # idle time before a Comments/Diff/Commits/Checks fetc
 timeout_s = 60            # a gh read that takes longer is killed (pagination 2x, writes 5x)
 cache = true              # on-disk cache of slow-changing lookups
 
+[ui]
+start = "auto"            # auto | repo | global (flag: --start)
+
 [panels]
 show = ["prs", "files", "issues", "actions", "repo"]   # order = numbering
+global = ["review", "mine", "assigned", "repos"]       # the global home
 hide_empty = false
 
 [panels.repo]
@@ -102,6 +106,40 @@ Never cached: tokens, comments, notifications, PR details, diffs, anything from 
 (the cached copy still expires on its own schedule). `gh-pulse --clear-cache` deletes the directory (only after the same
 ownership checks); `[api] cache = false` turns caching off.
 
+## Start mode and the global home
+
+`[ui] start` (or `--start`, which wins) decides where gh-pulse opens:
+
+| Mode | In a clone / with `-R` | Elsewhere |
+|---|---|---|
+| `auto` (default) | that repo | the global home |
+| `repo` | that repo | error: "not in a GitHub repo" |
+| `global` | the global home (`G` reaches the repo) | the global home |
+
+Inside a git work tree `auto` asks GitHub which repo it is (one `gh repo view`); outside one it makes no call at all.
+The global home's panels come from `[panels] global` (any of `review`, `mine`, `assigned`, `involved`, `repos`,
+`files`; default `review, mine, assigned, repos`). Sections are GitHub searches, each fetched when focused (one `gh
+search` call, or one per four favorites with the favorites scope, at most 4): `review-requested:@me is:open
+archived:false`; `author:@me` with `is:open` / `is:merged` / `is:closed is:unmerged`; `assignee:@me`, `author:@me` or
+`mentions:@me` with `is:open` for issues; `involves:@me` (PRs and issues, two calls) for Involved. Rows from hidden
+repos (`[repos] hidden`, the repo browser's `h`) are dropped client side; when that empties a full page one bigger
+request tops it up. The scope (`all`, `favorites`, `org:x`, `repo:a/b`) is stored in `$XDG_STATE_HOME/gh-pulse/scope.json`.
+Search budget: one section refresh costs one search per scope chunk (two for Involved), so at most 8, plus - only
+for a single-chunk scope with at least 10 searches (and a third of the minute) left - one bigger re-ask of just the
+searches that came back full after hidden repos emptied a page. A refresh that the rest of the minute can't pay for
+is refused with "search quota low, resets HH:MM" (the list on screen is kept); `r` while a section is already
+searching is ignored; if some favorites chunks fail the others' rows still show, with a note. `-R` takes whatever
+`gh repo view` takes (`OWNER/REPO`, `HOST/OWNER/REPO`, a URL) and is resolved as before; only names that flow into
+search queries (scope, favorites, recent) are held to a strict `owner/name` form (no `.`/`..` parts, no leading `-`).
+`[repos] favorites` and `hidden` are plain `owner/name` lists with no host: they apply to whichever host you run
+against (`GH_HOST`), while `scope.json` and `recent.json` remember their host and are ignored on another one.
+Hiding a repo (repo browser `H`, or `H` in the Repos panel) drops its rows from the loaded sections at once; unhiding
+searches the sections again (the focused one now, the others when focused, subject to the search quota). One-line
+fields from GitHub (titles, names, labels) show line breaks and tabs as a single space; repo names that are not plain
+`owner/name` are shown neutralized and never passed to `gh` (their actions are disabled).
+The `repos` panel (Favorites from `[repos] favorites`, Recent from `recent.json`) can also be listed in `[panels] show`
+for the repo home; it makes no API calls (details come from the cached repo list).
+
 ## Panels
 
 `[panels] show` lists the left-column panels in display order; the order is also the numbering (`1`, `2`, ...).
@@ -158,6 +196,8 @@ Keys are a single character (case matters: `C` is shift-c), `ctrl-<letter>`, or 
 | `global` | `G` | Toggle the global view |
 | `repo_browser` | `B`, `ctrl-r` | Open the repo browser |
 | `inbox` | `N` | Open the notifications inbox |
+| `scope` | `s` | Global home scope picker (Repos row: scope to that repo) |
+| `switch_repo_context` | `S` | Open the selected item's repo as the app's repo |
 
 The `?` help and the bottom bar show the keys you configured. Startup fails (with the config path and the offending entry) on an unknown action, an unparsable key, a key bound to two actions, an
 empty list, or a key that is reserved for navigation: `j k h l g n p t w v e s S T H .`, `[ ] { }`, digits `1`-`7`,

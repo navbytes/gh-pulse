@@ -128,6 +128,10 @@ pub fn actions(it: Option<&Item>, panel: usize, repo: &str, sel: &Sel) -> Vec<Ac
         _ => {}
     }
     let Some(it) = it else { return v };
+    // a repo name that isn't plain owner/name never reaches a command line
+    if !it.repo_ok() {
+        return vec![];
+    }
     let (r, n) = (it.repo.clone(), it.number.to_string());
     let open = it.state.eq_ignore_ascii_case("open");
     let edit = |view: &'static str, label: &'static str, flag: &'static str, r: &str, n: &str| {

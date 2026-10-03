@@ -7,10 +7,12 @@ mod diff;
 mod dispatch;
 mod form;
 mod gh;
+mod global;
 mod md;
 mod pool;
 mod rate;
 mod sanitize;
+mod start;
 mod state;
 mod syn;
 #[cfg(test)]
@@ -26,8 +28,22 @@ use std::io::IsTerminal;
 use std::time::Duration;
 use theme::{IconSet, Theme};
 
-const USAGE: &str =
-    "usage: gh-pulse [-R owner/repo] [--theme dark|light] [--ascii] [--nerd] [--clear-cache]";
+const USAGE: &str = "usage: gh-pulse [-R owner/repo] [--start auto|repo|global] [--theme dark|light] [--ascii] [--nerd] [--clear-cache]";
+
+const HELP: &str = "gh-pulse: a lazygit-style terminal UI for GitHub
+
+usage: gh-pulse [-R owner/repo] [--start auto|repo|global] [--theme dark|light] [--ascii] [--nerd] [--clear-cache]
+
+  -R, --repo owner/repo   open this repo
+  --start MODE            where to open (config: [ui] start):
+                            auto    the repo of the current directory (or -R); outside one, the global home
+                            repo    always a repo; outside a clone, an error
+                            global  the global home: review requests, your PRs, assigned issues, repos
+                                    (G switches between it and a repo)
+  --theme dark|light      color palette
+  --ascii | --nerd        ASCII icons and borders | Nerd Font icons
+  --clear-cache           delete gh-pulse's on-disk cache and exit
+  -h, --help              this text";
 
 struct MouseGuard;
 
@@ -48,6 +64,7 @@ fn die(msg: &str) -> ! {
 
 fn main() -> std::io::Result<()> {
     let (mut repo, mut light, mut ascii, mut nerd) = (None, None, false, false);
+    let mut start_flag = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -67,7 +84,14 @@ fn main() -> std::io::Result<()> {
                 }
                 return Ok(());
             }
-            "-h" | "--help" => die(USAGE),
+            "--start" => match args.next().as_deref().and_then(config::StartMode::parse) {
+                Some(m) => start_flag = Some(m),
+                None => die("--start takes auto, repo or global"),
+            },
+            "-h" | "--help" => {
+                println!("{HELP}");
+                return Ok(());
+            }
             _ => die(USAGE),
         }
     }
@@ -83,11 +107,17 @@ fn main() -> std::io::Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         die("gh-pulse needs an interactive terminal");
     }
-    let repo = match repo {
-        Some(r) => gh::resolve_repo(&r).unwrap_or_else(|e| die(&e)),
-        None => gh::repo_here()
-            .unwrap_or_else(|e| die(&format!("not in a GitHub repo ({e}); pass -R owner/repo"))),
-    };
+    let mode = start_flag.unwrap_or(cfg.ui.start);
+    // `gh repo view` (an API call) only runs inside a git work tree, and never when -R is given
+    let start = start::decide(
+        mode,
+        repo.clone(),
+        || gh::in_git_repo().then(|| gh::repo_here().ok()).flatten(),
+        gh::local_repo,
+    )
+    .unwrap_or_else(|e| die(&e));
+    let (repo, global) =
+        start::canonical(start, repo.is_some(), gh::resolve_repo).unwrap_or_else(|e| die(&e));
     // Flags win over the config file.
     let (ascii, nerd) = (ascii || cfg.ascii, nerd || cfg.nerd);
     let light = light.unwrap_or(cfg.theme.as_deref() == Some("light"));
@@ -114,7 +144,7 @@ fn main() -> std::io::Result<()> {
     let result = ratatui::run(|term| {
         crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
         let _guard = MouseGuard;
-        let mut app = app::App::from_config(repo, theme, cfg, keys);
+        let mut app = app::App::from_config(repo, global, theme, cfg, keys);
         loop {
             app.poll();
             term.draw(|f| ui::draw(f, &app))?;

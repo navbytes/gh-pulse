@@ -156,15 +156,289 @@ impl Viewed {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        let dir = path.parent().ok_or("bad state path")?;
-        std::fs::create_dir_all(dir).map_err(|e| format!("viewed marks not saved: {e}"))?;
         let body = serde_json::to_string_pretty(&self.map).map_err(|e| e.to_string())?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, body).map_err(|e| format!("viewed marks not saved: {e}"))?;
-        std::fs::rename(&tmp, path).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("viewed marks not saved: {e}")
-        })
+        // the same private directory and 0600 file as the other state files
+        write_private_atomic(path, &body).map_err(|e| format!("viewed marks not saved: {e}"))
+    }
+}
+
+#[cfg(test)]
+static DIR_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Tests point the state directory at a temp directory instead of the user's.
+#[cfg(test)]
+pub fn set_dir(p: Option<PathBuf>) {
+    *DIR_OVERRIDE.lock().unwrap() = p;
+}
+
+/// The state directory (`$XDG_STATE_HOME/gh-pulse`, default `~/.local/state/gh-pulse`); only absolute
+/// paths are honored.
+pub fn dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(d) = DIR_OVERRIDE.lock().unwrap().clone() {
+        return Some(d);
+    }
+    let abs = |k: &str| {
+        std::env::var_os(k)
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+    };
+    let base = abs("XDG_STATE_HOME").or_else(|| abs("HOME").map(|h| h.join(".local/state")))?;
+    Some(base.join("gh-pulse"))
+}
+
+/// Writes `body` to `path` through a unique, exclusively created `0600` temp file and a rename.
+fn write_private_atomic(path: &Path, body: &str) -> Result<(), String> {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = path.parent().ok_or("bad state path")?;
+    crate::cache::ensure_dir(dir)?;
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{}.{n}.tmp", std::process::id()));
+    crate::cache::write_private(&tmp, body.as_bytes()).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })
+}
+
+/// Reads a regular file of ours (never through a symlink); anything else is "no file".
+fn read_regular(path: &Path) -> Option<String> {
+    crate::cache::read_nofollow(path)
+}
+
+/// The last global-home scope (`all`, `favorites`, `org:x`, `repo:a/b`), kept out of config.toml and
+/// tied to the host it was chosen on (another host gets the default).
+pub fn load_scope(path: &Path, host: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct S {
+        host: String,
+        scope: String,
+    }
+    let s: S = serde_json::from_str(&read_regular(path)?).ok()?;
+    (s.host == host).then_some(s.scope)
+}
+
+pub fn save_scope(path: &Path, host: &str, scope: &str) -> Result<(), String> {
+    write_private_atomic(
+        path,
+        &serde_json::json!({ "host": host, "scope": scope }).to_string(),
+    )
+}
+
+/// The repos you entered last, newest first (at most [`RECENT_MAX`]), per host so hosts never mix.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Recent {
+    pub host: String,
+    pub repos: Vec<String>,
+}
+
+pub const RECENT_MAX: usize = 20;
+
+impl Recent {
+    pub fn new(host: &str) -> Recent {
+        Recent {
+            host: host.into(),
+            repos: vec![],
+        }
+    }
+
+    /// A missing, corrupt or other-host file is simply empty (and replaced on the next save).
+    pub fn load(path: &Path, host: &str) -> Recent {
+        let mut r: Recent = read_regular(path)
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .filter(|r: &Recent| r.host == host)
+            .unwrap_or_else(|| Recent::new(host));
+        r.repos.retain(|x| valid_repo(x));
+        r.repos.truncate(RECENT_MAX);
+        r
+    }
+
+    /// Moves `repo` to the front.
+    pub fn touch(&mut self, repo: &str) {
+        self.repos.retain(|r| !r.eq_ignore_ascii_case(repo));
+        self.repos.insert(0, repo.to_string());
+        self.repos.truncate(RECENT_MAX);
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        write_private_atomic(
+            path,
+            &serde_json::to_string(self).map_err(|e| e.to_string())?,
+        )
+    }
+}
+
+/// `owner/name` with only the characters GitHub allows: the one check every name that reaches a
+/// search query or a path goes through.
+pub fn valid_repo(s: &str) -> bool {
+    let ok = |p: &str| {
+        !p.is_empty()
+            && p.len() <= 100
+            && p != "."
+            && p != ".."
+            && !p.starts_with('-')
+            && p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+    };
+    s.split_once('/')
+        .is_some_and(|(o, n)| ok(o) && ok(n) && !n.contains('/'))
+}
+
+#[cfg(test)]
+mod tests_recent {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("gh-pulse-state-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn recent_keeps_twenty_newest_first_without_duplicates() {
+        let mut r = Recent::new("github.com");
+        for i in 0..25 {
+            r.touch(&format!("o/r{i}"));
+        }
+        r.touch("O/R20");
+        assert_eq!(r.repos.len(), RECENT_MAX);
+        assert_eq!(r.repos[0], "O/R20");
+        assert_eq!(
+            r.repos
+                .iter()
+                .filter(|x| x.eq_ignore_ascii_case("o/r20"))
+                .count(),
+            1
+        );
+        assert_eq!(r.repos[1], "o/r24");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recent_and_scope_files_are_private_atomic_and_forgiving() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("files");
+        let p = d.join("recent.json");
+        let mut r = Recent::new("github.com");
+        r.touch("o/a");
+        r.save(&p).unwrap();
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(Recent::load(&p, "github.com"), r);
+        assert!(
+            Recent::load(&p, "ghe.example.com").repos.is_empty(),
+            "another host's list is not mixed in"
+        );
+        // no temp files left behind; a second save replaces the first
+        r.touch("o/b");
+        r.save(&p).unwrap();
+        let names: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        // corrupt or hostile content is ignored
+        std::fs::write(&p, "{ not json").unwrap();
+        assert!(Recent::load(&p, "github.com").repos.is_empty());
+        std::fs::write(
+            &p,
+            r#"{"host":"github.com","repos":["o/ok","a b/c","../x/y","o/r --repo=z"]}"#,
+        )
+        .unwrap();
+        assert_eq!(Recent::load(&p, "github.com").repos, ["o/ok"]);
+        // a symlink where the file should be is not read
+        let target = d.join("elsewhere.json");
+        std::fs::write(&target, r#"{"host":"github.com","repos":["o/planted"]}"#).unwrap();
+        let link = d.join("link.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(Recent::load(&link, "github.com").repos.is_empty());
+        // scope round trip
+        let sp = d.join("scope.json");
+        assert_eq!(load_scope(&sp, "github.com"), None);
+        save_scope(&sp, "github.com", "org:cli").unwrap();
+        assert_eq!(load_scope(&sp, "github.com").as_deref(), Some("org:cli"));
+        assert_eq!(
+            load_scope(&sp, "ghe.example.com"),
+            None,
+            "another host never inherits a scope"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_state_directory_is_private_ours_and_never_a_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let root = tmp("private");
+        let d = root.join("nested/gh-pulse");
+        save_scope(&d.join("scope.json"), "github.com", "all").unwrap();
+        assert_eq!(mode(&d), 0o700, "created private");
+        assert_eq!(mode(&d.join("scope.json")), 0o600);
+        // ours but loose: tightened by the next save
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        save_scope(&d.join("scope.json"), "github.com", "favorites").unwrap();
+        assert_eq!(mode(&d), 0o700);
+        // a symlink where the directory should be: nothing is written through it
+        let target = root.join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = root.join("link");
+        symlink(&target, &link).unwrap();
+        let e = save_scope(&link.join("scope.json"), "github.com", "all").unwrap_err();
+        assert!(e.contains("not a plain directory"), "{e}");
+        assert!(std::fs::read_dir(&target).unwrap().next().is_none());
+        // somebody else's directory is refused (the file system root is not ours)
+        let e = Recent::new("github.com").save(Path::new("/gh-pulse-recent.json"));
+        assert!(e.is_err());
+        // reads go through the same checks: a file, ours, not a link
+        assert!(crate::cache::read_nofollow(&d.join("scope.json")).is_some());
+        assert!(crate::cache::read_nofollow(&link).is_none(), "a symlink");
+        assert!(crate::cache::read_nofollow(&d).is_none(), "a directory");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn viewed_marks_are_saved_privately_like_the_other_state_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let d = tmp("viewed");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = d.join("viewed.json");
+        let (mut v, _) = Viewed::load(Some(path.clone()));
+        v.toggle("o/r#1", "sha", "a.rs").unwrap();
+        assert_eq!(
+            mode(&d),
+            0o700,
+            "an existing loose directory of ours is tightened"
+        );
+        assert_eq!(mode(&path), 0o600);
+        let (v2, _) = Viewed::load(Some(path));
+        assert!(v2.is_viewed("o/r#1", "sha", "a.rs"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn repo_names_are_checked_before_they_reach_a_query() {
+        for ok in ["cli/cli", "a-b/c_d.e", "o/r"] {
+            assert!(valid_repo(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "cli",
+            "a/b/c",
+            "a b/c",
+            "o/r label:bug",
+            "o/",
+            "/r",
+            "o/r\n",
+            "o/r;x",
+        ] {
+            assert!(!valid_repo(bad), "{bad:?}");
+        }
     }
 }
 

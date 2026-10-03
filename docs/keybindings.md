@@ -40,9 +40,25 @@ The keys of the actions in this table can be remapped in `config.toml`; see [con
 | `Esc` | Clear the filter (after leaving zoom, detail focus and drill-in) |
 | `Enter` | On a PR: drill in. Elsewhere: focus the detail pane |
 | `l` / `Right` | Focus the detail pane |
-| `G` | Toggle the global view (PRs and issues across all repos); from the PR and Issues panels only (not Files, not inside a drill-in) |
+| `G` | Swap between the repo home and the global home (each remembers its cursor, tab and filter); from the lists only (not Files, not inside a drill-in). With no repo context yet it says so |
+| `s` | In the global home: scope picker (All, Favorites, Org..., Repo...). In the Repos panel: scope the global home to the selected repo. In a repo: explains |
+| `S` | Open the selected item's repo as the app's repo (`G` returns to the global home). On a Repos row: same as `Enter` |
 
 The Files panel (2) has no filter and follows the selected PR; the Checks and Comments panels exist only in a drill-in.
+
+## Global home
+
+Sections: `1` Review requested, `2` My PRs (`{` `}`: Open / Merged / Closed), `3` Issues (Assigned / Mine / Mentioned),
+`4` Repos (Favorites / Recent); `[panels] global` reorders, drops or adds Involved and Files. Everything else (detail
+tabs, drill-in with `Enter`, actions, `x`, `a`, `m`, `C`) works on a row with that row's repo.
+
+| Key | Action |
+|---|---|
+| `s` | Scope picker: `j` `k` / arrows, `Enter` picks, typing filters Org... and Repo... lists (a full `owner/name` is accepted), `Backspace` goes back, `Esc` cancels |
+| `S` | Open the row's repo as the app's repo; `G` leads back |
+| `r` | Search this section again |
+| Repos panel: `Enter` | Open the repo (`S` too) |
+| Repos panel: `s` / `f` / `H` | Scope the home to it / toggle favorite (same list as the repo browser) / hide it everywhere |
 
 ## PR drill-in (after `Enter` on a PR)
 
