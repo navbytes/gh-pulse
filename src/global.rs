@@ -49,6 +49,24 @@ impl Scope {
     }
 }
 
+/// `(a OR b OR c)` as separate search terms (a bare repeat of `repo:` would AND, and match nothing).
+fn or_group(mut terms: Vec<String>) -> Vec<String> {
+    if terms.len() < 2 {
+        return terms;
+    }
+    let n = terms.len();
+    terms[0].insert(0, '(');
+    terms[n - 1].push(')');
+    let mut out = Vec::with_capacity(2 * n - 1);
+    for (i, t) in terms.into_iter().enumerate() {
+        if i > 0 {
+            out.push("OR".to_string());
+        }
+        out.push(t);
+    }
+    out
+}
+
 /// `repo:` qualifiers per search call (GitHub allows at most 5 boolean operators in a query).
 pub const FAV_CHUNK: usize = 4;
 /// Calls per section refresh for the favorites scope: at most 16 favorites are searched.
@@ -66,7 +84,7 @@ pub fn scope_chunks(scope: &Scope, favorites: &[String]) -> (Vec<Vec<String>>, u
             let shown = favs.len().min(FAV_CHUNK * MAX_CHUNKS);
             let chunks = favs[..shown]
                 .chunks(FAV_CHUNK)
-                .map(|c| c.iter().map(|r| format!("repo:{r}")).collect())
+                .map(|c| or_group(c.iter().map(|r| format!("repo:{r}")).collect()))
                 .collect();
             (chunks, favs.len() - shown)
         }
@@ -365,16 +383,19 @@ mod tests {
     #[test]
     fn favorites_become_chunks_of_four_capped_at_sixteen() {
         let (c, left) = scope_chunks(&Scope::Favorites, &favs(10));
-        assert_eq!(c.iter().map(Vec::len).collect::<Vec<_>>(), [4, 4, 2]);
+        // each chunk is a parenthesized OR group: 4 + 3, 4 + 3 and 2 + 1 terms
+        assert_eq!(c.iter().map(Vec::len).collect::<Vec<_>>(), [7, 7, 3]);
         assert_eq!(left, 0);
-        assert_eq!(c[2], ["repo:o/r8", "repo:o/r9"]);
+        assert_eq!(c[2], ["(repo:o/r8", "OR", "repo:o/r9)"]);
+        assert_eq!(c[0][..3], ["(repo:o/r0", "OR", "repo:o/r1"]);
+        assert_eq!(c[0][6], "repo:o/r3)");
         let (c, left) = scope_chunks(&Scope::Favorites, &favs(21));
         assert_eq!(
             (c.len(), left),
             (4, 5),
             "16 searched, 5 reported as not shown"
         );
-        assert!(c.iter().all(|x| x.len() <= FAV_CHUNK));
+        assert!(c.iter().all(|x| x.len() <= 2 * FAV_CHUNK - 1));
         // config junk never reaches a query
         let junk = vec![
             "o/ok".to_string(),
@@ -383,7 +404,11 @@ mod tests {
             "nope".into(),
         ];
         let (c, left) = scope_chunks(&Scope::Favorites, &junk);
-        assert_eq!((c, left), (vec![vec!["repo:o/ok".to_string()]], 0));
+        assert_eq!(
+            (c, left),
+            (vec![vec!["repo:o/ok".to_string()]], 0),
+            "one repo needs no group"
+        );
         assert_eq!(scope_chunks(&Scope::Favorites, &[]).0.len(), 0);
         assert_eq!(scope_chunks(&Scope::All, &[]), (vec![vec![]], 0));
         assert_eq!(
@@ -444,9 +469,9 @@ mod tests {
         assert_eq!(n, 0);
         assert!(c[0].1.starts_with("search prs ") && c[2].1.starts_with("search issues "));
         assert!(c[0].1.ends_with(
-            "-- involves:@me is:open archived:false repo:o/r0 repo:o/r1 repo:o/r2 repo:o/r3"
+            "-- involves:@me is:open archived:false (repo:o/r0 OR repo:o/r1 OR repo:o/r2 OR repo:o/r3)"
         ));
-        assert!(c[1].1.ends_with("repo:o/r4 repo:o/r5"));
+        assert!(c[1].1.ends_with("(repo:o/r4 OR repo:o/r5)"));
         // values only ever follow `--`, so a repo or org name can't become a flag
         for (_, a) in &c {
             let dd = a.find(" -- ").unwrap();
@@ -549,9 +574,9 @@ mod tests {
         let head = "search prs --limit=100 --json number,title,url,state,isDraft,author,labels,body,repository,updatedAt --sort=updated --order=desc -- review-requested:@me is:open archived:false";
         assert_eq!(
             calls[0],
-            format!("{head} repo:o/r0 repo:o/r1 repo:o/r2 repo:o/r3")
+            format!("{head} (repo:o/r0 OR repo:o/r1 OR repo:o/r2 OR repo:o/r3)")
         );
-        assert_eq!(calls[1], format!("{head} repo:o/r4 repo:o/r5"));
+        assert_eq!(calls[1], format!("{head} (repo:o/r4 OR repo:o/r5)"));
         // the same two rows came back for both chunks: merged to one list, newest first
         assert_eq!(l.items.len(), 2);
         assert_eq!((l.hidden, l.not_shown), (0, 0));
