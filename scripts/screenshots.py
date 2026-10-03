@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Drive the real gh-pulse binary in a pty (pyte) against public repos and render docs/img/*.svg|png.
 
-Usage: scripts/screenshots.py [shot ...]   (needs `pip install pyte`, `cargo build --release`;
-PNG conversion uses rsvg-convert if present). Read-only: never confirms an action.
+Usage: GH_PULSE_SHOT_BLOCKLIST=a,b scripts/screenshots.py [shot ...]   (needs `pip install pyte`,
+`cargo build --release`; PNG conversion uses rsvg-convert if present). Read-only: never confirms an action.
+The header login becomes `you`, the unread badge is blanked, and a shot is aborted if a blocklisted string shows.
 """
 import fcntl, html, os, pty, re, select, shutil, signal, struct, subprocess, sys, tempfile, termios, time
 import pyte
@@ -112,7 +113,7 @@ def render_svg(t, path, title):
 
 
 def scrub(t):
-    """Replace the login in the header with `you`; abort if anything private is visible."""
+    """Replace the login with `you`, blank the unread badge/spinner; abort if anything private is visible."""
     m = re.search(r'user: (\S+)', t.text())
     if m:
         login = m.group(1)
@@ -122,9 +123,18 @@ def scrub(t):
                 for k, c in enumerate('you'.ljust(len(login))):
                     t.scr.buffer[y][i + k] = t.scr.buffer[y][i + k]._replace(data=c)
                 i = t.scr.display[y].find(login, i + 1)
+    hdr = t.scr.buffer[0]  # the badge is the user's real unread count
+    line = ''.join(hdr[x].data or ' ' for x in range(COLS))
+    for mm in re.finditer(r'✉\s*\d+|[⠀-⣿]', line):
+        for x in range(mm.start(), mm.end()):
+            hdr[x] = hdr[x]._replace(data=' ')
     low = t.text().lower()
+    if 'rate limit' in low: raise RateLimited()
     for s in SECRETS:
         if s.lower() in low: raise SystemExit(f'private string {s!r} on screen')
+
+
+class RateLimited(Exception): pass
 
 
 def launch(repo, tmp):
@@ -134,19 +144,26 @@ def launch(repo, tmp):
     for attempt in range(8):  # gh occasionally hits API rate limits; back off and retry
         t = T(['-R', repo, '--theme', 'dark'], env)
         try:
-            t.wait_for(r'Status', 8); return t
+            t.wait_for(r'\[1\] (PRs|Pull requests)', 15); return t
         except SystemExit:
             t.close(); time.sleep(30)
     raise SystemExit('gh-pulse never started (rate limited?)')
 
 
-def pr(t, sub):
-    """Focus the PR list on 'All open' and move to the PR whose title contains `sub`."""
-    t.send('2', .4); t.send('}', .4); t.send('}', 1)
-    for _ in range(120):
-        if sub in t.scr.display[2][53:]: break
+def pr(t, nums, tab=2):
+    """Go to the `tab`-th list tab of panel 1 (2 = All open) and select the first PR of `nums` that is listed;
+    falls back to the top row. Panel 1 is already focused at startup, so its number is not pressed."""
+    t.send('}' * tab, 1)
+    for _ in range(30):
+        if re.search(r'│#\d+ ', t.text()): break
+        t.pump(1)
+    t.pump(1)
+    for n in nums:
+        if re.search(rf'│#{n} ', t.text()): break
+    else: n = None
+    for _ in range(120 if n else 0):
+        if f'#{n} ' in ''.join(l[53:] for l in t.scr.display[1:5]): break
         t.send('j', .25)
-    else: raise SystemExit(f'PR {sub!r} not found (is it still open?)')
     t.pump(3)
 
 
@@ -157,54 +174,66 @@ def ctx(t, n=0):
     t.send('\r', 1.5)
 
 
-def s_main(t):
-    pr(t, 'drain pending TTY')
-def s_diff_split(t):
-    pr(t, 'terminal hyperlinks'); ctx(t, 9); t.send('f', .8)
-    for _ in range(3):
-        if 'auto:split' in t.scr.display[2]: break
-        t.send('t', .6)
-def s_diff_prose(t):
-    pr(t, 'Add ACCESSIBILITY.md'); ctx(t, 0); t.send('f', .8)
+def set_layout(t, want):  # cycle `t` until the diff header shows the wanted layout
     for _ in range(4):
-        if 'unified' in t.scr.display[2] and 'auto' not in t.scr.display[2]: break
+        if want in ''.join(t.scr.display[:5]): break
         t.send('t', .6)
+
+
+def s_main(t):
+    pr(t, [1829, 1826, 1816])
+def s_diff_split(t):
+    pr(t, [14578]); ctx(t, 3); t.send('f', .8); set_layout(t, 'auto:split')
+def s_diff_prose(t):
+    pr(t, [14583]); ctx(t, 0); t.send('f', .8); set_layout(t, 'unified')
 def s_files(t):
-    pr(t, 'terminal hyperlinks'); ctx(t, 3)
+    pr(t, [14578]); ctx(t, 3)
 def s_comments(t):
-    pr(t, 'terminal hyperlinks'); t.send(']', .6); t.send(']', 2)
+    pr(t, [14583]); t.send('\r', 2); t.send(']' * 3, 2); t.pump(3)
 def s_actions(t):
-    t.send('5', 2)
+    t.send('4', 2); t.pump(3)
+def s_tags(t):
+    t.send('5', 1.5); t.send('}', 2); t.send('\r', 2); t.pump(2)
 def s_menu(t):
-    pr(t, 'drain pending TTY'); t.send('x', 1)
+    pr(t, [1829]); t.send('x', 1)
 def s_confirm(t):  # picks "Close PR" and stops at the confirm popup; 'y' is never sent
-    pr(t, 'drain pending TTY'); t.send('x', 1); t.send('j' * 6, .5); t.send('\r', 1)
+    pr(t, [1829]); t.send('x', 1); t.send('j' * 7, .5); t.send('\r', 1)
 def s_help(t):
     t.send('?', 1)
+def s_compact(t):
+    pr(t, [1829])
 
 
-SHOTS = {  # name -> (repo, steps)
-    '1-main': ('charmbracelet/bubbletea', s_main),
-    '2-diff-split': ('cli/cli', s_diff_split),
-    '3-diff-prose': ('cli/cli', s_diff_prose),
-    '4-files': ('cli/cli', s_files),
-    '5-comments': ('cli/cli', s_comments),
-    '6-actions': ('charmbracelet/bubbletea', s_actions),
-    '7-menu': ('charmbracelet/bubbletea', s_menu),
-    '7b-confirm': ('charmbracelet/bubbletea', s_confirm),
-    '8-help': ('charmbracelet/bubbletea', s_help),
+SHOTS = {  # name -> (repo, steps, (cols, rows))
+    '1-main': ('charmbracelet/bubbletea', s_main, (140, 40)),
+    '2-diff-split': ('cli/cli', s_diff_split, (140, 40)),
+    '3-diff-prose': ('cli/cli', s_diff_prose, (140, 40)),
+    '4-files': ('cli/cli', s_files, (140, 40)),
+    '5-comments': ('cli/cli', s_comments, (140, 40)),
+    '6-actions': ('charmbracelet/bubbletea', s_actions, (140, 40)),
+    '7-tags': ('charmbracelet/bubbletea', s_tags, (140, 40)),
+    '8-menu': ('charmbracelet/bubbletea', s_menu, (140, 40)),
+    '8b-confirm': ('charmbracelet/bubbletea', s_confirm, (140, 40)),
+    '9-help': ('charmbracelet/bubbletea', s_help, (140, 40)),
+    '10-compact': ('charmbracelet/bubbletea', s_compact, (80, 24)),
 }
 
 if __name__ == '__main__':
     os.makedirs(OUT, exist_ok=True)
     for name in sys.argv[1:] or SHOTS:
-        repo, steps = SHOTS[name]
-        with tempfile.TemporaryDirectory() as tmp:
-            t = launch(repo, tmp)
-            try:
-                t.pump(3); steps(t); t.pump(1)
-                scrub(t)
-                render_svg(t, os.path.join(OUT, name + '.svg'), f'gh-pulse · {repo}')
-                print(f'== {name}'); print('\n'.join(l.rstrip() for l in t.scr.display))
-            finally:
-                t.close()
+        repo, steps, (COLS, ROWS) = SHOTS[name]
+        for attempt in range(6):
+            with tempfile.TemporaryDirectory() as tmp:
+                t = launch(repo, tmp)
+                try:
+                    t.pump(3); steps(t); t.pump(1)
+                    scrub(t)
+                    render_svg(t, os.path.join(OUT, name + '.svg'), f'gh-pulse · {repo}')
+                    print(f'== {name}'); print('\n'.join(l.rstrip() for l in t.scr.display))
+                    break
+                except RateLimited:
+                    print(f'{name}: rate limited, waiting', file=sys.stderr); time.sleep(120)
+                finally:
+                    t.close()
+        else:
+            raise SystemExit(f'{name}: still rate limited')

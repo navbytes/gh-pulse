@@ -1,6 +1,6 @@
 use crate::act::{self, Action, FormKind, Sel};
 use crate::browse::{self, Browser, Out, RepoRow};
-use crate::config::{self, Act, Config, Keymap};
+use crate::config::{self, Act, Config, Keymap, PanelName, PanelsCfg, TabDef};
 use crate::diff::{self, DiffMode};
 use crate::form::{self, Form};
 use crate::gh::{self, Data, FilesData, Item, Kind, Tab};
@@ -18,7 +18,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
 /// Panel identity. Files / Checks / Comments are derived from the selected (or drilled-into) PR.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum PK {
     Status,
     Prs,
@@ -28,28 +28,14 @@ pub enum PK {
     Comments,
     Issues,
     Actions,
-    Branches,
-    Releases,
+    /// Branches / Tags / Releases as list tabs.
+    Repo,
     Notifs,
 }
 
 impl PK {
-    /// Index understood by `gh::list`; None for derived panels.
-    pub fn src(self) -> Option<usize> {
-        Some(match self {
-            PK::Status => 0,
-            PK::Prs => 1,
-            PK::Issues => 2,
-            PK::Actions => 3,
-            PK::Branches => 4,
-            PK::Releases => 5,
-            PK::Notifs => 6,
-            _ => return None,
-        })
-    }
-
     pub fn derived(self) -> bool {
-        self.src().is_none()
+        matches!(self, PK::Files | PK::Commits | PK::Checks | PK::Comments)
     }
 }
 
@@ -63,7 +49,8 @@ pub struct Ctx {
 pub struct Panel {
     pub kind: PK,
     pub title: &'static str,
-    pub tabs: &'static [&'static str],
+    pub tabs: Vec<TabDef>,
+    /// Index into `tabs`.
     pub tab: usize,
     pub items: Vec<Item>,
     pub loading: bool,
@@ -73,7 +60,7 @@ pub struct Panel {
 }
 
 impl Panel {
-    fn new(kind: PK, title: &'static str, tabs: &'static [&'static str]) -> Self {
+    fn new(kind: PK, title: &'static str, tabs: Vec<TabDef>) -> Self {
         Panel {
             kind,
             title,
@@ -86,6 +73,57 @@ impl Panel {
             seq: 0,
         }
     }
+
+    /// The `gh::list` id of the active tab.
+    pub fn tab_id(&self) -> usize {
+        self.tabs.get(self.tab).map_or(0, |t| t.id)
+    }
+
+    /// (source panel, tab) understood by `gh::list`; None for derived panels.
+    pub fn source(&self) -> Option<(usize, usize)> {
+        source_of(self.kind, self.tab_id())
+    }
+
+    /// Switch to the tab with this `gh::list` id; false when it is not configured.
+    fn set_tab_id(&mut self, id: usize) -> bool {
+        match self.tabs.iter().position(|t| t.id == id) {
+            Some(i) => {
+                self.tab = i;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+fn source_of(kind: PK, id: usize) -> Option<(usize, usize)> {
+    Some(match kind {
+        PK::Status => (0, 0),
+        PK::Prs => (1, id),
+        PK::Issues => (2, id),
+        PK::Actions => (3, id),
+        PK::Repo => (
+            match id {
+                0 => 4,
+                1 => 7,
+                _ => 5,
+            },
+            0,
+        ),
+        PK::Notifs => (6, 0),
+        _ => return None,
+    })
+}
+
+/// `source()` ids that make a panel's tab count meaningful.
+type CountKey = (PK, usize);
+
+/// The unread-notifications view (`N`).
+pub struct Inbox {
+    pub items: Vec<Item>,
+    pub cursor: usize,
+    pub loading: bool,
+    pub error: Option<String>,
 }
 
 // A cache entry is built once per fetch; boxing the comment data would only add indirection.
@@ -160,6 +198,18 @@ pub struct Hit {
     pub body: Rect,
     pub tab_y: u16,
     pub tabs: Vec<(u16, u16)>,
+    /// Clickable list-tab labels in the panel titles.
+    pub ptabs: Vec<PTab>,
+}
+
+/// One list-tab label in a panel title: screen row, columns [x0, x1), panel and tab index.
+#[derive(Clone, Copy)]
+pub struct PTab {
+    pub y: u16,
+    pub x0: u16,
+    pub x1: u16,
+    pub panel: usize,
+    pub tab: usize,
 }
 
 pub struct Log {
@@ -189,6 +239,12 @@ enum Msg {
     Branch(u64, Option<String>),
     Repos(u64, Result<RepoMsg, String>),
     Header(u64, String),
+    /// Repo facts for the header (generation of the header lookup).
+    Meta(u64, gh::RepoMeta),
+    /// (list generation, panel, tab id, (rows, more)) for the other tabs' counts.
+    Count(u64, CountKey, Result<(usize, bool), String>),
+    /// Unread notifications, for the badge (and the inbox when open).
+    Inbox(u64, Result<Vec<Item>, String>),
 }
 
 pub struct App {
@@ -203,7 +259,18 @@ pub struct App {
     pub hl: RefCell<Option<Hl>>,
     pub repo: String,
     pub header: String,
+    pub meta: Option<gh::RepoMeta>,
     pub panels: Vec<Panel>,
+    /// Row counts of every configured list tab, as they become known.
+    pub counts: HashMap<CountKey, (usize, bool)>,
+    cpending: HashSet<CountKey>,
+    /// Bumped when the lists are reloaded, so late counts for the old ones are dropped.
+    cgen: u64,
+    pub inbox: Option<Inbox>,
+    /// Repos of the unread notifications once fetched (None: unknown or the fetch failed).
+    unread: Option<Vec<String>>,
+    inbox_seq: u64,
+    unread_at: Option<std::time::Instant>,
     pub focus: usize,
     pub filter: String,
     pub typing: bool,
@@ -230,6 +297,8 @@ pub struct App {
     pending_select: Option<(PK, u64, String)>,
     /// File shown from the selected commit (Commits panel).
     pub cfile: usize,
+    /// The file shown in the Diff tab when `files` is not among the panels.
+    file0: usize,
     /// When the last comments page was requested (pages are at least PAGE_GAP apart).
     last_more: Option<std::time::Instant>,
     /// Comments the user expanded (long ones, details blocks) / whose reaction names are shown, per item and row.
@@ -356,20 +425,37 @@ fn derive_items(kind: PK, pr: &Item, d: &Data) -> Vec<Item> {
     }
 }
 
+fn build_panels(cfg: &PanelsCfg) -> Vec<Panel> {
+    cfg.layout()
+        .into_iter()
+        .map(|s| {
+            let (kind, title) = match s.name {
+                PanelName::Prs => (PK::Prs, "Pull requests"),
+                PanelName::Files => (PK::Files, "Files"),
+                PanelName::Issues => (PK::Issues, "Issues"),
+                PanelName::Actions => (PK::Actions, "Actions"),
+                // titled by its tabs: "Branches 32 \u{b7} Tags 14 \u{b7} Releases 81"
+                PanelName::Repo => (PK::Repo, ""),
+                PanelName::Notifications => (PK::Notifs, "Notifications"),
+                PanelName::Status => (PK::Status, "Status"),
+            };
+            let mut p = Panel::new(kind, title, s.tabs);
+            p.tab = s.tab;
+            p
+        })
+        .collect()
+}
+
 fn step(cur: usize, d: isize, max: usize) -> usize {
     cur.min(max).saturating_add_signed(d).min(max)
 }
 
 impl App {
-    pub fn new(repo: String, theme: Theme) -> Self {
-        Self::with(repo, theme, true)
-    }
-
     /// The real entry point: config and keymap come from the user's config file.
     pub fn from_config(repo: String, theme: Theme, cfg: Config, keys: Keymap) -> Self {
-        let mut app = Self::new(repo, theme);
         gh::set_sync_viewed(cfg.sync_viewed);
-        (app.cfg, app.keys, app.cfg_path) = (cfg, keys, config::path());
+        let mut app = Self::build(repo, theme, true, cfg);
+        (app.keys, app.cfg_path) = (keys, config::path());
         let (viewed, warn) = Viewed::load(crate::state::path());
         app.viewed = viewed;
         app.status = warn.unwrap_or_default();
@@ -377,11 +463,16 @@ impl App {
     }
 
     /// `load: false` skips all `gh` calls (layout tests).
+    #[cfg(test)]
     pub fn with(repo: String, theme: Theme, load: bool) -> Self {
-        let panel = Panel::new;
+        Self::build(repo, theme, load, Config::default())
+    }
+
+    pub fn build(repo: String, theme: Theme, load: bool, cfg: Config) -> Self {
         let (tx, rx) = channel();
+        let panels = build_panels(&cfg.panels);
         let mut app = App {
-            cfg: Config::default(),
+            cfg,
             cfg_path: None,
             keys: Keymap::build(&Default::default()).expect("default keys are valid"),
             browser: None,
@@ -391,20 +482,15 @@ impl App {
             hl: RefCell::new(None),
             header: format!(" {repo}"),
             repo,
-            panels: vec![
-                panel(PK::Status, "Status", &[]),
-                panel(
-                    PK::Prs,
-                    "Pull requests",
-                    &["Mine", "Review requested", "All open", "Merged"],
-                ),
-                panel(PK::Files, "Files", &[]),
-                panel(PK::Issues, "Issues", &["Assigned", "Mine", "All open"]),
-                panel(PK::Actions, "Actions", &["Runs", "Workflows"]),
-                panel(PK::Branches, "Branches", &[]),
-                panel(PK::Releases, "Releases", &[]),
-                panel(PK::Notifs, "Notifications", &[]),
-            ],
+            meta: None,
+            panels,
+            counts: HashMap::new(),
+            cpending: HashSet::new(),
+            cgen: 0,
+            inbox: None,
+            unread: None,
+            inbox_seq: 0,
+            unread_at: None,
             focus: 0,
             filter: String::new(),
             typing: false,
@@ -426,6 +512,7 @@ impl App {
             hgen: 0,
             pending_select: None,
             cfile: 0,
+            file0: 0,
             last_more: None,
             expanded: HashSet::new(),
             react_open: HashSet::new(),
@@ -450,6 +537,7 @@ impl App {
                 app.load_panel(i);
             }
             app.spawn_header();
+            app.spawn_unread();
         }
         app
     }
@@ -477,7 +565,31 @@ impl App {
                 g,
                 format!(" {repo}  branch: {branch}  user: {}", gh::user()),
             ));
+            if let Ok(m) = gh::repo_meta(&repo) {
+                let _ = tx.send(Msg::Meta(g, m));
+            }
         });
+    }
+
+    /// Unread notifications for the header badge; the badge stays hidden when the fetch fails.
+    fn spawn_unread(&mut self) {
+        if !self.net {
+            return;
+        }
+        self.unread_at = Some(std::time::Instant::now());
+        self.inbox_seq += 1;
+        let (tx, seq) = (self.tx.clone(), self.inbox_seq);
+        thread::spawn(move || {
+            let _ = tx.send(Msg::Inbox(seq, gh::notifications()));
+        });
+    }
+
+    /// Unread notifications outside hidden repos; None while unknown.
+    pub fn unread_count(&self) -> Option<usize> {
+        let hidden = &self.cfg.repos;
+        self.unread
+            .as_ref()
+            .map(|v| v.iter().filter(|r| !hidden.is_hidden(r)).count())
     }
 
     fn clear_cache(&mut self) {
@@ -490,19 +602,57 @@ impl App {
 
     fn reload_all(&mut self) {
         self.clear_cache();
+        self.counts.clear();
+        self.cpending.clear();
+        self.cgen += 1;
         (0..self.panels.len()).for_each(|i| self.load_panel(i));
+        self.spawn_unread();
     }
 
     fn load_panel(&mut self, i: usize) {
         let p = &mut self.panels[i];
-        let Some(src) = p.kind.src() else { return };
+        let Some((src, tab_id)) = p.source() else {
+            return;
+        };
         p.loading = true;
         p.error = None;
         p.seq += 1;
-        let (seq, kind) = (p.seq, p.kind);
-        let (tx, repo, tab, global) = (self.tx.clone(), self.repo.clone(), p.tab, self.global);
+        if !self.net {
+            return;
+        }
+        let (seq, kind, tab) = (p.seq, p.kind, p.tab);
+        let (tx, repo, global) = (self.tx.clone(), self.repo.clone(), self.global);
         thread::spawn(move || {
-            let _ = tx.send(Msg::List(kind, tab, seq, gh::list(&repo, global, src, tab)));
+            let _ = tx.send(Msg::List(
+                kind,
+                tab,
+                seq,
+                gh::list(&repo, global, src, tab_id),
+            ));
+        });
+    }
+
+    /// Counts for the tabs that aren't showing, one lookup per idle tick (at most two in flight).
+    fn fetch_counts(&mut self) {
+        if !self.net || self.ctx.is_some() || self.cpending.len() >= 2 {
+            return;
+        }
+        let todo = self.panels.iter().find_map(|p| {
+            p.tabs.iter().find_map(|t| {
+                let key = (p.kind, t.id);
+                let known = self.counts.contains_key(&key) || self.cpending.contains(&key);
+                (p.tabs.len() > 1 && !known)
+                    .then(|| source_of(p.kind, t.id).map(|src| (key, src)))
+                    .flatten()
+            })
+        });
+        let Some((key, (src, tab))) = todo else {
+            return;
+        };
+        self.cpending.insert(key);
+        let (tx, repo, global, g) = (self.tx.clone(), self.repo.clone(), self.global, self.cgen);
+        thread::spawn(move || {
+            let _ = tx.send(Msg::Count(g, key, gh::count(&repo, global, src, tab)));
         });
     }
 
@@ -540,6 +690,9 @@ impl App {
                     }
                     p.loading = false;
                     let consumed = pending.as_ref().is_some_and(|x| x.0 == kind);
+                    let key = (kind, p.tab_id());
+                    let cap = p.source().map_or(gh::LIMIT, |s| gh::cap(s.0));
+                    let (mut found, mut rec) = (false, None);
                     match res {
                         Ok(mut items) => {
                             // hidden repos disappear from the cross-repo (global) results
@@ -556,13 +709,63 @@ impl App {
                             {
                                 p.cursor = pos;
                                 select_focus = Some(pk);
+                                found = true;
                             }
+                            rec = Some((items.len(), items.len() >= cap));
                             p.items = items;
                         }
                         Err(e) => p.error = Some(e),
                     }
                     if consumed {
+                        // closed or merged: the lists only hold open items, so show it on GitHub
+                        if !found && let Some((pk, n, repo)) = self.pending_select.take() {
+                            let what = if pk == PK::Prs { "pull" } else { "issues" };
+                            self.status = format!("#{n} is not open: opened on GitHub");
+                            if self.net {
+                                self.open_url(format!("https://github.com/{repo}/{what}/{n}"));
+                            }
+                        }
                         self.pending_select = None;
+                    }
+                    if let Some(r) = rec {
+                        self.cpending.remove(&key);
+                        self.counts.insert(key, r);
+                    }
+                }
+                Msg::Count(g, key, res) => {
+                    self.cpending.remove(&key);
+                    if g == self.cgen
+                        && let Ok(r) = res
+                    {
+                        self.counts.insert(key, r);
+                    }
+                }
+                Msg::Meta(g, m) => {
+                    if g == self.hgen {
+                        self.meta = Some(m);
+                    }
+                }
+                Msg::Inbox(seq, res) => {
+                    if seq == self.inbox_seq {
+                        self.unread = res
+                            .as_ref()
+                            .ok()
+                            .map(|v| v.iter().map(|i| i.repo.clone()).collect());
+                        if let Some(ib) = &mut self.inbox {
+                            ib.loading = false;
+                            match res {
+                                Ok(v) => {
+                                    let hidden = &self.cfg.repos;
+                                    ib.items = v
+                                        .into_iter()
+                                        .filter(|i| !hidden.is_hidden(&i.repo))
+                                        .collect();
+                                    ib.error = None;
+                                    ib.cursor = ib.cursor.min(ib.items.len().saturating_sub(1));
+                                }
+                                Err(e) => ib.error = Some(e),
+                            }
+                        }
                     }
                 }
                 Msg::Detail(key, tab, g, res) => {
@@ -613,7 +816,7 @@ impl App {
                         self.pending_select = Some((pk, n, self.repo.clone()));
                         // the new item must be in the list: show everything open
                         if let Some(p) = self.panel_mut(pk) {
-                            p.tab = 2;
+                            p.set_tab_id(2);
                         }
                     }
                     self.reload_all();
@@ -818,6 +1021,13 @@ impl App {
 
     /// Fetches whatever the screen needs and isn't cached yet; called when input is idle.
     pub fn ensure(&mut self) {
+        self.fetch_counts();
+        if self
+            .unread_at
+            .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(120))
+        {
+            self.spawn_unread();
+        }
         // scrolling toward the end of loaded comments pulls the next page, one at a time
         if self.comments_data().is_some_and(gh::CommentsData::paused) && self.near_comments_end() {
             self.load_more(false);
@@ -885,6 +1095,61 @@ impl App {
         p.items.iter().filter(hit).collect()
     }
 
+    /// (rows, more than that) of the panel's showing tab; None while its first load is out.
+    pub fn active_count(&self, i: usize) -> Option<(usize, bool)> {
+        let p = &self.panels[i];
+        if p.loading && p.items.is_empty() {
+            return self.counts.get(&(p.kind, p.tab_id())).copied();
+        }
+        let items = self.visible(i);
+        // a trailing "N more" row is not an item; the count says "n+" while more are still coming
+        let more = items.last().is_some_and(|x| x.state == "more");
+        let n = items.len() - usize::from(more);
+        let cap = p.source().map_or(gh::LIMIT, |s| gh::cap(s.0));
+        // list sources are capped; Files/Checks/... are complete, except Files at GitHub's 3000-file ceiling
+        let capped =
+            (!p.kind.derived() && p.items.len() >= cap) || (p.kind == PK::Files && n >= 3000);
+        Some((n, capped || more))
+    }
+
+    /// Count of tab `ti` of panel `i`: live for the showing tab, as fetched for the others.
+    pub fn tab_count(&self, i: usize, ti: usize) -> Option<(usize, bool)> {
+        let p = &self.panels[i];
+        if ti == p.tab {
+            self.active_count(i)
+        } else {
+            self.counts.get(&(p.kind, p.tabs.get(ti)?.id)).copied()
+        }
+    }
+
+    /// Open PRs of the repo, when the PR list's "All" tab has been counted.
+    pub fn open_prs(&self) -> Option<(usize, bool)> {
+        if self.global {
+            return None;
+        }
+        self.counts.get(&(PK::Prs, 2)).copied()
+    }
+
+    /// `hide_empty`: drawn as a single line (never the focused panel, never in a PR drill-in).
+    pub fn collapsed(&self, i: usize) -> bool {
+        self.cfg.panels.hide_empty && self.ctx.is_none() && i != self.focus && self.panel_empty(i)
+    }
+
+    /// Nothing in any of the panel's tabs (and nothing still loading): `hide_empty` collapses it.
+    pub fn panel_empty(&self, i: usize) -> bool {
+        let p = &self.panels[i];
+        if p.loading || p.error.is_some() {
+            return false;
+        }
+        (0..p.tabs.len().max(1)).all(|ti| {
+            if p.tabs.is_empty() || ti == p.tab {
+                p.items.is_empty()
+            } else {
+                self.tab_count(i, ti) == Some((0, false))
+            }
+        })
+    }
+
     pub fn selected_in(&self, i: usize) -> Option<&Item> {
         let v = self.visible(i);
         v.get(self.panels[i].cursor.min(v.len().saturating_sub(1)))
@@ -942,12 +1207,13 @@ impl App {
     /// Cursor of the Files panel = the file shown in the diff.
     pub fn file(&self) -> usize {
         self.panel_idx(PK::Files)
-            .map_or(0, |i| self.panels[i].cursor)
+            .map_or(self.file0, |i| self.panels[i].cursor)
     }
 
     fn set_file(&mut self, v: usize) {
-        if let Some(i) = self.panel_idx(PK::Files) {
-            self.panels[i].cursor = v;
+        match self.panel_idx(PK::Files) {
+            Some(i) => self.panels[i].cursor = v,
+            None => self.file0 = v,
         }
     }
 
@@ -1089,6 +1355,15 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(t) = hit
+                    .ptabs
+                    .iter()
+                    .find(|t| t.y == pos.y && pos.x >= t.x0 && pos.x < t.x1)
+                {
+                    self.set_focus(t.panel);
+                    self.select_tab(t.panel, t.tab);
+                    return;
+                }
                 if let Some(i) = hit.panels.iter().position(|r| r.contains(pos)) {
                     let was_list = i == self.focus && !self.detail_focus;
                     if !was_list {
@@ -1171,14 +1446,21 @@ impl App {
     fn panel_tab_step(&mut self, d: isize) {
         let p = &mut self.panels[self.focus];
         if p.tabs.len() > 1 {
-            (p.tab, p.cursor) = (
-                (p.tab as isize + d).rem_euclid(p.tabs.len() as isize) as usize,
-                0,
-            );
-            p.items.clear();
-            self.reset_view();
-            self.load_panel(self.focus);
+            let to = (p.tab as isize + d).rem_euclid(p.tabs.len() as isize) as usize;
+            self.select_tab(self.focus, to);
         }
+    }
+
+    /// Show the panel's tab number `to` (an index into its tabs).
+    fn select_tab(&mut self, i: usize, to: usize) {
+        let p = &mut self.panels[i];
+        if to >= p.tabs.len() || to == p.tab {
+            return;
+        }
+        (p.tab, p.cursor) = (to, 0);
+        p.items.clear();
+        self.reset_view();
+        self.load_panel(i);
     }
 
     /// Returns true to quit.
@@ -1221,6 +1503,10 @@ impl App {
             self.browser_key(k);
             return false;
         }
+        if self.inbox.is_some() {
+            self.inbox_key(k);
+            return false;
+        }
         if self.help {
             let m = self.help_max.get();
             match k.code {
@@ -1261,8 +1547,14 @@ impl App {
         match k.code {
             KeyCode::Tab => self.set_focus(self.focus + 1),
             KeyCode::BackTab => self.set_focus(self.focus + self.panels.len() - 1),
-            KeyCode::Char(c @ '1'..='8') if (c as usize - '1' as usize) < self.panels.len() => {
-                self.set_focus(c as usize - '1' as usize)
+            KeyCode::Char(c @ '1'..='7') if (c as usize - '1' as usize) < self.panels.len() => {
+                let i = c as usize - '1' as usize;
+                // the number of the focused panel again steps to its next list tab
+                if i == self.focus && !self.detail_focus {
+                    self.panel_tab_step(1);
+                } else {
+                    self.set_focus(i);
+                }
             }
             KeyCode::Char('[') => self.tab_step(-1),
             KeyCode::Char(']') => self.tab_step(1),
@@ -1363,7 +1655,7 @@ impl App {
     fn open_menu(&mut self, filter: Option<&str>) {
         let mut items = act::actions(
             self.selected(),
-            self.panels[self.focus].kind.src().unwrap_or(99),
+            self.panels[self.focus].source().map_or(99, |s| s.0),
             &self.repo,
             &self.sel(),
         );
@@ -1457,6 +1749,7 @@ impl App {
             Act::Checkout => self.checkout(),
             Act::Zoom => self.zoom = !self.zoom,
             Act::Browser => self.open_browser(),
+            Act::Inbox => self.open_inbox(),
             Act::Global => {
                 if !self.detail_focus
                     && self.log.is_none()
@@ -1510,6 +1803,104 @@ impl App {
                 }
             }
         });
+    }
+
+    fn open_inbox(&mut self) {
+        self.inbox = Some(Inbox {
+            items: vec![],
+            cursor: 0,
+            loading: true,
+            error: None,
+        });
+        self.spawn_unread();
+    }
+
+    #[cfg(test)]
+    pub fn seed_inbox(&mut self, items: Vec<Item>) {
+        self.unread = Some(items.iter().map(|i| i.repo.clone()).collect());
+        self.inbox = Some(Inbox {
+            items,
+            cursor: 0,
+            loading: false,
+            error: None,
+        });
+    }
+
+    #[cfg(test)]
+    pub fn seed_unread(&mut self, repos: &[&str]) {
+        self.unread = Some(repos.iter().map(|r| r.to_string()).collect());
+    }
+
+    fn inbox_key(&mut self, k: KeyEvent) {
+        let Some(ib) = self.inbox.as_mut() else {
+            return;
+        };
+        let last = ib.items.len().saturating_sub(1);
+        let to = |c: usize, d: isize| c.saturating_add_signed(d).min(last);
+        if self.keys.get(&k) == Some(Act::Inbox) {
+            self.inbox = None;
+            return;
+        }
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.inbox = None,
+            KeyCode::Char('j') | KeyCode::Down => ib.cursor = to(ib.cursor, 1),
+            KeyCode::Char('k') | KeyCode::Up => ib.cursor = to(ib.cursor, -1),
+            KeyCode::Char('g') | KeyCode::Home => ib.cursor = 0,
+            KeyCode::Char('G') | KeyCode::End => ib.cursor = last,
+            KeyCode::Char('r') => {
+                ib.loading = true;
+                self.spawn_unread();
+            }
+            KeyCode::Char('o') => {
+                if let Some(url) = ib.items.get(ib.cursor).map(|i| i.url.clone()) {
+                    self.open_url(url);
+                }
+            }
+            KeyCode::Char('m') => match ib.items.get(ib.cursor).map(|i| i.cmd.clone()) {
+                // thread ids are numeric; anything else never reaches a URL path
+                Some(id) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) => {
+                    self.modal = Some(Modal::Confirm(Confirm::new(act::mark_read(&id), None)));
+                }
+                _ => self.status = "nothing to mark read".into(),
+            },
+            KeyCode::Enter => self.inbox_open(),
+            _ => {}
+        }
+    }
+
+    /// Enter in the inbox: show the PR/issue in the lists (switching repo if needed); anything else opens in the browser.
+    fn inbox_open(&mut self) {
+        let Some(it) = self
+            .inbox
+            .as_ref()
+            .and_then(|ib| ib.items.get(ib.cursor))
+            .cloned()
+        else {
+            return;
+        };
+        let pk = match it.kind {
+            Kind::Pr => PK::Prs,
+            Kind::Issue => PK::Issues,
+            _ => return self.open_url(it.url),
+        };
+        if it.number == 0 {
+            return self.open_url(it.url);
+        }
+        let Some(idx) = self.panel_idx(pk) else {
+            self.status =
+                "that panel is hidden in [panels]; press o to open it in the browser".into();
+            return;
+        };
+        self.inbox = None;
+        if !it.repo.eq_ignore_ascii_case(&self.repo) {
+            self.switch_repo(it.repo.clone());
+        }
+        // the lists only hold open items: look in the broadest open tab
+        self.pending_select = Some((pk, it.number, self.repo.clone()));
+        let p = &mut self.panels[idx];
+        p.set_tab_id(2);
+        p.cursor = 0;
+        self.load_panel(idx);
     }
 
     fn browser_key(&mut self, k: KeyEvent) {
@@ -1774,10 +2165,10 @@ impl App {
             return;
         };
         let ctx_panels = vec![
-            Panel::new(PK::Files, "Files", &[]),
-            Panel::new(PK::Commits, "Commits", &[]),
-            Panel::new(PK::Checks, "Checks", &[]),
-            Panel::new(PK::Comments, "Comments", &[]),
+            Panel::new(PK::Files, "Files", vec![]),
+            Panel::new(PK::Commits, "Commits", vec![]),
+            Panel::new(PK::Checks, "Checks", vec![]),
+            Panel::new(PK::Comments, "Comments", vec![]),
         ];
         let saved = std::mem::replace(&mut self.panels, ctx_panels);
         self.ctx = Some(Ctx {
@@ -1890,9 +2281,12 @@ impl App {
     }
 
     fn open(&mut self) {
-        let Some(url) = self.selected().map(|i| i.url.clone()) else {
-            return;
-        };
+        if let Some(url) = self.selected().map(|i| i.url.clone()) {
+            self.open_url(url);
+        }
+    }
+
+    fn open_url(&mut self, url: String) {
         let cmd = if cfg!(target_os = "macos") {
             "open"
         } else {
@@ -1905,14 +2299,21 @@ impl App {
                 .stderr(Stdio::null())
                 .status();
             match s {
-                Ok(s) if s.success() => Ok(String::new()),
+                Ok(s) if s.success() => Ok(format!("opened {url}")),
                 _ => Err(format!("could not open {url}")),
             }
         });
     }
 
     fn copy(&mut self) {
-        let Some(url) = self.selected().map(|i| i.url.clone()) else {
+        // a tag has no page of its own worth pasting: copy its name
+        let Some(url) = self.selected().map(|i| {
+            if i.kind == Kind::Tag {
+                i.cmd_name().to_string()
+            } else {
+                i.url.clone()
+            }
+        }) else {
             return;
         };
         self.bg(move || {
@@ -1941,6 +2342,9 @@ impl App {
             Some(it) if it.kind == Kind::Pr => {
                 let (repo, n) = (it.repo.clone(), it.number);
                 self.bg(move || gh::checkout(&repo, n));
+            }
+            Some(it) if it.kind == Kind::Tag => {
+                self.status = "checkout is not available for tags (copy the name with y)".into()
             }
             _ => self.status = "checkout works on pull requests".into(),
         }
@@ -2081,5 +2485,109 @@ mod tests {
         });
         a.on_paste("x\r\ny");
         assert!(matches!(&a.modal, Some(Modal::Input { buf, .. }) if buf == "x\ny"));
+    }
+
+    fn plain() -> App {
+        App::with(
+            "o/r".into(),
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+        )
+    }
+
+    fn pr(n: u64) -> Item {
+        Item {
+            number: n,
+            title: format!("pr {n}"),
+            repo: "o/r".into(),
+            kind: Kind::Pr,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn inbox_enter_shows_the_item_here_after_one_reload() {
+        let mut a = plain();
+        let mut n = pr(7);
+        n.cmd = "55".into();
+        a.seed_inbox(vec![n]);
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(a.inbox.is_none());
+        assert_eq!(a.pending_select, Some((PK::Prs, 7, "o/r".into())));
+        let p = &a.panels[0];
+        assert_eq!(p.tab_id(), 2, "looks in All open");
+        let (tab, seq) = (p.tab, p.seq);
+        a.tx.send(Msg::List(PK::Prs, tab, seq, Ok(vec![pr(3), pr(7)])))
+            .unwrap();
+        a.poll();
+        assert_eq!((a.panels[0].cursor, a.focus), (1, 0));
+        assert!(a.pending_select.is_none());
+        assert_eq!(
+            a.counts.get(&(PK::Prs, 2)),
+            Some(&(2, false)),
+            "the list doubles as its count"
+        );
+    }
+
+    #[test]
+    fn inbox_enter_switches_repo_and_reports_a_missing_item() {
+        let mut a = plain();
+        let mut n = pr(9);
+        n.repo = "x/y".into();
+        a.seed_inbox(vec![n]);
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(a.repo, "x/y");
+        assert_eq!(a.pending_select, Some((PK::Prs, 9, "x/y".into())));
+        let (tab, seq) = (a.panels[0].tab, a.panels[0].seq);
+        a.tx.send(Msg::List(PK::Prs, tab, seq, Ok(vec![pr(1)])))
+            .unwrap();
+        a.poll();
+        assert!(
+            a.pending_select.is_none() && a.status.contains("#9 is not open"),
+            "{}",
+            a.status
+        );
+    }
+
+    #[test]
+    fn inbox_enter_needs_the_panel_it_opens_in() {
+        let cfg = config::parse("[panels]\nshow = [\"issues\"]\n", "t").unwrap();
+        let mut a = App::build(
+            "o/r".into(),
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+            cfg,
+        );
+        a.seed_inbox(vec![pr(7)]);
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            a.inbox.is_some() && a.status.contains("hidden in [panels]"),
+            "{}",
+            a.status
+        );
+    }
+
+    #[test]
+    fn mark_read_refuses_odd_thread_ids() {
+        let mut a = plain();
+        let mut n = pr(7);
+        n.cmd = "../x".into();
+        a.seed_inbox(vec![n]);
+        a.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert!(a.modal.is_none() && a.status.contains("nothing to mark read"));
+    }
+
+    #[test]
+    fn late_counts_from_before_a_reload_are_dropped() {
+        let mut a = plain();
+        let old = a.cgen;
+        a.reload_all();
+        a.tx.send(Msg::Count(old, (PK::Repo, 1), Ok((5, false))))
+            .unwrap();
+        a.tx.send(Msg::Count(a.cgen, (PK::Repo, 2), Ok((9, true))))
+            .unwrap();
+        a.poll();
+        assert_eq!(a.counts.get(&(PK::Repo, 1)), None);
+        assert_eq!(a.counts.get(&(PK::Repo, 2)), Some(&(9, true)));
     }
 }

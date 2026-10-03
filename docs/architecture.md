@@ -14,7 +14,7 @@ gh-pulse is a single binary: a synchronous ratatui event loop that talks to GitH
 | `src/act.rs` | Mutations as data: `Action` = label + optional prompt + `build(text) -> argv` |
 | `src/diff.rs` | Unified-diff parser, split-row builder, word-partner pairing, `wrap_ranges`, layout mode |
 | `src/syn.rs` | syntect highlighter (cargo feature `syntax`, on by default); a no-op stub with `--no-default-features` |
-| `src/config.rs` | `config.toml` model, validation with line numbers, atomic save, the named-action `Keymap` |
+| `src/config.rs` | `config.toml` model (incl. `[panels]` layout and tab sets), validation with line numbers, atomic save, the named-action `Keymap` |
 | `src/browse.rs` | Repo browser: GraphQL page parser, filter/sort/favorite/hide logic, browser key handling |
 | `src/md.rs` | Markdown to styled, wrapped lines (pulldown-cmark): headings, code, quotes, lists, tables, folding of `<details>` and long comments |
 | `src/sanitize.rs` | Makes bidi/zero-width/control characters visible (`<U+202E>`) in everything GitHub-sourced and in confirm-popup commands |
@@ -37,6 +37,12 @@ key/mouse event -> App (state change) -> spawn thread -> gh subprocess
   (scroll position, hit rectangles, wrapped-row offsets).
 - Lists come from `gh::list`; per-item detail (overview, checks, comments, diff, logs) from `gh::detail`, cached
   in `App.cache` keyed by `(item key, tab)`.
+- The left column is built from `[panels]` (`config::PanelsCfg::layout`). A panel has configured list tabs; the Repo
+  panel's tabs are different sources (`gh::list` panels 4 Branches, 7 Tags, 5 Releases). Titles show every tab's
+  count: the showing tab counts its own rows, the others are fetched one per idle tick (`App::counts`, dropped on
+  reload by a generation).
+- The header badge and the inbox (`N`) share one `gh api notifications` fetch (`Msg::Inbox`); marking read is an
+  ordinary `Action` through the confirm popup.
 - Files, Checks and Comments are *derived panels*: their rows are rebuilt from that cache for the selected (or
   drilled-into) PR by `sync_derived`, so they never fetch on their own.
 

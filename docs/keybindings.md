@@ -10,20 +10,21 @@ Press `?` in the app for the same list. Keys are checked against `src/app.rs` (`
 | `?` | Help popup (sized to its content; `j` `k` scroll when the terminal is short, any other key closes) |
 | `q` | Quit (closes the log view first when one is open) |
 | `Ctrl-C` | Quit, from anywhere including popups |
-| `1`-`8` | Focus panel by number (only as many as are shown; a PR drill-in has 3) |
+| `1`-`7` | Focus panel by number (only as many as are shown; a PR drill-in has 4). Pressing the number of the already focused panel steps to its next list tab |
 | `Tab` / `Shift-Tab` | Next / previous panel |
 | `x` | Action menu for the selected item or row |
 | `a` | Approve (shortcut into the menu, PRs) |
 | `C` | Comment (PRs and issues) |
 | `m` | Merge (open PRs) |
 | `o` | Open in the browser (`open`, or `xdg-open` off macOS) |
-| `y` | Copy the URL (`pbcopy`, `wl-copy` or `xclip`) |
-| `c` | Check out the selected PR (cwd must be a clone of its repo) |
+| `y` | Copy the URL (`pbcopy`, `wl-copy` or `xclip`); on a tag, its name |
+| `c` | Check out the selected PR (cwd must be a clone of its repo); not available for tags |
 | `r` | Refresh the focused panel (and clear cached details) |
 | `R` | Refresh all panels |
 | `L` | Toggle the command log strip |
 | `f` | Zoom the right pane to full width; `f` or `Esc` restores |
 | `B` / `Ctrl-r` | Repo browser (full screen) |
+| `N` | Inbox (full screen): unread notifications across repos. `j` `k` `g` `G` move, `Enter` opens the PR/issue in the app (switching repo; a closed or merged one opens in the browser), `m` marks read (confirm shows `gh api -X PATCH notifications/threads/<id>`), `o` opens in the browser, `r` refreshes, `N` / `Esc` / `q` close. Hidden repos are filtered |
 
 The keys of the actions in this table can be remapped in `config.toml`; see [configuration.md](configuration.md).
 
@@ -34,14 +35,14 @@ The keys of the actions in this table can be remapped in `config.toml`; see [con
 | `j` `k` / `Down` `Up` | Move |
 | `Ctrl-d` / `Ctrl-u` | Half page down / up |
 | `g` / `Home`, `G` / `End` | Top / bottom. Exception: `G` in a normal-layout list focus (PR, Issues, ...) toggles the global view, so use `End` there. In the Files panel and in a PR drill-in `G` jumps to the last row and says so in the status line |
-| `{` `}` | Previous / next list tab of the panel (Mine, Review requested, All open, Merged; Assigned, Mine, All open; Runs, Workflows) |
+| `{` `}` | Previous / next list tab of the panel (Mine, Review, All, Merged; Assigned, Mine, All; Runs, Workflows; Branches, Tags, Releases). Clicking a tab label in the panel title does the same |
 | `/` | Filter: type, `Enter` applies, `Esc` clears |
 | `Esc` | Clear the filter (after leaving zoom, detail focus and drill-in) |
 | `Enter` | On a PR: drill in. Elsewhere: focus the detail pane |
 | `l` / `Right` | Focus the detail pane |
-| `G` | Toggle the global view (PRs and issues across all repos); from the PR, Issues, Actions, Branches, Releases and Notifications panels only (not Files, not inside a drill-in) |
+| `G` | Toggle the global view (PRs and issues across all repos); from the PR and Issues panels only (not Files, not inside a drill-in) |
 
-The Files panel (3) has no filter and follows the selected PR; the Checks and Comments panels exist only in a drill-in.
+The Files panel (2) has no filter and follows the selected PR; the Checks and Comments panels exist only in a drill-in.
 
 ## PR drill-in (after `Enter` on a PR)
 

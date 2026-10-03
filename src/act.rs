@@ -79,6 +79,17 @@ pub fn enc_path(s: &str) -> String {
     s.split('/').map(seg).collect::<Vec<_>>().join("/")
 }
 
+/// Marks one notification thread read (the inbox's `m`).
+pub fn mark_read(thread_id: &str) -> Vec<String> {
+    cmd![
+        "gh",
+        "api",
+        "-X",
+        "PATCH",
+        format!("notifications/threads/{}", enc_path(thread_id))
+    ]
+}
+
 fn body_flag(b: &str) -> Vec<String> {
     if b.is_empty() { vec![] } else { cmd!["-b", b] }
 }

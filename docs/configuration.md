@@ -26,7 +26,37 @@ hidden = ["octocat/old-experiments"]
 [keys]
 quit = ["q", "ctrl-q"]
 actions = "space"
+
+[panels]
+show = ["prs", "files", "issues", "actions", "repo"]   # order = numbering
+hide_empty = false
+
+[panels.repo]
+tabs = ["branches", "releases"]    # drop Tags
+default_tab = "branches"
 ```
+
+## Panels
+
+`[panels] show` lists the left-column panels in display order; the order is also the numbering (`1`, `2`, ...).
+Any subset works, at least one is required, repeats are an error. Names:
+
+| Name | Panel |
+|---|---|
+| `prs` | Pull requests |
+| `files` | Files of the selected PR (follows `prs`; it is dropped when `prs` is not shown) |
+| `issues` | Issues |
+| `actions` | Workflow runs and workflows |
+| `repo` | Branches / Tags / Releases |
+| `notifications` | The repo's notifications, as a panel (not shown by default; the `✉` badge and the `N` inbox cover all repos) |
+| `status` | Repo summary (not shown by default; the header carries the same facts) |
+
+`[panels.prs]`, `[panels.issues]`, `[panels.actions]` and `[panels.repo]` take `tabs` (which list tabs to offer, in
+this order) and `default_tab` (which one opens first, and must be among `tabs`). Tab names: prs `mine` `review` `all`
+`merged`; issues `assigned` `mine` `all`; actions `runs` `workflows`; repo `branches` `tags` `releases`.
+`hide_empty = true` collapses a panel with nothing in any of its tabs to a single line (the focused panel never
+collapses). A bad name is a startup error naming the file, the line and the valid choices. With `files` not shown, the
+Diff tab still works: `n` / `p` pick the file.
 
 ## Syncing viewed marks with GitHub
 
@@ -61,8 +91,9 @@ Keys are a single character (case matters: `C` is shift-c), `ctrl-<letter>`, or 
 | `zoom` | `f` | Zoom the right pane |
 | `global` | `G` | Toggle the global view |
 | `repo_browser` | `B`, `ctrl-r` | Open the repo browser |
+| `inbox` | `N` | Open the notifications inbox |
 
 The `?` help and the bottom bar show the keys you configured. Startup fails (with the config path and the offending entry) on an unknown action, an unparsable key, a key bound to two actions, an
-empty list, or a key that is reserved for navigation: `j k h l g n p t w v e s S T H .`, `[ ] { }`, digits `1`-`8`,
+empty list, or a key that is reserved for navigation: `j k h l g n p t w v e s S T H .`, `[ ] { }`, digits `1`-`7`,
 `Enter`, `Esc`, `Tab`, arrows, `Home`, `End`, and `ctrl-c`/`ctrl-d`/`ctrl-u`. Inside popups and the repo browser the
 keys are fixed.

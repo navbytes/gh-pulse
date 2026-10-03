@@ -2,7 +2,7 @@ use crate::app::{App, Hit, Load, Modal, PK};
 use crate::browse::{self, Browser};
 use crate::config::Act;
 use crate::diff::{self, DLine, DiffMode, Op, Row};
-use crate::gh::{self, Data, FilesData, Item, Kind, LIMIT, Tab};
+use crate::gh::{self, Data, FilesData, Item, Kind, Tab};
 use crate::md::slice_spans;
 use crate::syn::Hl;
 use crate::theme::Theme;
@@ -19,13 +19,16 @@ fn help_text(app: &App) -> String {
     let k = |a: Act| app.keys.labels(a);
     format!(
         "\
-Panels (Status, Pull requests, Files, Issues, Actions, Branches, Releases, Notifications)
-  1-8, Tab/S-Tab  focus panel      {{ }}  switch the panel's list tab (Mine/Review/...)
+Panels (default: Pull requests, Files, Issues, Actions, Repo; choose them in [panels])
+  1-5, Tab/S-Tab  focus panel (its number again: next list tab)   {{ }}  previous/next list tab
   j/k, arrows     move             Ctrl-d/u  half page     g/G or Home/End  top/bottom
   {filter}  filter (Enter apply, Esc clear)
   l/Right         focus the detail pane   h/Esc/Left  back to the list
   {global}  (PR/Issues/... list focus) toggle global view; in Files and PR drill-in it jumps to the last row
   {browser}  repo browser: all your repos (search, sort, favorite, hide, Enter switches)
+  {inbox}  inbox: unread notifications of all repos (Enter opens it here, m marks read, o browser)
+Repo panel (Branches / Tags / Releases tabs)
+  Enter/l  details (a tag: commit, date, release)   {copy} on a tag copies its name   {actions}  branch/release actions
 Pull requests
   Files panel follows the selected PR; j/k there changes the file shown in the diff
   Enter on a PR drills in: Files / Commits / Checks / Comments of that PR (Esc returns)
@@ -51,6 +54,7 @@ Anywhere
         filter = k(Act::Filter),
         global = k(Act::Global),
         browser = k(Act::Browser),
+        inbox = k(Act::Inbox),
         zoom = k(Act::Zoom),
         actions = k(Act::Actions),
         approve = k(Act::Approve),
@@ -88,6 +92,10 @@ pub fn draw(f: &mut Frame, app: &App) {
     if let Some(b) = &app.browser {
         return browser_view(f, app, b, area);
     }
+    if app.inbox.is_some() {
+        inbox_view(f, app, area);
+        return modal(f, app);
+    }
     let log_h = if app.show_log && area.height >= 24 {
         8
     } else {
@@ -106,7 +114,48 @@ pub fn draw(f: &mut Frame, app: &App) {
         Some(c) => format!(" {} › PR #{}  {}", app.repo, c.pr.number, c.pr.title),
         None => app.header.clone(),
     };
+    // the badge keeps the right edge; hidden at 0 and when the fetch failed
+    let badge = app.unread_count().filter(|n| *n > 0).map(|n| {
+        format!(
+            "{} {} ",
+            th.ic.mail,
+            if n >= 100 {
+                "99+".into()
+            } else {
+                n.to_string()
+            }
+        )
+    });
+    let bw = badge.as_ref().map_or(0, |b| {
+        unicode_width::UnicodeWidthStr::width(b.as_str()) as u16
+    });
+    let [head, badge_area] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(bw)]).areas(head);
+    // repo, branch and user always; the repo facts are dropped from the right as the width shrinks
+    let mut facts = vec![];
+    if app.ctx.is_none()
+        && let Some(m) = &app.meta
+    {
+        facts.push(format!("{} {}", th.ic.star, m.stars));
+        facts.push(if m.private { "private" } else { "public" }.to_string());
+        if !m.branch.is_empty() {
+            facts.push(format!("default {}", m.branch));
+        }
+        if let Some((n, more)) = app.open_prs() {
+            facts.push(format!("{n}{} open PRs", if more { "+" } else { "" }));
+        }
+    }
+    let extra = if app.global {
+        "  [global view]".len()
+    } else {
+        0
+    } + if loading { 4 } else { 0 };
+    let avail = (head.width as usize).saturating_sub(extra);
+    let (title, tail) = fit_header(&title, &facts, th.ic.dot, th.ic.ell, avail);
     let mut hdr = vec![Span::styled(title, Style::new().fg(th.accent).bold())];
+    if !tail.is_empty() {
+        hdr.push(Span::styled(tail, Style::new().fg(th.muted)));
+    }
     if app.global {
         hdr.push(Span::styled("  [global view]", Style::new().fg(th.warn)));
     }
@@ -117,6 +166,12 @@ pub fn draw(f: &mut Frame, app: &App) {
         ));
     }
     f.render_widget(Paragraph::new(Line::from(hdr)), head);
+    if let Some(b) = badge {
+        f.render_widget(
+            Paragraph::new(Span::styled(b, Style::new().fg(th.warn).bold())),
+            badge_area,
+        );
+    }
 
     if app.show_log && log_h > 0 {
         let l = gh::cmd_log();
@@ -138,9 +193,10 @@ pub fn draw(f: &mut Frame, app: &App) {
         Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)]).areas(main)
     };
     // Short terminals: unfocused panels shrink to a single borderless line.
-    let n = app.panels.len() as u16;
-    let compact = left.height < 3 * (n - 1) + 5;
+    let n = (0..app.panels.len()).filter(|&i| !app.collapsed(i)).count() as u16;
+    let compact = left.height < 3 * n.saturating_sub(1) + 5;
     let rows = (0..app.panels.len()).map(|i| match (i == app.focus, compact) {
+        _ if app.collapsed(i) => Constraint::Length(1),
         (true, true) => Constraint::Min(4),
         (true, false) => Constraint::Min(5),
         (false, true) => Constraint::Length(1),
@@ -286,6 +342,156 @@ fn file_label(app: &App, it: &Item, w: usize) -> Line<'static> {
     v.push(Span::raw(" ".repeat(w.saturating_sub(used + rw))));
     v.extend(right);
     Line::from(v)
+}
+
+/// Right pane when nothing is selected: what the repo is, from the header's lookup.
+fn repo_overview(f: &mut Frame, app: &App, area: Rect) {
+    let th = &app.theme;
+    let Some(m) = &app.meta else {
+        return f.render_widget(bordered(app, " Detail ".into(), false), area);
+    };
+    let block = bordered(app, " Overview ".into(), false);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let muted = Style::new().fg(th.muted);
+    let kv = |k: &str, v: String| {
+        Line::from(vec![Span::styled(format!("{k:<16}"), muted), Span::raw(v)])
+    };
+    let mut lines = vec![Line::styled(app.repo.clone(), Style::new().bold())];
+    lines.extend(
+        wrap(&m.description, inner.width as usize)
+            .into_iter()
+            .map(Line::raw),
+    );
+    lines.push(Line::raw(""));
+    lines.push(kv(
+        "visibility",
+        if m.private { "private" } else { "public" }.into(),
+    ));
+    lines.push(kv("stars", m.stars.to_string()));
+    lines.push(kv("forks", m.forks.to_string()));
+    lines.push(kv("open issues", m.issues.to_string()));
+    lines.push(kv("default branch", m.branch.clone()));
+    if !m.license.is_empty() {
+        lines.push(kv("license", m.license.clone()));
+    }
+    if !m.pushed.is_empty() {
+        lines.push(kv("last push", m.pushed.clone()));
+    }
+    if !m.topics.is_empty() {
+        lines.push(kv("topics", m.topics.join(", ")));
+    }
+    f.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+        inner,
+    );
+}
+
+/// The header text for `avail` columns: `base` whole (ellipsized only if it alone is too long), then as
+/// many of `facts` as fit, whole, dropping from the right.
+fn fit_header(
+    base: &str,
+    facts: &[String],
+    dot: &str,
+    ell: &str,
+    avail: usize,
+) -> (String, String) {
+    use unicode_width::UnicodeWidthStr;
+    if base.width() > avail {
+        let keep: String = base.chars().take(avail.saturating_sub(1)).collect();
+        return (format!("{keep}{ell}"), String::new());
+    }
+    let (mut tail, mut used) = (String::new(), base.width());
+    for (i, f) in facts.iter().enumerate() {
+        let piece = if i == 0 {
+            format!("  {f}")
+        } else {
+            format!(" {dot} {f}")
+        };
+        if used + piece.width() > avail {
+            break;
+        }
+        used += piece.width();
+        tail += &piece;
+    }
+    (base.to_string(), tail)
+}
+
+/// Full-screen unread-notifications view (`N`).
+fn inbox_view(f: &mut Frame, app: &App, area: Rect) {
+    let th = &app.theme;
+    let Some(ib) = &app.inbox else { return };
+    let [head, body, foot] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+    let title = format!(" Inbox  {} unread", ib.items.len());
+    let mut hdr = vec![Span::styled(title, Style::new().fg(th.accent).bold())];
+    if ib.loading {
+        hdr.push(Span::styled(
+            format!("  {}", spinner(app)),
+            Style::new().fg(th.muted),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(hdr)), head);
+    let block = bordered(app, " Notifications (all repos) ".into(), true);
+    if let Some(e) = &ib.error {
+        return f.render_widget(
+            Paragraph::new(note(app, Note::Err(e.clone()))).block(block),
+            body,
+        );
+    }
+    if ib.items.is_empty() {
+        let n = if ib.loading {
+            Note::Loading
+        } else {
+            Note::Empty("no unread notifications")
+        };
+        return f.render_widget(Paragraph::new(note(app, n)).block(block), body);
+    }
+    let muted = Style::new().fg(th.muted);
+    let rows = ib.items.iter().map(|it| {
+        let what = match it.kind {
+            Kind::Pr => "PR",
+            Kind::Issue => "issue",
+            _ => "other",
+        };
+        let num = if it.number > 0 {
+            format!("#{} ", it.number)
+        } else {
+            String::new()
+        };
+        // meta is "repo · reason"
+        let reason = it.meta.split_once(" \u{b7} ").map_or("", |(_, r)| r);
+        ListItem::new(Line::from(vec![
+            Span::styled(format!("{} ", th.ic.unread), Style::new().fg(th.accent)),
+            Span::styled(format!("{what:<5} "), muted),
+            Span::styled(format!("{} ", it.repo), muted),
+            Span::styled(num, muted),
+            Span::raw(it.title.clone()),
+            Span::styled(format!("  {reason}"), muted),
+        ]))
+    });
+    let list = List::new(rows)
+        .block(block)
+        .highlight_style(Style::new().bg(th.sel_bg).bold());
+    let mut st = ListState::default().with_selected(Some(ib.cursor.min(ib.items.len() - 1)));
+    f.render_stateful_widget(list, body, &mut st);
+    let hint = format!(
+        "j/k move  Enter open  m mark read  o browser  r refresh  {}/Esc back",
+        app.keys.label(Act::Inbox)
+    );
+    let status = if app.status.is_empty() {
+        hint
+    } else {
+        app.status.clone()
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(status, Style::new().fg(th.muted))),
+        foot,
+    );
 }
 
 /// Full-screen repository browser.
@@ -512,8 +718,9 @@ fn hints(app: &App) -> String {
         "j/k move".into()
     } else {
         format!(
-            "j/k move  Enter drill in  [ ] detail tab  {{ }} list tab  {filter} filter  {actions} actions  {} repos",
-            kl(Act::Browser)
+            "j/k move  Enter drill in  [ ] detail tab  {{ }} list tab  {filter} filter  {actions} actions  {} repos  {} inbox",
+            kl(Act::Browser),
+            kl(Act::Inbox)
         )
     };
     format!("{ctx}  {} help  {} quit{flt}", kl(Act::Help), kl(Act::Quit))
@@ -624,6 +831,10 @@ fn label(app: &App, it: &Item, show_repo: bool, w: usize) -> Line<'static> {
                 v.push(Span::styled(format!(" {}", it.state), muted));
             }
         }
+        Kind::Tag => {
+            v.push(Span::raw(it.title.clone()));
+            v.push(Span::styled(format!("  {}", it.meta), muted));
+        }
         Kind::Check => {
             v.push(status_icon(th, &it.state));
             v.push(Span::raw(it.title.clone()));
@@ -665,35 +876,164 @@ fn note(app: &App, n: Note) -> Line<'static> {
     }
 }
 
+/// One piece of a panel title; `tab` marks the clickable list-tab labels.
+struct Part {
+    text: String,
+    tab: Option<usize>,
+    active: bool,
+}
+
+fn count_txt(app: &App, c: Option<(usize, bool)>) -> String {
+    match c {
+        None => app.theme.ic.ell.to_string(),
+        Some((n, true)) => format!("{n}+"),
+        Some((n, false)) => n.to_string(),
+    }
+}
+
+/// `[5] Branches 32 · Tags 14 · Releases 81`: every list tab with its count (`…` until known).
+fn tab_title(app: &App, i: usize, short_name: bool, short_tabs: bool) -> Vec<Part> {
+    let (p, th) = (&app.panels[i], &app.theme);
+    let plain = |text: String| Part {
+        text,
+        tab: None,
+        active: false,
+    };
+    let mut v = vec![plain(format!(" [{}] ", i + 1))];
+    if !p.title.is_empty() {
+        let name = if short_name && p.title == "Pull requests" {
+            "PRs"
+        } else {
+            p.title
+        };
+        v.push(plain(format!("{name} ")));
+    }
+    for (ti, t) in p.tabs.iter().enumerate() {
+        if ti > 0 {
+            v.push(plain(format!(" {} ", th.ic.dot)));
+        }
+        let label = if short_tabs { t.short } else { t.label };
+        v.push(Part {
+            text: format!("{label} {}", count_txt(app, app.tab_count(i, ti))),
+            tab: Some(ti),
+            active: ti == p.tab,
+        });
+    }
+    v.push(plain(" ".into()));
+    v
+}
+
+/// The one-tab form: `[2] Files (12)`, `[1] Pull requests · Mine (3)`; `with_tab` keeps the tab name,
+/// `short_name` squeezes the panel name to `PRs` (or drops it).
+fn simple_title(app: &App, i: usize, with_tab: bool, short_name: Option<bool>) -> Vec<Part> {
+    let (p, th) = (&app.panels[i], &app.theme);
+    let tab = p.tabs.get(p.tab).map(|t| t.label);
+    let name = if p.title.is_empty() {
+        tab.unwrap_or("")
+    } else {
+        p.title
+    };
+    let name = match short_name {
+        None => String::new(),
+        Some(true) if name == "Pull requests" => "PRs ".to_string(),
+        Some(_) if name.is_empty() => String::new(),
+        Some(_) => format!("{name} "),
+    };
+    let extra = match (with_tab, p.title.is_empty(), tab) {
+        (true, false, Some(t)) => format!("{} {t} ", th.ic.dot),
+        _ => String::new(),
+    };
+    let count = match (p.kind, app.active_count(i)) {
+        (PK::Status, _) => String::new(),
+        (_, Some((n, true))) => format!("({n}+)"),
+        (_, Some((n, false))) => format!("({n})"),
+        (_, None) => format!("({})", th.ic.ell),
+    };
+    let text = format!(" [{}] {name}{extra}{count} ", i + 1);
+    vec![Part {
+        text,
+        tab: None,
+        active: false,
+    }]
+}
+
+fn parts_width(v: &[Part]) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    v.iter().map(|p| p.text.width()).sum()
+}
+
+/// The fullest title form that fits `avail` columns, degrading by whole segments (every tab with its
+/// count, short tab names, the showing tab, the panel name, `PRs`, the number alone); a count is
+/// never cut in half. Only a width under the last form gets an ellipsis.
+fn fit_title(app: &App, i: usize, avail: usize) -> Vec<Part> {
+    let mut forms = vec![];
+    if app.panels[i].tabs.len() > 1 {
+        forms.push(tab_title(app, i, false, false));
+        forms.push(tab_title(app, i, true, false));
+        forms.push(tab_title(app, i, true, true));
+    }
+    forms.push(simple_title(app, i, true, Some(false)));
+    forms.push(simple_title(app, i, false, Some(false)));
+    forms.push(simple_title(app, i, false, Some(true)));
+    forms.push(simple_title(app, i, false, None));
+    if let Some(f) = forms.iter().position(|f| parts_width(f) <= avail) {
+        return forms.swap_remove(f);
+    }
+    let mut last = forms.pop().unwrap_or_default();
+    if let Some(p) = last.first_mut() {
+        let keep: String = p.text.chars().take(avail.saturating_sub(1)).collect();
+        p.text = format!("{keep}{}", app.theme.ic.ell);
+    }
+    last
+}
+
 fn panel(f: &mut Frame, app: &App, i: usize, area: Rect, compact: bool) {
+    use unicode_width::UnicodeWidthStr;
     let th = &app.theme;
     let p = &app.panels[i];
     let focused = i == app.focus;
     let items = app.visible(i);
-    let tab = p
-        .tabs
-        .get(p.tab)
-        .map(|t| format!(" {} {t}", th.ic.dot))
-        .unwrap_or_default();
-    // a trailing "N more" row is not an item; the count says "n+" while more are still coming
-    let more = items.last().is_some_and(|i| i.state == "more");
-    let count = match (p.kind, items.len() - usize::from(more)) {
-        (PK::Status, _) => String::new(),
-        // list panels are capped at LIMIT; Files/Checks/... are complete, except Files at GitHub's
-        // 3000-file API ceiling and Comments that are still paging in
-        (PK::Files, n) if n >= 3000 => format!(" ({n}+)"),
-        (k, n) if (!k.derived() && p.items.len() >= LIMIT) || more => format!(" ({n}+)"),
-        (_, n) => format!(" ({n})"),
-    };
-    let title = format!(" [{}] {}{tab}{count} ", i + 1, p.title);
-    if compact && !focused {
-        let t = title.trim().to_string();
-        return f.render_widget(
-            Paragraph::new(Span::styled(t, Style::new().fg(th.muted))),
-            area,
+    let collapsed = app.collapsed(i);
+    if collapsed {
+        let name = if p.title.is_empty() { "Repo" } else { p.title };
+        let line = Line::styled(
+            format!(" [{}] {name} (empty)", i + 1),
+            Style::new().fg(th.muted).italic(),
         );
+        return f.render_widget(Paragraph::new(line), area);
     }
-    let block = bordered(app, title, focused && !app.detail_focus);
+    let borderless = compact && !focused;
+    let avail = (area.width as usize).saturating_sub(if borderless { 0 } else { 2 });
+    let parts = fit_title(app, i, avail);
+    // clickable tab labels start right after the corner (or at the edge of a borderless line)
+    let mut x = area.x + u16::from(!borderless);
+    let (mut spans, mut ptabs) = (vec![], vec![]);
+    for part in &parts {
+        let w = part.text.width() as u16;
+        let st = match (part.tab, part.active) {
+            (Some(_), true) => Style::new().fg(th.accent).bold().underlined(),
+            (Some(_), false) => Style::new().fg(th.muted).not_bold(),
+            _ => Style::default(),
+        };
+        if let Some(t) = part.tab {
+            ptabs.push(crate::app::PTab {
+                y: area.y,
+                x0: x,
+                x1: x + w,
+                panel: i,
+                tab: t,
+            });
+        }
+        x += w;
+        spans.push(Span::styled(part.text.clone(), st));
+    }
+    app.hit.borrow_mut().ptabs.extend(ptabs);
+    if borderless {
+        let line = Line::from(spans).style(Style::new().fg(th.muted));
+        return f.render_widget(Paragraph::new(line), area);
+    }
+    let title = Line::from(spans);
+    let block = bordered_line(app, title, focused && !app.detail_focus);
     let inner = block.inner(area);
 
     let cur = items.get(p.cursor.min(items.len().saturating_sub(1)));
@@ -861,7 +1201,7 @@ fn detail(f: &mut Frame, app: &App, area: Rect) {
         return derived_detail(f, app, area, k);
     }
     let Some(it) = app.selected() else {
-        return f.render_widget(bordered(app, " Detail ".into(), false), area);
+        return repo_overview(f, app, area);
     };
     let sep = format!(" {} ", th.border.vertical_left);
     let mut title = vec![Span::raw(" ")];
@@ -891,7 +1231,7 @@ fn detail(f: &mut Frame, app: &App, area: Rect) {
     let tab = app.cur_tab();
     let w = inner.width as usize;
     // Item-only overviews render instantly; everything else waits on its fetch.
-    if tab != Tab::Overview || matches!(it.kind, Kind::Status | Kind::Release) {
+    if tab != Tab::Overview || matches!(it.kind, Kind::Status | Kind::Release | Kind::Tag) {
         let n = match app.load() {
             Some(Load::Done(Err(e))) => Some(Note::Err(e.clone())),
             Some(Load::Done(Ok(_))) => None,
@@ -2243,7 +2583,6 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
             ],
         );
         a.seed_commit_diffs(&commits, "diff --git a/c.rs b/c.rs\n--- a/c.rs\n+++ b/c.rs\n@@ -1 +1 @@\n-old commit line\n+new commit line\ndiff --git a/d.rs b/d.rs\n--- a/d.rs\n+++ b/d.rs\n@@ -1 +1 @@\n-x\n+second file of the commit\n");
-        key(&mut a, KeyCode::Char('2'));
         a
     }
 
@@ -2253,10 +2592,11 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
             for (w, h) in [(120, 40), (80, 24), (50, 12)] {
                 let s = render(w, h, light, IconSet::Unicode);
                 for want in [
-                    "[1] Status",
-                    "[2] Pull requests",
-                    "[3] Files",
-                    "[8] Notifications",
+                    "[1] ",
+                    "[2] Files",
+                    "[3] Issues",
+                    "[4] Actions",
+                    "[5] ",
                     "╭",
                     "Detail",
                 ] {
@@ -2274,8 +2614,8 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
         for (w, h) in [(80, 24), (120, 40)] {
             let mut a = seeded();
             let s = render_app(&a, w, h);
-            assert!(s.contains("[3] Files (2)"), "{w}x{h}\n{s}");
-            key(&mut a, KeyCode::Char('3')); // focus Files: diff of file 1 shown, full width
+            assert!(s.contains("[2] Files (2)"), "{w}x{h}\n{s}");
+            key(&mut a, KeyCode::Char('2')); // focus Files: diff of file 1 shown, full width
             let s = render_app(&a, w, h);
             for want in [
                 "M ",
@@ -2301,7 +2641,7 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
     #[test]
     fn badges_viewed_and_zoom() {
         let mut a = seeded();
-        key(&mut a, KeyCode::Char('3'));
+        key(&mut a, KeyCode::Char('2'));
         key(&mut a, KeyCode::Char('j'));
         let s = render_app(&a, 120, 40);
         assert!(s.contains("◆2"), "thread badge\n{s}");
@@ -2310,11 +2650,11 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
         key(&mut a, KeyCode::Char('f'));
         let s = render_app(&a, 160, 30);
         assert!(
-            !s.contains("[3] Files") && s.contains("auto:split"),
+            !s.contains("[2] Files") && s.contains("auto:split"),
             "zoomed:\n{s}"
         );
         key(&mut a, KeyCode::Esc);
-        assert!(render_app(&a, 120, 40).contains("[3] Files"));
+        assert!(render_app(&a, 120, 40).contains("[2] Files"));
     }
 
     #[test]
@@ -2332,7 +2672,10 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
             ] {
                 assert!(s.contains(want), "{w}x{h} missing {want:?}\n{s}");
             }
-            assert!(!s.contains("[2] Pull requests"));
+            assert!(
+                !s.contains("Mine"),
+                "the PR list is parked while drilled in"
+            );
             key(&mut a, KeyCode::Char(']')); // next panel: Commits
             assert!(render_app(&a, w, h).contains("Commit abc1234"));
             key(&mut a, KeyCode::Char(']')); // Checks
@@ -2342,7 +2685,8 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
             key(&mut a, KeyCode::Esc);
             let s = render_app(&a, w, h);
             assert!(
-                s.contains("[2] Pull requests") && !s.contains("› PR"),
+                s.contains("[1] ") && s.contains("Mine") && !s.contains("› PR")
+                    || s.contains("[1] Pull requests"),
                 "{s}"
             );
         }
@@ -2355,7 +2699,7 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
         assert!(a.global, "list focus toggles the global view");
         key(&mut a, KeyCode::Char('G'));
         assert!(!a.global);
-        key(&mut a, KeyCode::Char('3')); // Files focus: last file, no toggle, and it says why
+        key(&mut a, KeyCode::Char('2')); // Files focus: last file, no toggle, and it says why
         key(&mut a, KeyCode::Char('G'));
         assert!(
             !a.global && a.file() == 1 && a.status.contains("last row"),
@@ -2377,7 +2721,8 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
         let s = render_app(&a, 200, 50);
         for want in [
             "(Esc returns)",
-            "Mine/Review/...)",
+            "previous/next list tab",
+            "Repo panel (Branches / Tags / Releases tabs)",
             "m merge",
             "f zoom",
             "g/G first/last row",
@@ -2386,7 +2731,7 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
         }
         let s = render_app(&a, 80, 24); // too small for everything: wraps and scrolls
         assert!(
-            s.contains("Keys (j/k scroll") && s.contains("returns)"),
+            s.contains("Keys (j/k scroll") && s.contains("Panels (default"),
             "{s}"
         );
         for _ in 0..40 {
@@ -2401,7 +2746,7 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
     #[test]
     fn files_focus_switches_detail_tabs() {
         let mut a = seeded();
-        key(&mut a, KeyCode::Char('3'));
+        key(&mut a, KeyCode::Char('2'));
         assert!(render_app(&a, 120, 40).contains("auto:unified")); // Diff by default
         key(&mut a, KeyCode::Char(']')); // Commits tab
         key(&mut a, KeyCode::Char(']')); // wraps to Overview
@@ -2412,7 +2757,7 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
     #[test]
     fn viewed_tick_keeps_stats_aligned() {
         let mut a = seeded();
-        key(&mut a, KeyCode::Char('3'));
+        key(&mut a, KeyCode::Char('2'));
         key(&mut a, KeyCode::Char('v')); // mark file 1 viewed
         let s = render_app(&a, 120, 40);
         let col = |name: &str| {
@@ -2454,7 +2799,7 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
                 "hidden repos are not listed"
             );
             assert!(
-                !s.contains("[3] Files"),
+                !s.contains("[2] Files"),
                 "full screen: the normal panels are gone"
             );
             // favorites first
@@ -2477,7 +2822,7 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
             "{s}"
         );
         key(&mut a, KeyCode::Esc);
-        assert!(a.browser.is_none() && render_app(&a, 120, 40).contains("[3] Files"));
+        assert!(a.browser.is_none() && render_app(&a, 120, 40).contains("[2] Files"));
     }
 
     #[test]
@@ -2765,7 +3110,7 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
                     }),
                 )],
             );
-            key(&mut a, KeyCode::Char('3'));
+            key(&mut a, KeyCode::Char('2'));
             key(&mut a, KeyCode::Char('l'));
             key(&mut a, KeyCode::Char('t')); // auto -> unified
             if width == 220 {
@@ -2954,7 +3299,6 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
         let mut a = app(false, IconSet::Unicode);
         let i = a.panel_idx_for_test(crate::app::PK::Prs);
         a.panels[i].items = items;
-        key(&mut a, KeyCode::Char('2'));
         let mut t = Terminal::new(TestBackend::new(120, 30)).unwrap();
         let dump = |t: &Terminal<TestBackend>| -> Vec<String> {
             let b = t.backend().buffer();
@@ -3007,7 +3351,7 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
             )],
         );
         let s = render_app(&a, 120, 40);
-        assert!(s.contains("[3] Files (252)") && !s.contains("252+"), "{s}");
+        assert!(s.contains("[2] Files (252)") && !s.contains("252+"), "{s}");
     }
 
     fn type_str(a: &mut App, s: &str) {
@@ -3031,7 +3375,7 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
     fn new_issue_form_validates_then_confirms_the_exact_command() {
         for (w, h) in [(80, 24), (120, 40)] {
             let mut a = seeded();
-            key(&mut a, KeyCode::Char('4')); // Issues panel
+            key(&mut a, KeyCode::Char('3')); // Issues panel
             key(&mut a, KeyCode::Char('n'));
             let s = render_app(&a, w, h);
             for want in [
@@ -3091,7 +3435,7 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
     #[test]
     fn new_pr_form_from_a_branch_warns_when_it_is_not_pushed() {
         let mut a = seeded();
-        let i = a.panel_idx_for_test(crate::app::PK::Branches);
+        let i = a.panel_idx_for_test(crate::app::PK::Repo);
         a.panels[i].items = vec![Item {
             title: "feat/x".into(),
             cmd: "feat/x".into(),
@@ -3099,7 +3443,7 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
             kind: Kind::Branch,
             ..Default::default()
         }];
-        key(&mut a, KeyCode::Char('6')); // Branches
+        key(&mut a, KeyCode::Char('5')); // Repo: Branches tab
         key(&mut a, KeyCode::Char('x'));
         let menu = render_app(&a, 120, 40);
         assert!(menu.contains("Create pull request..."), "{menu}");
@@ -3172,7 +3516,7 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
                 wf(4242, "Deploy", "active"),
                 wf(7, "Old", "disabled_manually"),
             ];
-            key(&mut a, KeyCode::Char('5')); // Actions
+            key(&mut a, KeyCode::Char('4')); // Actions
             key(&mut a, KeyCode::Char('d'));
             let s = render_app(&a, w, h);
             assert!(
@@ -3210,10 +3554,12 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
             ctrl_s(&mut a);
             let s = render_app(&a, w, h);
             // (the box wraps the command at 80 columns: compare with borders and line breaks removed)
+            // (panel rows behind the popup's edges leave stray cells: keep each row's widest segment)
             let flat: String = s
-                .chars()
-                .filter(|c| !"\u{2502}\u{256d}\u{256e}\u{2570}\u{256f}".contains(*c))
-                .collect();
+                .lines()
+                .filter_map(|l| l.split('\u{2502}').max_by_key(|p| p.chars().count()))
+                .collect::<Vec<_>>()
+                .join(" ");
             let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
             assert!(
                 flat.contains("gh workflow run 4242 -R o/r --ref main -f 'message=ship it' -f verbose=true -f level=warn -f count=3"),
@@ -3300,7 +3646,7 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
                 }),
             )],
         );
-        key(&mut a, KeyCode::Char('3'));
+        key(&mut a, KeyCode::Char('2'));
         key(&mut a, KeyCode::Char('l'));
         for _ in 0..12 {
             key(&mut a, KeyCode::Char('G')); // cursor to the last row: worst case for offsets
@@ -3406,5 +3752,498 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
         let s = render_app(&a, 100, 20);
         assert!(!s.contains('\u{258e}') && s.contains('|'), "{s}");
         assert!(s.contains("test:   which < all >"), "{s}");
+    }
+
+    fn cfg_app(toml: &str) -> App {
+        let cfg = crate::config::parse(toml, "t").unwrap();
+        App::build(
+            "o/r".into(),
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+            cfg,
+        )
+    }
+
+    fn items(kind: Kind, n: usize) -> Vec<Item> {
+        (1..=n)
+            .map(|i| Item {
+                number: i as u64,
+                title: format!("item number {i}"),
+                repo: "o/r".into(),
+                state: "open".into(),
+                kind,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn default_layout_is_five_panels_with_room_for_rows() {
+        for (w, h) in [(80u16, 24u16), (120, 40)] {
+            let mut a = app(false, IconSet::Unicode);
+            let i = a.panel_idx_for_test(crate::app::PK::Prs);
+            a.panels[i].items = items(Kind::Pr, 8);
+            let s = render_app(&a, w, h);
+            for want in ["[1] ", "[2] Files", "[3] Issues", "[4] Actions", "[5] "] {
+                assert!(s.contains(want), "{w}x{h} missing {want:?}\n{s}");
+            }
+            for gone in ["Status", "Notifications", "[6]"] {
+                assert!(!s.contains(gone), "{w}x{h} still has {gone:?}\n{s}");
+            }
+            if h == 24 {
+                assert!(
+                    s.contains("#8 item number 8"),
+                    "eight rows fit at 80x24\n{s}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_tab_shows_its_count_and_dots_until_known() {
+        let mut a = app(false, IconSet::Unicode);
+        let i = a.panel_idx_for_test(crate::app::PK::Repo);
+        a.panels[i].items = items(Kind::Branch, 32);
+        a.counts.insert((crate::app::PK::Repo, 1), (14, false));
+        let s = render_app(&a, 120, 40);
+        assert!(
+            s.contains("[5] Branches 32 \u{b7} Tags 14 \u{b7} Releases \u{2026}"),
+            "{s}"
+        );
+        a.counts.insert((crate::app::PK::Repo, 2), (100, true));
+        let s = render_app(&a, 120, 40);
+        assert!(s.contains("Releases 100+"), "{s}");
+        // too narrow for every label: short names, then just the showing tab
+        let s = render_app(&a, 80, 24);
+        assert!(
+            s.contains("[5] Branches (32)") || s.contains("[5] Brn 32"),
+            "{s}"
+        );
+        let s = render_app(&app(false, IconSet::Ascii), 120, 40);
+        assert!(s.contains("Releases ~"), "ascii uses ~ for unknown\n{s}");
+    }
+
+    #[test]
+    fn the_active_tab_is_highlighted_and_clicking_a_label_switches() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut a = app(false, IconSet::Unicode);
+        render_app(&a, 120, 40);
+        let t = *a
+            .hit
+            .borrow()
+            .ptabs
+            .iter()
+            .find(|t| t.panel == 4 && t.tab == 1)
+            .expect("Tags label is clickable");
+        a.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: t.x0 + 1,
+            row: t.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            (a.focus, a.panels[4].tab),
+            (4, 1),
+            "focus follows, tab switched"
+        );
+        // the showing tab is underlined, the others are not
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| draw(f, &a)).unwrap();
+        let b = term.backend().buffer();
+        let row = a
+            .hit
+            .borrow()
+            .ptabs
+            .iter()
+            .find(|t| t.panel == 4)
+            .map(|t| t.y)
+            .unwrap();
+        let ul = |x: u16| b[(x, row)].modifier.contains(Modifier::UNDERLINED);
+        let (tags, branches) = (
+            *a.hit
+                .borrow()
+                .ptabs
+                .iter()
+                .find(|t| t.panel == 4 && t.tab == 1)
+                .unwrap(),
+            *a.hit
+                .borrow()
+                .ptabs
+                .iter()
+                .find(|t| t.panel == 4 && t.tab == 0)
+                .unwrap(),
+        );
+        assert!(ul(tags.x0) && !ul(branches.x0));
+    }
+
+    #[test]
+    fn number_key_again_cycles_the_list_tab_and_braces_step() {
+        let mut a = app(false, IconSet::Unicode);
+        assert_eq!(a.panels[0].tab, 0);
+        key(&mut a, KeyCode::Char('1'));
+        assert_eq!(a.panels[0].tab, 1, "focused panel's number: next tab");
+        for _ in 0..3 {
+            key(&mut a, KeyCode::Char('1'));
+        }
+        assert_eq!(a.panels[0].tab, 0, "wraps");
+        key(&mut a, KeyCode::Char('3'));
+        assert_eq!(
+            (a.focus, a.panels[2].tab),
+            (2, 0),
+            "another panel's number only focuses"
+        );
+        key(&mut a, KeyCode::Char('}'));
+        key(&mut a, KeyCode::Char('{'));
+        key(&mut a, KeyCode::Char('{'));
+        assert_eq!(a.panels[2].tab, 2, "braces still step, backwards wraps");
+    }
+
+    #[test]
+    fn custom_three_panel_config_numbers_by_order_and_hides_files_without_prs() {
+        for (w, h) in [(80u16, 24u16), (120, 40)] {
+            let mut a = cfg_app(
+                "[panels]\nshow = [\"repo\", \"issues\", \"prs\"]\n[panels.repo]\ntabs = [\"tags\", \"branches\"]\ndefault_tab = \"branches\"\n",
+            );
+            let s = render_app(&a, w, h);
+            for want in ["[1] ", "[2] Issues", "[3] "] {
+                assert!(s.contains(want), "{w}x{h} missing {want:?}\n{s}");
+            }
+            for gone in ["Files", "Actions", "[4]", "Releases"] {
+                assert!(!s.contains(gone), "{w}x{h} has {gone:?}\n{s}");
+            }
+            assert_eq!(a.panels[0].tab, 1, "default_tab = branches");
+            key(&mut a, KeyCode::Char('3'));
+            assert_eq!(a.panels[a.focus].kind, crate::app::PK::Prs);
+            key(&mut a, KeyCode::Char('4'));
+            assert_eq!(a.focus, 2, "no fourth panel");
+        }
+    }
+
+    #[test]
+    fn diff_file_navigation_works_without_a_files_panel() {
+        let mut a = cfg_app("[panels]\nshow = [\"prs\"]\n");
+        let diff = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/b b/b\n--- a/b\n+++ b/b\n@@ -1 +1 @@\n-x\n+y\n";
+        let pr = items(Kind::Pr, 1).remove(0);
+        a.seed(
+            pr,
+            vec![(
+                Tab::Diff,
+                Data::Files(FilesData {
+                    sha: "s".into(),
+                    files: crate::diff::parse(diff),
+                    ..Default::default()
+                }),
+            )],
+        );
+        for _ in 0..3 {
+            key(&mut a, KeyCode::Char(']')); // Overview .. Diff
+        }
+        key(&mut a, KeyCode::Char('l'));
+        key(&mut a, KeyCode::Char('n'));
+        assert_eq!(a.file(), 1);
+        assert!(render_app(&a, 120, 40).contains("2/2"));
+    }
+
+    #[test]
+    fn hide_empty_collapses_empty_panels_to_a_line() {
+        let mut a = cfg_app("[panels]\nhide_empty = true\n");
+        let i = a.panel_idx_for_test(crate::app::PK::Prs);
+        a.panels[i].items = items(Kind::Pr, 2);
+        for (k, tabs) in [
+            (crate::app::PK::Issues, 3),
+            (crate::app::PK::Actions, 2),
+            (crate::app::PK::Repo, 3),
+        ] {
+            for t in 1..tabs {
+                a.counts.insert((k, t), (0, false));
+            }
+        }
+        let s = render_app(&a, 120, 40);
+        assert_eq!(
+            s.matches("(empty)").count(),
+            4,
+            "files, issues, actions, repo\n{s}"
+        );
+        // a panel with something in another tab stays open; so does the focused one
+        a.counts.insert((crate::app::PK::Issues, 2), (5, false));
+        let s = render_app(&a, 120, 40);
+        assert_eq!(s.matches("(empty)").count(), 3, "{s}");
+        key(&mut a, KeyCode::Char('4'));
+        let s = render_app(&a, 120, 40);
+        assert_eq!(
+            s.matches("(empty)").count(),
+            2,
+            "focus expands a panel\n{s}"
+        );
+        let s = render_app(&app(false, IconSet::Unicode), 120, 40);
+        assert!(!s.contains("(empty)"), "off by default");
+    }
+
+    #[test]
+    fn header_shows_repo_facts_and_the_unread_badge() {
+        let mut a = app(false, IconSet::Unicode);
+        a.meta = Some(crate::gh::RepoMeta {
+            stars: 46514,
+            private: false,
+            branch: "trunk".into(),
+            ..Default::default()
+        });
+        a.counts.insert((crate::app::PK::Prs, 2), (74, false));
+        a.seed_unread(&["a/b", "c/d", "c/d"]);
+        let s = render_app(&a, 120, 40);
+        let head = s.lines().next().unwrap();
+        assert!(
+            head.contains("\u{2605} 46514 \u{b7} public \u{b7} default trunk \u{b7} 74 open PRs"),
+            "{head}"
+        );
+        assert!(
+            head.trim_end().ends_with("\u{2709} 3"),
+            "badge keeps the right edge: {head}"
+        );
+        a.cfg.repos.toggle_hidden("c/d");
+        assert!(
+            render_app(&a, 120, 40)
+                .lines()
+                .next()
+                .unwrap()
+                .trim_end()
+                .ends_with("\u{2709} 1"),
+            "hidden repos don't count"
+        );
+        a.seed_unread(&[]);
+        assert!(!render_app(&a, 120, 40).contains('\u{2709}'), "hidden at 0");
+    }
+
+    fn notif(kind: Kind, repo: &str, n: u64, title: &str, id: &str) -> Item {
+        Item {
+            kind,
+            repo: repo.into(),
+            number: n,
+            title: title.into(),
+            state: "unread".into(),
+            meta: format!("{repo} \u{b7} mention"),
+            cmd: id.into(),
+            url: format!("https://github.com/{repo}/pull/{n}"),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn inbox_lists_notifications_and_marking_read_confirms_the_exact_command() {
+        for (w, h) in [(80u16, 24u16), (120, 40)] {
+            let mut a = app(false, IconSet::Unicode);
+            a.seed_inbox(vec![
+                notif(Kind::Pr, "o/r", 7, "Add notes", "1001"),
+                notif(Kind::Issue, "x/y", 9, "Crash on start", "1002"),
+                notif(Kind::Other, "x/y", 0, "Release v2", "1003"),
+            ]);
+            let s = render_app(&a, w, h);
+            for want in [
+                "Inbox  3 unread",
+                "o/r",
+                "#7 Add notes",
+                "x/y",
+                "Crash on start",
+                "mention",
+                "m mark read",
+                "Esc back",
+            ] {
+                assert!(s.contains(want), "{w}x{h} missing {want:?}\n{s}");
+            }
+            assert!(!s.contains("[1] "), "full screen, no panels\n{s}");
+            key(&mut a, KeyCode::Char('j'));
+            key(&mut a, KeyCode::Char('m'));
+            let s = render_app(&a, w, h);
+            assert!(
+                s.contains("Run this command?")
+                    && s.contains("gh api -X PATCH notifications/threads/1002"),
+                "{w}x{h}\n{s}"
+            );
+            key(&mut a, KeyCode::Enter); // never runs
+            assert!(render_app(&a, w, h).contains("Run this command?"));
+            key(&mut a, KeyCode::Char('n'));
+            assert!(
+                a.modal.is_none() && a.inbox.is_some(),
+                "cancel returns to the inbox"
+            );
+            key(&mut a, KeyCode::Esc);
+            assert!(a.inbox.is_none() && render_app(&a, w, h).contains("[1] "));
+        }
+    }
+
+    #[test]
+    fn inbox_states_and_hidden_repos() {
+        let mut a = app(false, IconSet::Unicode);
+        key(&mut a, KeyCode::Char('N'));
+        assert!(
+            render_app(&a, 120, 40).contains("loading"),
+            "loading until the fetch answers"
+        );
+        a.seed_inbox(vec![]);
+        assert!(render_app(&a, 120, 40).contains("no unread notifications"));
+        key(&mut a, KeyCode::Char('N'));
+        assert!(a.inbox.is_none(), "the same key closes it");
+    }
+
+    #[test]
+    fn tags_list_and_checkout_is_not_offered() {
+        let mut a = app(false, IconSet::Unicode);
+        let i = a.panel_idx_for_test(crate::app::PK::Repo);
+        a.panels[i].tab = 1;
+        a.panels[i].items = vec![Item {
+            title: "v1.2.0".into(),
+            cmd: "v1.2.0".into(),
+            meta: "abc1234".into(),
+            repo: "o/r".into(),
+            kind: Kind::Tag,
+            ..Default::default()
+        }];
+        key(&mut a, KeyCode::Char('5'));
+        let s = render_app(&a, 120, 40);
+        assert!(
+            s.contains("v1.2.0  abc1234") && s.contains("Branches"),
+            "{s}"
+        );
+        key(&mut a, KeyCode::Char('c'));
+        assert!(a.status.contains("not available for tags"), "{}", a.status);
+    }
+
+    fn line_of(s: &str, needle: &str) -> String {
+        s.lines()
+            .find(|l| l.contains(needle))
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[test]
+    fn header_drops_facts_from_the_right_and_keeps_the_badge() {
+        let mut a = app(false, IconSet::Unicode);
+        a.header = " cli/cli  branch: feat  user: octocat".into();
+        a.meta = Some(crate::gh::RepoMeta {
+            stars: 46514,
+            branch: "trunk".into(),
+            ..Default::default()
+        });
+        a.counts.insert((crate::app::PK::Prs, 2), (74, false));
+        a.seed_unread(&["a/b"]);
+        let facts = ["\u{2605} 46514", "public", "default trunk", "74 open PRs"];
+        let mut last = facts.len();
+        for w in [120u16, 80, 70, 60, 50] {
+            let s = render_app(&a, w, 24);
+            let head = s.lines().next().unwrap().trim_end().to_string();
+            assert!(
+                head.ends_with("\u{2709} 1"),
+                "{w}: badge keeps the edge: {head:?}"
+            );
+            assert!(
+                head.contains("user: octocat"),
+                "{w}: base always whole: {head:?}"
+            );
+            let shown = facts.iter().take_while(|f| head.contains(**f)).count();
+            assert!(
+                facts[shown..]
+                    .iter()
+                    .all(|f| !head.contains(f.split(' ').next().unwrap())),
+                "{w}: no half facts: {head:?}"
+            );
+            assert!(shown <= last, "{w}: monotone");
+            last = shown;
+        }
+        assert!(last < facts.len(), "not everything fits at 50 columns");
+        let s = render_app(&a, 120, 24);
+        assert!(
+            line_of(&s, "cli/cli").contains("74 open PRs"),
+            "everything fits at 120"
+        );
+        // a base that alone is too long is ellipsized, never run into the badge
+        a.header = format!(" {}", "x".repeat(80));
+        let head = render_app(&a, 60, 24)
+            .lines()
+            .next()
+            .unwrap()
+            .trim_end()
+            .to_string();
+        assert!(
+            head.contains("\u{2026}") && head.ends_with("\u{2709} 1"),
+            "{head:?}"
+        );
+    }
+
+    #[test]
+    fn panel_titles_degrade_by_whole_segments() {
+        let mut a = app(false, IconSet::Unicode);
+        let i = a.panel_idx_for_test(crate::app::PK::Prs);
+        a.panels[i].items = items(Kind::Pr, 12);
+        for w in 50u16..=120 {
+            let s = render_app(&a, w, 24);
+            let t = line_of(&s, "[1]");
+            let title = t.split('\u{2502}').next().unwrap_or(&t);
+            assert_eq!(
+                title.matches('(').count(),
+                title.matches(')').count(),
+                "{w}: a count was cut in half: {title:?}"
+            );
+            assert!(
+                title.contains("12") || title.contains("Mine 12"),
+                "{w}: the count survives: {title:?}"
+            );
+        }
+        // the ladder, widest first
+        let s = render_app(&a, 120, 24);
+        assert!(
+            line_of(&s, "[1]").contains("Mine 12 \u{b7}"),
+            "every tab with its count"
+        );
+        let s = render_app(&a, 80, 24);
+        assert!(
+            line_of(&s, "[1]").contains("[1] Pull requests (12)"),
+            "{}",
+            line_of(&s, "[1]")
+        );
+        let s = render_app(&a, 50, 24);
+        assert!(
+            line_of(&s, "[1]").contains("[1] PRs (12)"),
+            "{}",
+            line_of(&s, "[1]")
+        );
+    }
+
+    #[test]
+    fn empty_detail_pane_describes_the_repo() {
+        let mut a = app(false, IconSet::Unicode);
+        assert!(
+            render_app(&a, 120, 40).contains("Detail"),
+            "nothing known yet"
+        );
+        a.meta = Some(crate::gh::RepoMeta {
+            stars: 46514,
+            forks: 9114,
+            issues: 1038,
+            branch: "trunk".into(),
+            description: "GitHub's official command line tool".into(),
+            license: "MIT License".into(),
+            topics: vec!["cli".into(), "golang".into()],
+            pushed: "2026-10-02".into(),
+            ..Default::default()
+        });
+        let s = render_app(&a, 120, 40);
+        for want in [
+            "official command line tool",
+            "stars           46514",
+            "forks           9114",
+            "open issues     1038",
+            "default branch  trunk",
+            "MIT License",
+            "cli, golang",
+            "2026-10-02",
+        ] {
+            assert!(s.contains(want), "missing {want:?}\n{s}");
+        }
+        a.panels[0].items = items(Kind::Pr, 1);
+        let s = render_app(&a, 120, 40);
+        assert!(
+            !s.contains("MIT License") && s.contains("Overview"),
+            "an item replaces it\n{s}"
+        );
     }
 }

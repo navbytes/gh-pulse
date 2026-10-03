@@ -134,6 +134,7 @@ pub enum Kind {
     Workflow,
     Branch,
     Release,
+    Tag,
     Other,
     /// Rows of the derived Files / Checks / Comments panels.
     File,
@@ -362,6 +363,7 @@ fn search(panel: usize, tab: usize) -> Result<Vec<Item>, String> {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct Notif {
+    id: String,
     unread: bool,
     reason: String,
     subject: NSubject,
@@ -408,6 +410,7 @@ pub fn parse_notifications(s: &str) -> Result<Vec<Item>, String> {
                 number: if kind == Kind::Other { 0 } else { number },
                 title: n.subject.title,
                 url,
+                cmd: n.id, // thread id, for marking it read
                 state: if n.unread { "unread" } else { "read" }.into(),
                 meta: format!("{} · {}", n.repository.full_name, n.reason),
                 repo: n.repository.full_name,
@@ -449,7 +452,106 @@ fn releases(repo: &str) -> Result<Vec<Item>, String> {
         .collect())
 }
 
-/// Panels: 0 Status, 1 Pull requests, 2 Issues, 3 Actions, 4 Branches, 5 Releases, 6 Notifications.
+/// Tag pages fetched (100 each); the Tags tab shows "300+" beyond that.
+const TAG_PAGES: usize = 3;
+
+/// Rows a source can return before its count is shown as "N+".
+pub fn cap(panel: usize) -> usize {
+    if panel == 7 { TAG_PAGES * LIMIT } else { LIMIT }
+}
+
+fn tag_rows(v: &Value, repo: &str) -> Vec<Item> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| {
+            let name = t["name"].as_str()?;
+            let sha = t["commit"]["sha"].as_str().unwrap_or("");
+            Some(Item {
+                title: name.into(),
+                cmd: name.into(),
+                meta: sha.chars().take(7).collect(),
+                body: sha.into(),
+                url: format!(
+                    "https://github.com/{repo}/tree/{}",
+                    crate::act::enc_path(name)
+                ),
+                repo: repo.into(),
+                kind: Kind::Tag,
+                ..Default::default()
+            })
+        })
+        .collect()
+}
+
+fn tags(repo: &str) -> Result<Vec<Item>, String> {
+    let mut out = vec![];
+    for page in 1..=TAG_PAGES {
+        let path = format!("repos/{repo}/tags?per_page={LIMIT}&page={page}");
+        let rows = tag_rows(&json(&gh(["api", &path])?)?, repo);
+        let full = rows.len() >= LIMIT;
+        out.extend(rows);
+        if !full {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Unread notifications across all repos (the API's default), for the inbox and its header badge.
+pub fn notifications() -> Result<Vec<Item>, String> {
+    let mut v = parse_notifications(&gh(["api", "notifications?per_page=100"])?)?;
+    v.iter_mut().for_each(clean_item);
+    Ok(v)
+}
+
+/// What the header and the empty detail pane say about the repo (text already neutralized).
+#[derive(Default)]
+pub struct RepoMeta {
+    pub stars: u64,
+    pub forks: u64,
+    pub issues: u64,
+    pub private: bool,
+    pub branch: String,
+    pub description: String,
+    pub license: String,
+    pub topics: Vec<String>,
+    /// Day of the last push (YYYY-MM-DD).
+    pub pushed: String,
+}
+
+pub fn repo_meta(repo: &str) -> Result<RepoMeta, String> {
+    let f = "stargazerCount,forkCount,issues,isPrivate,defaultBranchRef,description,licenseInfo,repositoryTopics,pushedAt";
+    let v: Value = json(&gh(["repo", "view", repo, "--json", f])?)?;
+    let s = |p: &str| {
+        crate::sanitize::clean(v.pointer(p).and_then(Value::as_str).unwrap_or("")).into_owned()
+    };
+    Ok(RepoMeta {
+        stars: v["stargazerCount"].as_u64().unwrap_or(0),
+        forks: v["forkCount"].as_u64().unwrap_or(0),
+        issues: v["issues"]["totalCount"].as_u64().unwrap_or(0),
+        private: v["isPrivate"] == true,
+        branch: s("/defaultBranchRef/name"),
+        description: s("/description"),
+        license: s("/licenseInfo/name"),
+        topics: v["repositoryTopics"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t["name"].as_str())
+            .map(|t| crate::sanitize::clean(t).into_owned())
+            .collect(),
+        pushed: day(&s("/pushedAt")).to_string(),
+    })
+}
+
+/// (rows, more than that) of one list tab, for the panel titles.
+pub fn count(repo: &str, global: bool, panel: usize, tab: usize) -> Result<(usize, bool), String> {
+    let n = list(repo, global, panel, tab)?.len();
+    Ok((n, n >= cap(panel)))
+}
+
+/// Panels: 0 Status, 1 Pull requests, 2 Issues, 3 Actions, 4 Branches, 5 Releases, 6 Notifications, 7 Tags.
 /// In the global view panels 1-2 search across all repos and the repo-only ones are empty.
 pub fn list(repo: &str, global: bool, panel: usize, tab: usize) -> Result<Vec<Item>, String> {
     let mut v = list_raw(repo, global, panel, tab)?;
@@ -551,6 +653,7 @@ fn list_raw(repo: &str, global: bool, panel: usize, tab: usize) -> Result<Vec<It
                 .collect())
         }
         4 => branches(repo),
+        7 => tags(repo),
         _ => releases(repo),
     }
 }
@@ -1522,9 +1625,47 @@ fn detail_raw(repo: &str, it: &Item, tab: Tab) -> Result<Data, String> {
                     .collect(),
             ))
         }
+        (Kind::Tag, Tab::Overview) => tag_info(repo, it),
         (Kind::Status, _) => status(repo).map(text),
         _ => Ok(Data::Text(vec![])),
     }
+}
+
+/// Commit, date and the release (if one exists) behind a tag.
+fn tag_info(repo: &str, it: &Item) -> Result<Data, String> {
+    let (tag, sha) = (it.cmd_name(), it.body.as_str());
+    if sha.is_empty() {
+        return Err("this tag has no commit sha".into());
+    }
+    let c: Value = json(&gh(["api", &format!("repos/{repo}/commits/{sha}")])?)?;
+    let s = |p: &str| {
+        c.pointer(p)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let release = match gh([
+        "api",
+        &format!("repos/{repo}/releases/tags/{}", crate::act::enc_path(tag)),
+    ]) {
+        Ok(r) => {
+            let r: Value = json(&r)?;
+            r["html_url"].as_str().unwrap_or("").to_string()
+        }
+        Err(e) if e.contains("Not Found") || e.contains("404") => "none".into(),
+        Err(e) => format!("unknown ({e})"),
+    };
+    Ok(Data::Text(vec![
+        format!("tag:      {tag}"),
+        format!("commit:   {sha}"),
+        format!("date:     {}", s("/commit/committer/date")),
+        format!("author:   {}", s("/commit/author/name")),
+        format!(
+            "message:  {}",
+            s("/commit/message").lines().next().unwrap_or("")
+        ),
+        format!("release:  {release}"),
+    ]))
 }
 
 fn tail(s: String) -> Data {
@@ -1996,6 +2137,40 @@ pub fn checkout(repo: &str, n: u64) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tags_and_notifications_carry_what_the_actions_need() {
+        let v: Value = serde_json::from_str(
+            r#"[{"name":"v1.2.0","commit":{"sha":"abcdef0123456789"}},{"name":"-x","commit":{"sha":"1"}},{"nope":1}]"#,
+        )
+        .unwrap();
+        let t = tag_rows(&v, "o/r");
+        assert_eq!(t.len(), 2);
+        assert_eq!(
+            (
+                t[0].kind,
+                t[0].cmd_name(),
+                t[0].meta.as_str(),
+                t[0].body.as_str()
+            ),
+            (Kind::Tag, "v1.2.0", "abcdef0", "abcdef0123456789")
+        );
+        assert_eq!(t[0].url, "https://github.com/o/r/tree/v1.2.0");
+        assert_eq!(cap(7), 300);
+        assert_eq!(cap(1), LIMIT);
+        let n = parse_notifications(
+            r#"[{"id":"1001","unread":true,"reason":"mention","subject":{"title":"T","url":"https://api.github.com/repos/o/r/pulls/7","type":"PullRequest"},"repository":{"full_name":"o/r"}}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (n[0].cmd.as_str(), n[0].number, n[0].kind),
+            ("1001", 7, Kind::Pr)
+        );
+        assert_eq!(
+            shell(&crate::act::mark_read("1001")),
+            "gh api -X PATCH notifications/threads/1001"
+        );
+    }
+
     #[test]
     fn shell_line_round_trips_through_sh() {
         let args: Vec<String> = [

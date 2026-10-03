@@ -9,14 +9,14 @@ see, gh-pulse can see.
 
 ![gh-pulse main layout](docs/img/1-main.png)
 
-<sub>Text capture of a real session against a public repository (usernames replaced).</sub>
+<sub>Real session against a public repository (login shown as `you`).</sub>
 
 ## Screenshots
 
 Captured from the real binary against public repos (`scripts/screenshots.py`).
 
 ![Split diff with syntax highlighting](docs/img/2-diff-split.png)
-*Zoomed Diff tab: auto layout picks side-by-side at width, with syntax highlighting and intra-line highlights.*
+*Zoomed Diff tab (`f`): auto layout picks side-by-side at width, with syntax highlighting and intra-line highlights.*
 
 ![Unified diff of a Markdown file with wrap](docs/img/3-diff-prose.png)
 *Unified layout with soft wrap (`t` / `w`) keeps long prose lines readable.*
@@ -25,24 +25,34 @@ Captured from the real binary against public repos (`scripts/screenshots.py`).
 *Enter on a PR drills into Files / Commits / Checks / Comments; markers show files with review comments.*
 
 ![Comments tab](docs/img/5-comments.png)
-*Comment cards with markdown, reactions, review summaries and threads.*
+*Comment cards with markdown, role badges and review summaries; bot boilerplate is collapsed.*
 
 ![Actions panel](docs/img/6-actions.png)
-*Workflow runs with their jobs and steps.*
+*[4] Actions: workflow runs with their jobs and steps.*
 
-![Action menu](docs/img/7-menu.png)
-![Confirm popup](docs/img/7b-confirm.png)
-*Every action is confirmed first and shows the exact `gh` command it will run.*
+![Repo panel, Tags tab](docs/img/7-tags.png)
+*[5] Repo: Branches / Tags / Releases tabs; a tag shows its commit, date and release.*
 
-![Help](docs/img/8-help.png)
+![Action menu](docs/img/8-menu.png)
+![Confirm popup](docs/img/8b-confirm.png)
+*Every action is confirmed first and shows the exact `gh` command it will run (only `y` runs it; this one was cancelled).*
+
+![Help](docs/img/9-help.png)
 *`?` lists every key.*
 
-Regenerate with `python3 scripts/screenshots.py` (needs `pyte` and `rsvg-convert`; uses public repos only).
+![Compact layout at 80x24](docs/img/10-compact.png)
+*At 80x24 the panels shrink to short titles and the key hints truncate.*
+
+Regenerate with `GH_PULSE_SHOT_BLOCKLIST=word,word python3 scripts/screenshots.py` (needs `pyte` and `rsvg-convert`; public repos only; the blocklist aborts a shot if a private string shows).
 
 ## Features
 
-- **Repo-scoped panels**: Status, Pull requests (Mine / Review requested / All open / Merged), Files, Issues,
-  Actions (Runs / Workflows), Branches, Releases, Notifications. Filter any list with `/`.
+- **Five repo-scoped panels**: Pull requests (Mine / Review / All / Merged), Files, Issues (Assigned / Mine / All),
+  Actions (Runs / Workflows) and Repo (Branches / Tags / Releases). Every title shows the count of every tab
+  (`[5] Branches 32 · Tags 14 · Releases 81`, `…` until known). Filter any list with `/`. Choose, order and trim the
+  panels and their tabs under `[panels]` ([configuration](docs/configuration.md)).
+- **Inbox**: `✉ N` in the header counts your unread notifications; `N` opens them across all repos. `Enter` shows the
+  PR or issue in the app (switching repo), `m` marks it read (after the usual exact-command confirm), `o` opens it in the browser.
 - **Code review without the browser**: unified, split or auto diff with soft-wrap, word-level highlighting,
   syntax highlighting (on by default), per-file stats, review-thread badges and viewed marks.
 - **Comments as cards**: GitHub-flavored markdown rendered in the terminal (headings, emphasis, inline and fenced
@@ -127,10 +137,11 @@ A corrupt state file is ignored with a warning, never a crash.
 ## Concepts
 
 - **Repo scope.** Everything is about one repository: the current directory's, or `-R`. The header shows the
-  repo, your local branch (only when the directory is a clone of it) and your user. `B` (or `Ctrl-r`) opens the repo browser to switch.
+  repo, your local branch (only when the directory is a clone of it), your user, and the repo's stars, visibility, default branch and open-PR count. `B` (or `Ctrl-r`) opens the repo browser to switch.
 - **Panels.** Numbered like lazygit; the focused one expands, the rest collapse. `[` `]` change the detail
-  tab, `{` `}` change the panel's own list (e.g. Mine vs Merged).
-- **Files follows the PR.** Panel 3 always lists the files of the selected PR; moving through it changes the
+  tab, `{` `}` change the panel's own list (e.g. Mine vs Merged); pressing the focused panel's number again also steps to
+  its next list tab, and the tab labels in the title are clickable.
+- **Files follows the PR.** Panel 2 lists the files of the selected PR; moving through it changes the
   file shown in the diff.
 - **Drill-in.** `Enter` on a PR replaces the left column with Files / Commits / Checks / Comments of that PR; `Esc` goes
   back and your cursor is where you left it.
@@ -144,7 +155,7 @@ The full reference is in [docs/keybindings.md](docs/keybindings.md). The essenti
 | Context | Key | Action |
 |---|---|---|
 | Global | `?` / `q` | Help / quit |
-| Global | `1`-`8`, `Tab`, `Shift-Tab` | Focus panel |
+| Global | `1`-`5`, `Tab`, `Shift-Tab` | Focus panel |
 | Global | `x` | Action menu for the selected item |
 | Global | `o` `y` `c` | Open in browser / copy URL / check out PR |
 | Global | `r` `R` `L` | Refresh panel / all / command log |
@@ -179,39 +190,6 @@ nearest of 256 colors. Icons are Unicode by default, `--ascii` for plain ASCII (
 Font glyphs.
 
 ## Diff view
-
-```text
- cli/cli  branch:   user: you
-╭ [1] Status ───────────────────────────────╮╭ Overview │ Checks │ Comments │ Diff ──────────────────────────────────╮
-│cli/cli                                    ││pkg/cmd/issue/artifact/client/client.go  2/9  +31 -0  [auto:unified, wr│
-╰───────────────────────────────────────────╯│@@ -39,6 +39,10 @@ type ArtifactClient interface {                     │
-╭ [2] Pull requests · All open (72) ────────╮│ 39  39      // Create creates one artifact on an issue and returns    │
-│#14571 `gh issue artifact` stack 8/10: Add ││        ↪it. The API doesn't                                           │
-╰───────────────────────────────────────────╯│ 40  40      // return a new artifact's description.                   │
-╭ [3] Files (9) ────────────────────────────╮│ 41  41      Create(repo ghrepo.Interface, issueNumber int,            │
-│M artifact.go  pkg/cmd/is…/artifact/  +2 -0││        ↪artifactType, name, body string) (*Artifact, error)           │
-│M client.go  pkg/cmd/iss…ct/client/  +31 -0││     42 +    // Update saves a new version of one artifact on an issue │
-│M client_mock.go  pkg/cmd/…/client/  +68 -0││        ↪and returns the                                               │
-│M client_test.go  pkg/cmd/…client/  +126 -0││     43 +    // artifact. A nil name or body keeps the current one.    │
-│M create.go  pkg/cmd/iss…ct/create/  +1 -20││        ↪The API can't change                                          │
-╰───────────────────────────────────────────╯│     44 +    // an artifact's type.                                    │
-╭ [4] Issues · Assigned (0) ────────────────╮│     45 +    Update(repo ghrepo.Interface, issueNumber int, number int,│
-│nothing here                               ││        ↪ name, body *string) (*Artifact, error)                       │
-╰───────────────────────────────────────────╯│ 42  46  }                                                             │
-╭ [5] Actions · Runs (100+) ────────────────╮│ 43  47                                                                │
-│✓ Triage Scheduled Tasks  Triage Scheduled ││ 44  48  // maxPageSize is the most artifacts one request asks for.    │
-╰───────────────────────────────────────────╯│@@ -163,3 +167,30 @@ func (c *artifactClient) Create(repo              │
-╭ [6] Branches (100+) ──────────────────────╮│ghrepo.Interface, issueNumber int, artifact                            │
-│⎇ 1119-support-for-owner-based-queries     ││163 167      }                                                         │
-╰───────────────────────────────────────────╯│164 168      return &artifact, nil                                     │
-╭ [7] Releases (100+) ──────────────────────╮│165 169  }                                                             │
-│★ GitHub CLI 2.102.0                       ││    170 +                                                              │
-╰───────────────────────────────────────────╯│    171 +// Update sends only the fields it changes, since the API     │
-╭ [8] Notifications (0) ────────────────────╮│        ↪keeps any field a                                             │
-│nothing here                               ││    172 +// request leaves out.                                        │
-╰───────────────────────────────────────────╯╰───────────────────────────────────────────────────────────────────────╯
-j/k file  l/Enter diff  v viewed  f zoom  [ ] panel  x actions  ? help  q quit
-```
 
 `t` cycles auto / unified / split (auto goes side-by-side when each half has 60+ columns). Long lines soft-wrap
 at word boundaries with a `↪` marker; `w` switches to clipping. `f` zooms the right pane to full width.
