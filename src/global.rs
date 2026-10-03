@@ -233,9 +233,10 @@ impl Custom {
         let f = config::parse_filter(&cfg.filter)?;
         let mut terms = f.terms;
         // without parentheses GitHub's OR would swallow the qualifiers added below
+        // as terms of their own, so no user term's quoting is touched
         if f.has_or {
-            terms[0].insert(0, '(');
-            terms.last_mut().expect("non-empty").push(')');
+            terms.insert(0, "(".into());
+            terms.push(")".into());
         }
         if !f.has_archived {
             terms.push("archived:false".into());
@@ -1060,7 +1061,7 @@ mod tests {
         // OR is grouped so the added qualifiers apply to all of it
         assert_eq!(
             tail("a OR b", &org, None),
-            "(a OR b) archived:false org:acme"
+            "( a OR b ) archived:false org:acme"
         );
         assert_eq!(
             tail("label:\"good first issue\" -label:wip", &all, None),
@@ -1090,7 +1091,7 @@ mod tests {
         // an OR with a user: qualifier is just terms: nothing before `--` changes
         assert_eq!(
             tail("x OR user:y", &Scope::Org("acme".into()), None),
-            "(x OR user:y) archived:false"
+            "( x OR user:y ) archived:false"
         );
         // a quoted phrase cannot smuggle a flag either
         assert!(Custom::new(&sec(SectionKind::Prs, "\"--web\""), None).is_err());
@@ -1182,6 +1183,44 @@ mod tests {
             crate::gh::cmd_log()
                 .iter()
                 .any(|l| l.contains("rate: search 19/30 left"))
+        );
+    }
+    #[test]
+    fn or_groups_never_touch_a_users_term_or_its_quoting() {
+        let t = |f: &str| tail(f, &Scope::Org("acme".into()), None);
+        let a = "archived:false org:acme";
+        assert_eq!(
+            t(r#"x OR label:"good first""#),
+            format!("( x OR label:good first ) {a}")
+        );
+        assert_eq!(
+            t(r#"label:"good first" OR x"#),
+            format!("( label:good first OR x ) {a}")
+        );
+        assert_eq!(t(r#""a b" OR c"#), format!("( a b OR c ) {a}"));
+        assert_eq!(
+            t(r#"(label:"a b" OR c) d"#),
+            format!("( ( label:a b OR c ) d ) {a}")
+        );
+        assert_eq!(
+            t("((a OR b)(c OR d))"),
+            format!("( ( ( a OR b ) ( c OR d ) ) ) {a}")
+        );
+        assert_eq!(
+            t(r#"fix "(not a group)" OR y"#),
+            format!("( fix (not a group) OR y ) {a}")
+        );
+        // parentheses are separate arguments, so no argument ends in `)` or starts with `(` next to a value
+        let c = Custom::new(
+            &sec(SectionKind::Issues, r#"x OR label:"good first""#),
+            None,
+        )
+        .unwrap();
+        let (calls, _) = c.calls(&Scope::All, &[], 30);
+        let dd = calls[0].1.iter().position(|x| x == "--").unwrap();
+        assert_eq!(
+            calls[0].1[dd + 1..],
+            ["(", "x", "OR", "label:good first", ")", "archived:false"]
         );
     }
 }

@@ -231,7 +231,7 @@ impl TryFrom<String> for PanelName {
             "involved" => PanelName::Involved,
             _ => {
                 return Err(format!(
-                    "unknown panel `{s}`; valid: {REPO_NAMES}, review, mine, assigned, involved, section:<title>"
+                    "unknown panel {s:?}; valid: {REPO_NAMES}, review, mine, assigned, involved, section:<title>"
                 ));
             }
         })
@@ -428,14 +428,16 @@ impl PanelsCfg {
             let bad = |m: String| Err(("[panels]", key, format!("panels.{key}: {m}")));
             match secs.iter().find(|s| s.title == *t) {
                 None => bad(format!(
-                    "unknown section `{t}` (defined: {})",
+                    "unknown section {} (defined: {})",
+                    shown(t),
                     secs.iter()
-                        .map(|s| s.title.as_str())
+                        .map(|s| shown(&s.title))
                         .collect::<Vec<_>>()
                         .join(", ")
                 )),
                 Some(s) if !here(s.at) => bad(format!(
-                    "section `{t}` has where = \"{}\"; it cannot be listed here",
+                    "section {} has where = \"{}\"; it cannot be listed here",
+                    shown(t),
                     s.at.word()
                 )),
                 Some(_) => Ok(()),
@@ -470,7 +472,7 @@ impl PanelsCfg {
                 return Err((
                     "[panels]",
                     "global",
-                    format!("panels.global: {} listed twice", n.word()),
+                    format!("panels.global: {} listed twice", label(n)),
                 ));
             }
         }
@@ -486,7 +488,7 @@ impl PanelsCfg {
                 return Err((
                     "[panels]",
                     "show",
-                    format!("panels.show: {} listed twice", n.word()),
+                    format!("panels.show: {} listed twice", label(n)),
                 ));
             }
         }
@@ -603,6 +605,19 @@ pub struct Filter {
     pub has_or: bool,
 }
 
+/// A user-written name for an error message: neutralized and quoted.
+fn shown(s: &str) -> String {
+    format!("{:?}", crate::sanitize::clean(s))
+}
+
+/// A panel name for an error message; section titles are user text.
+fn label(n: &PanelName) -> String {
+    match n {
+        PanelName::Section(_) => shown(&n.word()),
+        _ => n.word(),
+    }
+}
+
 fn term_char_ok(c: char) -> bool {
     c.is_alphanumeric() || "-_.:/@*<>=!,~()'#+?".contains(c)
 }
@@ -622,7 +637,7 @@ pub fn parse_filter(src: &str) -> Result<Filter, String> {
             c as u32
         ));
     }
-    let (mut terms, mut cur, mut quoted) = (vec![], String::new(), false);
+    let (mut terms, mut cur, mut quoted, mut depth) = (vec![], String::new(), false, 0i32);
     for c in src.chars() {
         match c {
             // gh re-quotes a term with spaces itself (`label:good first` -> `label:"good first"`), so the
@@ -632,6 +647,18 @@ pub fn parse_filter(src: &str) -> Result<Filter, String> {
                 if !cur.is_empty() {
                     terms.push(std::mem::take(&mut cur));
                 }
+            }
+            // parentheses outside quotes are terms of their own: glued to a quoted value they would end up
+            // inside gh's quoting (`label:"a b)"`)
+            '(' | ')' if !quoted => {
+                if !cur.is_empty() {
+                    terms.push(std::mem::take(&mut cur));
+                }
+                depth += i32::from(c == '(') - i32::from(c == ')');
+                if depth < 0 {
+                    return Err("filter has a ) without a matching (".into());
+                }
+                terms.push(c.to_string());
             }
             c if c.is_whitespace() || term_char_ok(c) => cur.push(c),
             c => {
@@ -646,6 +673,9 @@ pub fn parse_filter(src: &str) -> Result<Filter, String> {
     }
     if !cur.is_empty() {
         terms.push(cur);
+    }
+    if depth != 0 {
+        return Err("filter has a ( without a matching )".into());
     }
     if let Some(t) = terms.iter().find(|t| t.starts_with("--")) {
         return Err(format!("term {t:?} looks like a command-line flag"));
@@ -662,9 +692,11 @@ pub fn parse_filter(src: &str) -> Result<Filter, String> {
             .count(),
         own_scope: terms.iter().any(|t| starts(t, &["repo:", "org:", "user:"])),
         own_repo: terms.iter().any(|t| starts(t, &["repo:"])),
-        has_archived: terms
-            .iter()
-            .any(|t| qual(t).trim_start_matches('-').starts_with("archived:")),
+        has_archived: terms.iter().any(|t| {
+            let q = qual(t);
+            let q = q.trim_start_matches('-');
+            q.starts_with("archived:") || q == "is:archived"
+        }),
         has_or: terms.iter().any(|t| t == "OR"),
         terms,
     })
@@ -677,11 +709,15 @@ impl SectionCfg {
 
     /// (key, message) of the first problem.
     fn check(&self) -> Result<(), (&'static str, String)> {
-        let n = self.title.chars().count();
-        if n == 0 || n > MAX_TITLE {
+        // display width of what the panel will show, not the raw text
+        let shown = crate::sanitize::clean(&self.title);
+        let n = unicode_width::UnicodeWidthStr::width(shown.as_ref());
+        if shown.trim().is_empty() || n > MAX_TITLE {
             return Err((
                 "title",
-                format!("sections.title: must be 1..{MAX_TITLE} characters, got {n}"),
+                format!(
+                    "sections.title: must be 1..{MAX_TITLE} columns wide and not blank, got {n}"
+                ),
             ));
         }
         if !self.limit.is_none_or(|l| (1..=100).contains(&l)) {
@@ -735,11 +771,12 @@ fn check_sections(secs: &[SectionCfg]) -> Result<(), (usize, &'static str, Strin
             ));
         }
         s.check().map_err(|(k, m)| (i, k, m))?;
-        if secs[..i].iter().any(|o| o.title == s.title) {
+        let clean = |t: &str| crate::sanitize::clean(t).into_owned();
+        if secs[..i].iter().any(|o| clean(&o.title) == clean(&s.title)) {
             return Err((
                 i,
                 "title",
-                format!("sections.title: {:?} is used twice", s.title),
+                format!("sections.title: {} is used twice", shown(&s.title)),
             ));
         }
     }
@@ -1590,7 +1627,7 @@ filter = 'is:open label:"good first issue" -label:wip'
         );
         let e = parse("[[sections]]\ntitle=\"A\"\nkind=\"prs\"\nfilter=\"x\"\n[panels]\nglobal = [\"section:B\"]\n", "cfg").unwrap_err();
         assert!(
-            e.starts_with("cfg:6:") && e.contains("unknown section `B`") && e.contains("A"),
+            e.starts_with("cfg:6:") && e.contains("unknown section \"B\"") && e.contains("A"),
             "{e}"
         );
         let e = parse("[panels]\nshow = [\"section:B\"]\n", "cfg").unwrap_err();
@@ -1670,5 +1707,50 @@ filter = 'is:open label:"good first issue" -label:wip'
         let w = warnings(&c);
         assert!(w.len() == 1 && w[0].contains("6 AND/OR/NOT"), "{w:?}");
         assert!(warnings(&parse(TWO, "cfg").unwrap()).is_empty());
+    }
+    #[test]
+    fn parentheses_archived_and_titles_follow_the_audit_rules() {
+        let one = |filter: &str, title: &str| {
+            format!("[[sections]]\ntitle = '{title}'\nkind = \"prs\"\nfilter = {filter:?}\n")
+        };
+        for bad in ["(a OR b", "a OR b)", ")a(", "((a)"] {
+            let e = parse(&one(bad, "A"), "cfg").unwrap_err();
+            assert!(
+                e.starts_with("cfg:4:") && e.contains("matching"),
+                "{bad}: {e}"
+            );
+        }
+        // parentheses inside quotes are text, not groups
+        assert!(parse(&one("\"fix (x\" OR y", "A"), "cfg").is_ok());
+        let f = parse_filter(r#"(label:"a b" OR c)"#).unwrap();
+        assert_eq!(f.terms, ["(", "label:a b", "OR", "c", ")"]);
+        assert!(parse_filter("is:archived x").unwrap().has_archived);
+        assert!(parse_filter("-is:archived x").unwrap().has_archived);
+        assert!(!parse_filter("is:open").unwrap().has_archived);
+        // titles: width, blank, and look-alikes after neutralizing
+        let e = parse(&one("x", &"\u{4e2d}".repeat(21)), "cfg").unwrap_err();
+        assert!(
+            e.starts_with("cfg:2:") && e.contains("1..40"),
+            "42 columns: {e}"
+        );
+        assert!(parse(&one("x", &"\u{4e2d}".repeat(20)), "cfg").is_ok());
+        let e = parse(&one("x", "   "), "cfg").unwrap_err();
+        assert!(e.contains("not blank"), "{e}");
+        let two = format!("{}{}", one("x", "a\u{202e}b"), one("x", "a<U+202E>b"));
+        let e = parse(&two, "cfg").unwrap_err();
+        assert!(
+            e.starts_with("cfg:6:") && e.contains("used twice") && !e.contains('\u{202e}'),
+            "{e}"
+        );
+        // section titles in panels errors are quoted and neutralized
+        let src = format!(
+            "{}[panels]\nglobal = [\"section:x\\u202ey\"]\n",
+            one("x", "A")
+        );
+        let e = parse(&src, "cfg").unwrap_err();
+        assert!(
+            e.contains("unknown section") && !e.contains('\u{202e}'),
+            "{e}"
+        );
     }
 }

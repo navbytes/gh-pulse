@@ -3364,7 +3364,7 @@ impl App {
     /// Searched sections are emptied and reload when focused (the focused one now). A section with a
     /// scope qualifier of its own does not depend on the scope: only `all` (a hidden repo came back) reloads it.
     fn stale_sections(&mut self, all: bool) {
-        let secs = &self.cfg.sections;
+        let secs = self.cfg.sections.clone();
         let stale = |panels: &mut Vec<Panel>| {
             for p in panels.iter_mut().filter(|p| {
                 p.kind.is_global_search()
@@ -3374,13 +3374,17 @@ impl App {
                 p.items.clear();
             }
         };
-        if self.global {
+        // unhiding (`all`) also concerns the parked home: its sections may have lacked that repo's rows
+        if self.global || all {
             stale(&mut self.panels);
             let f = self.focus;
             if self.panels[f].unloaded && self.panels[f].kind.is_global_search() {
                 self.load_panel(f, false);
             }
-        } else if let Some(o) = self.other.as_mut() {
+        }
+        if (!self.global || all)
+            && let Some(o) = self.other.as_mut()
+        {
             stale(&mut o.panels);
         }
         self.reset_view();
@@ -6309,6 +6313,27 @@ mod tests {
             Some("org:charmbracelet"),
             "persisted like any other scope"
         );
+    }
+
+    #[test]
+    fn unhiding_a_repo_marks_repo_home_sections_stale_too() {
+        let mut sc = section("Here", config::SectionKind::Prs, "is:open");
+        sc.at = config::Where::Both;
+        let cfg = Config {
+            sections: vec![sc],
+            ..Default::default()
+        };
+        let mut a = App::build(
+            "o/r".into(),
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+            cfg,
+        );
+        let i = a.panels.len() - 1;
+        assert!(a.panels[i].kind.custom().is_some());
+        (a.panels[i].unloaded, a.panels[i].items) = (false, vec![gitem("o/r", 1)]);
+        a.hidden_changed("x/y", false);
+        assert!(a.panels[i].unloaded && a.panels[i].items.is_empty());
     }
 
     #[test]

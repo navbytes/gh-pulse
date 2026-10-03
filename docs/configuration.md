@@ -183,7 +183,7 @@ where  = "global"                   # "global" (default) | "repo" | "both"
 
 | Key | Meaning |
 |---|---|
-| `title` | Panel title. Control characters are shown neutralized. Titles must be unique; at most 12 sections |
+| `title` | Panel title, at most 40 columns wide as displayed (control characters are shown neutralized as `<U+XXXX>`), not blank. Titles must be unique after that; at most 12 sections |
 | `kind` | `prs` runs `gh search prs`, `issues` runs `gh search issues` |
 | `filter` | GitHub search syntax, at most 256 characters, one line (see the rules below) |
 | `limit` | Rows to fetch (default 30, at most 100). A title count ending in `+` means the limit was reached |
@@ -193,11 +193,11 @@ where  = "global"                   # "global" (default) | "repo" | "both"
 `label:"good first issue"` is one term) and each term is passed to `gh search` as its own argument after `--`, never
 through a shell and never as a flag. Added to your terms:
 
-- `archived:false`, unless the filter has an `archived:` qualifier.
+- `archived:false`, unless the filter has an `archived:` or `is:archived` qualifier (`archived:true` and `is:archived` switch the default off).
 - Global home: the active scope (`s`: `org:x`, `repo:a/b`, or a group of favorites) **unless the filter already has a
   `repo:`, `org:` or `user:` qualifier**. Then the scope does not apply, and the panel title says `(own filter)`.
 - Repo home (`where = "repo"` or `"both"`): `repo:<the current repo>`, unless the filter has its own `repo:`.
-- If the filter uses `OR`, it is wrapped in parentheses first, so the added qualifiers apply to the whole thing.
+- If the filter uses `OR`, it is wrapped in parentheses first, so the added qualifiers apply to the whole thing. Parentheses outside quotes are sent as separate terms; they must be balanced (an error with `file:line`), parentheses inside quotes are plain text.
 - `@me` is you, as in the built-in sections.
 
 **Rules (checked at startup, errors name `file:line`).** No control characters or newlines; terms may not start with
