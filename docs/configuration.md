@@ -124,6 +124,15 @@ archived:false`; `author:@me` with `is:open` / `is:merged` / `is:closed is:unmer
 `mentions:@me` with `is:open` for issues; `involves:@me` (PRs and issues, two calls) for Involved. Rows from hidden
 repos (`[repos] hidden`, the repo browser's `h`) are dropped client side; when that empties a full page one bigger
 request tops it up. The scope (`all`, `favorites`, `org:x`, `repo:a/b`) is stored in `$XDG_STATE_HOME/gh-pulse/scope.json`.
+Search budget: one section refresh costs one search per scope chunk (two for Involved), so at most 8, plus - only
+for a single-chunk scope with at least 10 searches (and a third of the minute) left - one bigger re-ask of just the
+searches that came back full after hidden repos emptied a page. A refresh that the rest of the minute can't pay for
+is refused with "search quota low, resets HH:MM" (the list on screen is kept); `r` while a section is already
+searching is ignored; if some favorites chunks fail the others' rows still show, with a note. `-R` takes whatever
+`gh repo view` takes (`OWNER/REPO`, `HOST/OWNER/REPO`, a URL) and is resolved as before; only names that flow into
+search queries (scope, favorites, recent) are held to a strict `owner/name` form (no `.`/`..` parts, no leading `-`).
+`[repos] favorites` and `hidden` are plain `owner/name` lists with no host: they apply to whichever host you run
+against (`GH_HOST`), while `scope.json` and `recent.json` remember their host and are ignored on another one.
 The `repos` panel (Favorites from `[repos] favorites`, Recent from `recent.json`) can also be listed in `[panels] show`
 for the repo home; it makes no API calls (details come from the cached repo list).
 

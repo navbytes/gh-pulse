@@ -373,6 +373,38 @@ mod tests_recent {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn the_state_directory_is_private_ours_and_never_a_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let root = tmp("private");
+        let d = root.join("nested/gh-pulse");
+        save_scope(&d.join("scope.json"), "github.com", "all").unwrap();
+        assert_eq!(mode(&d), 0o700, "created private");
+        assert_eq!(mode(&d.join("scope.json")), 0o600);
+        // ours but loose: tightened by the next save
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        save_scope(&d.join("scope.json"), "github.com", "favorites").unwrap();
+        assert_eq!(mode(&d), 0o700);
+        // a symlink where the directory should be: nothing is written through it
+        let target = root.join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = root.join("link");
+        symlink(&target, &link).unwrap();
+        let e = save_scope(&link.join("scope.json"), "github.com", "all").unwrap_err();
+        assert!(e.contains("not a plain directory"), "{e}");
+        assert!(std::fs::read_dir(&target).unwrap().next().is_none());
+        // somebody else's directory is refused (the file system root is not ours)
+        let e = Recent::new("github.com").save(Path::new("/gh-pulse-recent.json"));
+        assert!(e.is_err());
+        // reads go through the same checks: a file, ours, not a link
+        assert!(crate::cache::read_nofollow(&d.join("scope.json")).is_some());
+        assert!(crate::cache::read_nofollow(&link).is_none(), "a symlink");
+        assert!(crate::cache::read_nofollow(&d).is_none(), "a directory");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn repo_names_are_checked_before_they_reach_a_query() {
         for ok in ["cli/cli", "a-b/c_d.e", "o/r"] {

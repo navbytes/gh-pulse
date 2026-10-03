@@ -145,7 +145,9 @@ The file never contains credentials; authentication stays entirely with `gh`.
 
 `$XDG_STATE_HOME/gh-pulse` (default `~/.local/state/gh-pulse`) holds `viewed.json` (files marked viewed), `scope.json`
 (the global home's last scope) and `recent.json` (the last 20 repos you entered, per host). Files are `0600`, written
-atomically, and a corrupt one is ignored. None of it contains credentials.
+atomically, and a corrupt one is ignored. The directory is `0700` and must be yours (a foreign-owned or symlinked one
+is refused with a notice); files are read without following links. `scope.json` and `recent.json` remember their host.
+None of it contains credentials.
 
 Slow-changing lookups are cached under `$XDG_CACHE_HOME/gh-pulse` (default `~/.cache/gh-pulse`; a `0700` directory
 you own, files `0600`; a relative `XDG_CACHE_HOME` is ignored, and if the directory is not yours or is a symlink the
@@ -181,7 +183,8 @@ A corrupt state file is ignored with a warning, never a crash.
   back and your cursor is where you left it.
 - **Search budget.** Each global section is one GitHub search (the search API allows 30 a minute), made when you
   focus the section, change the scope or press `r` (favorites scope: one search per four repos, at most 16 repos).
-  Nothing searches in the background and unopened search tabs show `?`.
+  Nothing searches in the background and unopened search tabs show `?`. A section never costs more than 8 searches,
+  `r` while one is running is ignored, and a refresh the rest of the minute can't pay for is refused with the reset time.
 - **Safety.** See below.
 
 ## Keybindings

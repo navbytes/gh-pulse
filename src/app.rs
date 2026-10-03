@@ -389,9 +389,11 @@ struct RepoMsg {
 /// Seconds the repo list stays fresh; older cached rows still show at once, then refresh.
 const REPOS_TTL: u64 = 600;
 
-/// How many times the repo-list cache was read (tests assert the picker doesn't re-read per key).
+// How many times the repo-list cache was read (tests assert the picker does not re-read per key).
 #[cfg(test)]
-static READS: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    static READS: Cell<usize> = const { Cell::new(0) };
+}
 
 /// The repo list as cached, with who it was fetched as.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -409,7 +411,7 @@ fn repos_key(host: &str, login: &str) -> String {
 /// Cached rows and their age, for this host and login only (and re-cleaned: the disk is not trusted).
 fn read_repos() -> Option<(CachedRepos, u64)> {
     #[cfg(test)]
-    READS.fetch_add(1, Relaxed);
+    READS.with(|r| r.set(r.get() + 1));
     let (host, login) = gh::identity()?;
     let st = crate::cache::Store::default_if_enabled()?;
     let (mut c, age): (CachedRepos, u64) = st.read(&repos_key(&host, &login), rate::now())?;
@@ -1427,7 +1429,13 @@ impl App {
         } else {
             self.recent.repos.clone()
         };
-        let items = global::repo_items(&names, &known, &self.cfg.repos, rate::now() as i64);
+        let items = global::repo_items(
+            &names,
+            &known,
+            &self.cfg.repos,
+            rate::now() as i64,
+            &gh::host(),
+        );
         let p = &mut self.panels[i];
         p.cursor = p.cursor.min(items.len().saturating_sub(1));
         (p.items, p.loading, p.unloaded, p.error) = (items, false, false, None);
@@ -5689,5 +5697,250 @@ mod tests {
         a.cfg.repos.favorites = vec!["a/b".into()];
         press(&mut a, 'r');
         assert_eq!(a.panels[3].items.len(), 1, "the local list is rebuilt");
+    }
+
+    fn list_reply(a: &mut App, kind: PK, tab: usize, seq: u64, items: Vec<Item>) {
+        a.tx.send(Msg::List(kind, tab, seq, Ok(items))).unwrap();
+        a.poll();
+    }
+
+    #[test]
+    fn a_late_reply_from_the_repo_we_left_never_lands_in_the_repo_we_opened() {
+        let mut a = home();
+        press(&mut a, 'G'); // repo A = o/r
+        let (tab, seq_a) = (a.panels[0].tab, a.panels[0].seq);
+        press(&mut a, 'G');
+        a.panels[0].items = vec![gitem("x/y", 9)];
+        press(&mut a, 'S'); // repo B = x/y, a brand new side (A's was replaced)
+        assert_eq!(a.repo, "x/y");
+        let seq_b = a.panels[0].seq;
+        assert_ne!(seq_a, seq_b, "numbers are never reused across homes");
+        assert!(a.panels[0].loading && a.panels[0].items.is_empty());
+        // A's reply arrives before B's own: dropped, B still waiting
+        list_reply(&mut a, PK::Prs, tab, seq_a, vec![gitem("o/r", 1)]);
+        assert!(
+            a.panels[0].items.is_empty() && a.panels[0].loading,
+            "A's list did not land in B"
+        );
+        // B's reply lands; A's duplicate afterwards changes nothing
+        list_reply(&mut a, PK::Prs, tab, seq_b, vec![gitem("x/y", 2)]);
+        assert_eq!(a.panels[0].items[0].repo, "x/y");
+        assert!(!a.panels[0].loading);
+        list_reply(
+            &mut a,
+            PK::Prs,
+            tab,
+            seq_a,
+            vec![gitem("o/r", 3), gitem("o/r", 4)],
+        );
+        assert_eq!(a.panels[0].items.len(), 1);
+        assert_eq!(a.selected().unwrap().repo, "x/y", "actions would target B");
+        // facts and branch for A are dropped too (they are keyed by repo)
+        a.tx.send(Msg::Meta(
+            "o/r".into(),
+            gh::RepoMeta {
+                stars: 99,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+        a.tx.send(Msg::Branch("o/r".into(), Some("feat".into())))
+            .unwrap();
+        a.tx.send(Msg::StartupFallback("o/r".into())).unwrap();
+        a.poll();
+        assert!(a.meta.is_none() && a.cwd_branch.is_none() && !a.header.contains("feat"));
+    }
+
+    #[test]
+    fn replies_for_a_parked_home_reach_their_own_panels_and_counts() {
+        let mut a = home();
+        press(&mut a, 'G'); // repo o/r on screen, global parked
+        let g_seq = a.other.as_ref().unwrap().panels[0].seq;
+        let r_seq = a.panels[0].seq;
+        press(&mut a, 'G'); // global on screen, repo parked
+        let (gtab, rtab) = (a.panels[0].tab, 0);
+        a.panels[0].loading = true;
+        a.panels[0].seq = next_seq();
+        let live_seq = a.panels[0].seq;
+        let counts_before = a.counts.clone();
+        // the repo's list arrives while the global home is showing
+        list_reply(
+            &mut a,
+            PK::Prs,
+            rtab,
+            r_seq,
+            vec![gitem("o/r", 1), gitem("o/r", 2)],
+        );
+        let o = a.other.as_ref().unwrap();
+        assert_eq!(o.panels[0].items.len(), 2, "into the parked repo panel");
+        assert_eq!(
+            o.counts.get(&(PK::Prs, 0)),
+            Some(&(2, false)),
+            "its count in its own map"
+        );
+        assert_eq!(
+            a.counts, counts_before,
+            "the active home's counts are untouched"
+        );
+        assert!(
+            a.panels[0].items.len() == 3 && a.panels[0].loading,
+            "and nothing in the global list"
+        );
+        // an old global reply (before a scope change) is ignored; the fresh one lands
+        let _ = g_seq;
+        list_reply(
+            &mut a,
+            PK::Review,
+            gtab,
+            live_seq - 1,
+            vec![gitem("z/z", 7)],
+        );
+        assert_eq!(a.panels[0].items.len(), 3);
+        list_reply(&mut a, PK::Review, gtab, live_seq, vec![gitem("z/z", 8)]);
+        assert_eq!(a.panels[0].items[0].number, 8);
+    }
+
+    #[test]
+    fn toggling_changing_scope_and_opening_a_repo_while_loads_are_in_flight() {
+        let mut a = home();
+        let tab = a.panels[0].tab;
+        a.panels[0].loading = true;
+        a.panels[0].seq = next_seq();
+        let old = a.panels[0].seq;
+        a.set_scope(Scope::Org("cli".into())); // reloads the focused section: a new number
+        let fresh = a.panels[0].seq;
+        assert_ne!(old, fresh);
+        a.panels[0].items = vec![gitem("cli/cli", 5)];
+        press(&mut a, 'S'); // opens the row's repo; the global home is parked
+        assert!(!a.global);
+        list_reply(&mut a, PK::Review, tab, old, vec![gitem("old/scope", 1)]);
+        list_reply(&mut a, PK::Review, tab, fresh, vec![gitem("cli/cli", 2)]);
+        press(&mut a, 'G');
+        let items: Vec<_> = a.panels[0].items.iter().map(|i| i.repo.clone()).collect();
+        assert_eq!(
+            items,
+            ["cli/cli"],
+            "only the reply for the scope in force survived"
+        );
+    }
+
+    #[test]
+    fn the_scope_picker_reads_the_repo_list_once_not_per_key_or_frame() {
+        let mut a = home();
+        let reads = || READS.with(|r| r.get());
+        press(&mut a, 's');
+        for _ in 0..3 {
+            a.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        let base = reads();
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // Repo... stage
+        assert_eq!(reads(), base + 1, "read once on entering the stage");
+        for c in "abc/d".chars() {
+            press(&mut a, c);
+            let Some(Modal::Scope(p)) = &a.modal else {
+                panic!()
+            };
+            let _ = a.scope_choices(p);
+            let _ = a.scope_choices(p);
+        }
+        a.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(
+            reads(),
+            base + 1,
+            "typing and re-rendering never touch the disk"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_section_refresh_is_bounded_and_respects_the_search_budget() {
+        let shim = crate::testshim::Shim::new();
+        shim.set("searchprs.out", "[]");
+        shim.set("searchissues.out", "[]");
+        let mut a = home();
+        a.net = true;
+        a.cfg.repos.favorites = (0..16).map(|i| format!("o/r{i}")).collect();
+        a.scope = Scope::Favorites;
+        a.panels[0].kind = PK::Involved; // PRs + issues per chunk: the worst case, 4 chunks x 2
+        wait(&mut a, "start", |_| true);
+        a.load_panel(0, false);
+        wait(&mut a, "the section", |a| !a.panels[0].loading);
+        let n = shim
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("search "))
+            .count();
+        assert_eq!(
+            n, 8,
+            "never more than the 8 searches of a full favorites scope"
+        );
+        // with too little search quota left the refresh is refused, with the reset time
+        let calls = shim.calls().len();
+        a.rate.search = Some(rate::Bucket {
+            limit: 30,
+            remaining: 3,
+            reset: rate::now() + 600,
+        });
+        a.panels[0].items = vec![gitem("a/b", 1)];
+        a.load_panel(0, false);
+        assert!(
+            !a.panels[0].loading && a.panels[0].items.len() == 1,
+            "the list is kept"
+        );
+        assert!(
+            a.status.starts_with("search quota low, resets "),
+            "{}",
+            a.status
+        );
+        assert_eq!(shim.calls().len(), calls, "no search was made");
+        // an empty list shows the reason instead of a blank
+        a.panels[0].items.clear();
+        a.load_panel(0, false);
+        assert!(
+            a.panels[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("search quota low")
+        );
+        // and a window that has reset is not held against us
+        a.rate.search = Some(rate::Bucket {
+            limit: 30,
+            remaining: 0,
+            reset: rate::now() - 1,
+        });
+        a.load_panel(0, false);
+        assert!(a.panels[0].loading);
+        wait(&mut a, "the section", |a| !a.panels[0].loading);
+    }
+
+    #[test]
+    fn r_on_a_section_that_is_already_searching_does_nothing() {
+        let mut a = home();
+        a.panels[0].loading = true;
+        let seq = a.panels[0].seq;
+        press(&mut a, 'r');
+        assert_eq!(a.panels[0].seq, seq, "no second search");
+        assert_eq!(a.status, "already searching");
+        a.panels[0].loading = false;
+        press(&mut a, 'r');
+        assert_ne!(a.panels[0].seq, seq);
+    }
+
+    #[test]
+    fn a_failed_search_note_reaches_the_status_line() {
+        let mut a = home();
+        let (tab, seq) = (a.panels[0].tab, a.panels[0].seq);
+        a.tx.send(Msg::GMeta(
+            PK::Review,
+            tab,
+            seq,
+            0,
+            0,
+            Some("1 of 4 searches failed (boom); showing the rest".into()),
+        ))
+        .unwrap();
+        a.poll();
+        assert!(a.status.contains("1 of 4 searches failed"), "{}", a.status);
     }
 }

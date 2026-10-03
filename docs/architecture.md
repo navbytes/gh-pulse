@@ -59,7 +59,9 @@ filter, breadcrumb); `G` swaps them, so each comes back exactly as left. The glo
 `PK::Repos` is built synchronously from the config, `recent.json` and the cached repo list. Items carry their repo, and
 every detail fetch and action uses `Item::repo`, so the same panes, drill-in and write actions work across repos. The
 Files panel follows the PR list you were last in (`pr_src`). Result messages for a parked home still find their panel
-(`panel_mut` looks in the parked side too). Search is never polled, and search-backed tabs are never counted.
+(`panel_mut` looks in the parked side too). Search is never polled, and search-backed tabs are never counted. List loads draw their number from one app-wide
+counter, so a late reply from a repo you left can never be taken for the current repo's; replies that carry no list
+number (facts, branch, startup fallback) are keyed by repo name and routed to the side that owns it.
 
 ## API usage
 

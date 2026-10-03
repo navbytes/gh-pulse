@@ -22,4 +22,5 @@
 - Global home: `gh search` returns no CI status, so rows show draft and merged/closed markers but no check marker; adding one needs a GraphQL search (more quota).
 - Global home: the Closed tab of My PRs is `is:closed is:unmerged` (merged PRs have their own tab); each section shows at most 100 rows per search (200 after a hidden-repo top-up).
 - Favorites scope searches at most 16 favorites per refresh (4 calls of 4 repos in an OR group); the rest are reported as "not shown" rather than silently dropped.
+- `[repos] favorites` / `hidden` carry no host: with `GH_HOST` pointing at another instance they are sent there as search qualifiers. Per-host lists would need a config shape change.
 

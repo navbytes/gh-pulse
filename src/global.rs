@@ -325,6 +325,7 @@ pub fn repo_items(
     known: &[RepoRow],
     favorites: &ReposCfg,
     now: i64,
+    host: &str,
 ) -> Vec<Item> {
     names
         .iter()
@@ -376,7 +377,7 @@ pub fn repo_items(
                 state: if fav { "fav".into() } else { String::new() },
                 meta: facts.join(" \u{b7} "),
                 body: card.join("\n"),
-                url: format!("https://{}/{name}", gh::host()),
+                url: format!("https://{host}/{name}"),
                 ..Default::default()
             }
         })
@@ -562,7 +563,11 @@ mod tests {
             ..Default::default()
         };
         let names = vec!["o/known".to_string(), "o/unknown".into(), "bad name".into()];
-        let rows = repo_items(&names, &known, &cfg, 1_800_000_000);
+        let rows = repo_items(&names, &known, &cfg, 1_800_000_000, "ghe.example.com");
+        assert_eq!(
+            rows[0].url, "https://ghe.example.com/o/known",
+            "the configured host, not github.com"
+        );
         assert_eq!(rows.len(), 2, "invalid names are skipped");
         assert_eq!((rows[0].state.as_str(), rows[0].kind), ("fav", Kind::Repo));
         assert!(
@@ -747,6 +752,96 @@ mod tests {
                 None
             )
             .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_top_up_is_cheap_conditional_and_bounded() {
+        let shim = crate::testshim::Shim::new();
+        let mut rows: Vec<(&str, u64)> = (0..100).map(|i| ("noisy/bot", i)).collect();
+        rows.truncate(100);
+        shim.set("searchprs.out", &search_json(&rows));
+        shim.set("searchissues.out", &search_json(&[("keep/me", 1)]));
+        let cfg = ReposCfg {
+            hidden: vec!["noisy/bot".into()],
+            ..Default::default()
+        };
+        // Involved, one chunk: only the search that came back full is asked again
+        let l = fetch_section(Section::Involved, 0, &Scope::All, &[], &cfg, None).unwrap();
+        let c = shim.calls();
+        assert_eq!(c.len(), 3, "{c:?}");
+        assert!(c[2].starts_with("search prs") && c[2].contains("--limit=200"));
+        assert_eq!((l.items.len(), l.hidden), (1, 100));
+        // several favorites chunks: no top-up at all, and never more than 2 x 4 searches
+        shim.clear("calls.log");
+        let favs: Vec<String> = (0..16).map(|i| format!("o/r{i}")).collect();
+        fetch_section(Section::Involved, 0, &Scope::Favorites, &favs, &cfg, None).unwrap();
+        let c = shim.calls();
+        assert_eq!(c.len(), 8, "{c:?}");
+        assert!(c.iter().all(|x| x.contains("--limit=100")));
+        // little search quota left: no top-up either
+        shim.clear("calls.log");
+        let q = |remaining| {
+            Some(Quota {
+                remaining,
+                limit: 30,
+            })
+        };
+        fetch_section(Section::Involved, 0, &Scope::All, &[], &cfg, q(9)).unwrap();
+        assert_eq!(shim.calls().len(), 2, "9 left is not comfortable");
+        shim.clear("calls.log");
+        fetch_section(Section::Involved, 0, &Scope::All, &[], &cfg, q(10)).unwrap();
+        assert_eq!(shim.calls().len(), 3);
+        assert!(
+            !Quota::comfortable(Some(Quota {
+                remaining: 10,
+                limit: 60
+            })),
+            "under a third of the window"
+        );
+        assert!(Quota::comfortable(None));
+        assert_eq!(
+            searches_needed(Section::Involved, 0, &Scope::Favorites, &favs),
+            8
+        );
+        assert_eq!(searches_needed(Section::Review, 0, &Scope::All, &[]), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_failed_favorites_chunk_keeps_the_others_rows() {
+        let shim = crate::testshim::Shim::new();
+        shim.set("searchprs.out", &search_json(&[("a/b", 1)]));
+        // fail only the second chunk: the shim fails calls whose arguments mention r4
+        let favs: Vec<String> = (0..6).map(|i| format!("o/r{i}")).collect();
+        std::fs::write(
+            shim.dir.join("gh"),
+            std::fs::read_to_string(shim.dir.join("gh"))
+                .unwrap()
+                .replace(
+                    "case \"$*\" in",
+                    "case \"$*\" in\n  *\"repo:o/r4\"*) echo boom >&2; exit 1;;",
+                ),
+        )
+        .unwrap();
+        let l = fetch_section(
+            Section::Review,
+            0,
+            &Scope::Favorites,
+            &favs,
+            &ReposCfg::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(l.items.len(), 1, "the first chunk's rows survive");
+        assert!(
+            l.note
+                .as_deref()
+                .unwrap()
+                .contains("1 of 2 searches failed (boom)"),
+            "{:?}",
+            l.note
         );
     }
 }
