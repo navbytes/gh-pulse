@@ -13,9 +13,9 @@ see, gh-pulse can see.
 
 ## Screenshots
 
-Captured from the real binary against public repos (`scripts/screenshots.py`). They show the repo home; the global
-home (cross-repo review requests, your PRs, issues and repos) uses the same layout with `owner/repo#N` rows and is not
-pictured yet.
+Captured from the real binary (`scripts/screenshots.py`). The repo-home shots use public repositories. The **global
+home** shots further down use **synthetic data**: the binary runs against a fake `gh` (`scripts/fake-gh`) serving made-up
+users, orgs, repos, PRs and notifications, so nothing of a real account appears.
 
 ![Split diff with syntax highlighting](docs/img/2-diff-split.png)
 *Zoomed Diff tab (`f`): auto layout picks side-by-side at width, with syntax highlighting and intra-line highlights.*
@@ -45,7 +45,30 @@ pictured yet.
 ![Compact layout at 80x24](docs/img/10-compact.png)
 *At 80x24 the panels shrink to short titles and the key hints truncate.*
 
-Regenerate with `GH_PULSE_SHOT_BLOCKLIST=word,word python3 scripts/screenshots.py` (needs `pyte` and `rsvg-convert`; public repos only; the blocklist aborts a shot if a private string shows).
+### Global home (synthetic data)
+
+![Global home](docs/img/11-global-home.png)
+*Started outside a repo: **Review requested**, **My PRs**, **Issues** and **Repos** on the left, the selected item's Overview on the right. Rows read `owner/repo#N`.*
+
+![Cross-repo diff](docs/img/12-global-diff.png)
+*Diff tab zoomed with `f`, split layout: diffs, checks and comments work on a row from any repo without switching.*
+
+![Scope picker](docs/img/13-scope-picker.png)
+*`s` opens the scope picker: all repos, favorites, one org or one repo.*
+
+![Repos panel](docs/img/14-repos-panel.png)
+*[4] Repos: Favorites and Recent tabs; `Enter` opens a repo, `s` scopes the home to it, `f` favorites, `H` hides.*
+
+![Repo browser](docs/img/15-repo-browser.png)
+*`B` browses every repo you can access, with search, sort, type filter, favorites (★) and hide; `.` shows hidden repos (⊘).*
+
+![Inbox](docs/img/16-inbox.png)
+*`N` opens the inbox: unread notifications across repos.*
+
+![Global home at 80x24](docs/img/17-global-compact.png)
+*The global home at 80x24.*
+
+Regenerate with `GH_PULSE_SHOT_BLOCKLIST=word,word python3 scripts/screenshots.py` (needs `pyte`, `rsvg-convert` and `cargo build --release`; public repos only; the blocklist aborts a shot if a private string shows). The global-home shots are `python3 scripts/screenshots.py --fake [shot ...]`: offline, synthetic data from [scripts/fake-gh](scripts/fake-gh/README.md), in a throwaway `HOME` and config.
 
 ## Features
 
@@ -113,7 +136,7 @@ incremental and cached per file; jumping to the end of a huge diff skips the lin
 Run it inside a clone of a GitHub repository, point it at one, or run it anywhere for the global home:
 
 ```sh
-gh-pulse                       # in a clone: that repo. Anywhere else: the global home
+gh-pulse                       # in a clone: that repo. Outside a repo: the global home (--start auto)
 gh-pulse -R cli/cli            # any repo you can access
 gh-pulse --start global        # the global home even inside a clone (G reaches the repo)
 gh-pulse --theme light --ascii
@@ -194,11 +217,15 @@ The full reference is in [docs/keybindings.md](docs/keybindings.md). The essenti
 | Context | Key | Action |
 |---|---|---|
 | Global | `?` / `q` | Help / quit |
-| Global | `1`-`5`, `Tab`, `Shift-Tab` | Focus panel |
+| Global | `1`-`7`, `Tab`, `Shift-Tab` | Focus panel (as many as are shown) |
 | Global | `x` | Action menu for the selected item |
 | Global | `o` `y` `c` | Open in browser / copy URL / check out PR |
 | Global | `r` `R` `L` | Refresh selected item / reload everything / command log |
-| Lists | `j` `k` `Ctrl-d` `Ctrl-u` `g` `G` | Move |
+| Global | `B` `N` | Repo browser / inbox |
+| Global home | `G` | Swap between the repo home and the global home |
+| Global home | `s` `S` | Scope picker / open the row's repo (`G` returns) |
+| Repos panel | `Enter` `s` `f` `H` | Open repo / scope the home to it / favorite / hide |
+| Lists | `j` `k` `Ctrl-d` `Ctrl-u` `g` | Move (`End` for the bottom; `G` swaps homes) |
 | Lists | `/` `Esc` | Filter / clear |
 | Lists | `{` `}` | Panel list tab |
 | Lists | `Enter` | Drill into a PR, else focus detail |
