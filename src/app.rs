@@ -31,9 +31,6 @@ fn next_seq() -> u64 {
     SEQ.fetch_add(1, Relaxed) + 1
 }
 
-/// Seconds the repo's header facts stay cached.
-const META_TTL: u64 = 300;
-
 /// A repo's header facts as cached: with the host and login they were fetched as, so another
 /// account (or host) never sees them.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -49,10 +46,10 @@ fn meta_key(host: &str, repo: &str) -> String {
 
 /// Cached facts for `repo` if fresh and stored for this host and login (None when the login is
 /// unknown: nothing user-specific is cached then).
-fn read_meta(repo: &str) -> Option<gh::RepoMeta> {
+fn read_meta(repo: &str, ttl: u64) -> Option<gh::RepoMeta> {
     let (host, login) = gh::identity()?;
     let st = crate::cache::Store::default_if_enabled()?;
-    let c: CachedMeta = st.fresh(&meta_key(&host, repo), META_TTL, rate::now())?;
+    let c: CachedMeta = st.fresh(&meta_key(&host, repo), ttl, rate::now())?;
     let mut m = c.meta;
     (c.host == host && c.viewer.eq_ignore_ascii_case(&login)).then(|| {
         m.clean();
@@ -318,6 +315,8 @@ struct DMeta {
     number: u64,
 }
 
+// one entry per cached detail: a few hundred bytes each is cheaper than boxing every read
+#[allow(clippy::large_enum_variant)]
 pub enum Load {
     Loading,
     Done(Result<Data, String>),
@@ -454,9 +453,6 @@ struct RepoMsg {
     /// Replace the rows instead of appending (cached rows being swapped for fresh ones).
     replace: bool,
 }
-
-/// Seconds the repo list stays fresh; older cached rows still show at once, then refresh.
-const REPOS_TTL: u64 = 600;
 
 // How many times the repo-list cache was read (tests assert the picker does not re-read per key).
 #[cfg(test)]
@@ -1072,6 +1068,7 @@ impl App {
         if load {
             rate::set_limits(app.cfg.api.low_quota_percent, app.cfg.api.pause_percent);
             crate::cache::set_enabled(app.cfg.api.cache);
+            crate::cache::set_slow(app.cfg.cache.slow_s);
             // old and surplus cached details and lists go, off the UI thread
             std::thread::spawn(dcache::prune);
             pool::init(app.cfg.api.max_concurrent);
@@ -1269,7 +1266,7 @@ impl App {
         };
         if !fresh
             && self.net
-            && let Some(m) = read_meta(&self.repo)
+            && let Some(m) = read_meta(&self.repo, self.cfg.cache.slow_s)
         {
             (self.meta, want.meta) = (Some(m), false);
         }
@@ -3475,7 +3472,7 @@ impl App {
         let mut stale = true;
         if !fresh && let Some((c, age)) = read_repos() {
             (b.viewer, b.rows, b.truncated) = (c.viewer, c.rows, c.truncated);
-            stale = age > REPOS_TTL;
+            stale = age > self.cfg.cache.slow_s;
             (b.loading, cached) = (stale, true);
         }
         self.browser = Some(b);
@@ -5452,7 +5449,11 @@ mod tests {
             shim.calls()
         );
         // stale cache: shown at once, then replaced
-        put("octocat", vec![row("cached")], rate::now() - REPOS_TTL - 5);
+        put(
+            "octocat",
+            vec![row("cached")],
+            rate::now() - a.cfg.cache.slow_s - 5,
+        );
         a.open_browser(false);
         assert_eq!(a.browser.as_ref().unwrap().rows[0].name, "o/cached");
         wait(&mut a, "refreshed", |a| {
@@ -5533,11 +5534,11 @@ mod tests {
         );
         // another host: its own keys, so alice's entries do not apply
         gh::set_identity(Some(("ghe.example.com".into(), "octocat".into())));
-        assert!(read_repos().is_none() && read_meta("o/r").is_none());
+        assert!(read_repos().is_none() && read_meta("o/r", 300).is_none());
         // back as alice everything is still there
         gh::set_identity(Some(("github.com".into(), "octocat".into())));
         assert_eq!(read_repos().unwrap().0.rows[0].name, "o/private-one");
-        assert!(read_meta("o/r").is_some());
+        assert!(read_meta("o/r", 300).is_some());
         // an entry whose stored identity does not match its key is refused (tampering)
         let forged = CachedRepos {
             viewer: "mallory".into(),
@@ -5549,7 +5550,7 @@ mod tests {
         assert!(read_repos().is_none());
         // no known login (a token from the environment): nothing user-specific is cached
         gh::set_identity(None);
-        assert!(read_repos().is_none() && read_meta("o/r").is_none());
+        assert!(read_repos().is_none() && read_meta("o/r", 300).is_none());
     }
 
     #[test]
@@ -5580,7 +5581,7 @@ mod tests {
             ..Default::default()
         };
         write_meta("o/r", &m, "octocat");
-        let got = read_meta("o/r").unwrap();
+        let got = read_meta("o/r", 300).unwrap();
         assert_eq!(
             (got.description.as_str(), got.topics[0].as_str()),
             ("d<U+202E>x", "t<U+200B>")

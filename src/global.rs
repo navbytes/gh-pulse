@@ -523,13 +523,13 @@ fn search(args: &[String], kind: Kind, limit: usize) -> Result<Vec<Item>, String
     gh::parse_items(&out?, kind, "")
 }
 
-/// Your organizations (`gh api user/orgs`), cached for an hour.
+/// Your organizations (`gh api user/orgs`), cached like the other rarely-changing facts (a day).
 pub fn orgs() -> Result<Vec<String>, String> {
     let out = gh::gh_cached(
         ["api", "user/orgs?per_page=100", "--jq", ".[].login"]
             .map(String::from)
             .to_vec(),
-        "1h",
+        &crate::cache::slow_ttl(24),
         false,
     )?;
     Ok(out

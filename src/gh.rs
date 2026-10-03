@@ -680,7 +680,11 @@ fn tags(repo: &str, fresh: bool) -> Result<Vec<Item>, String> {
     for page in 1..=TAG_PAGES {
         let path = format!("repos/{repo}/tags?per_page={LIMIT}&page={page}");
         let rows = tag_rows(
-            &json(&gh_cached(vec!["api".into(), path], "10m", fresh)?)?,
+            &json(&gh_cached(
+                vec!["api".into(), path],
+                &crate::cache::slow_ttl(1),
+                fresh,
+            )?)?,
             repo,
         );
         let full = rows.len() >= LIMIT;
@@ -2544,7 +2548,7 @@ fn raw_file(repo: &str, path: &str) -> Option<String> {
             "Accept: application/vnd.github.raw".into(),
             format!("repos/{repo}/contents/{}", crate::act::enc_path(path)),
         ],
-        "1h",
+        &crate::cache::slow_ttl(1),
         false,
     )
     .ok()
@@ -2594,7 +2598,7 @@ pub fn form_data(repo: &str, head: Option<&str>, workflow_path: Option<&str>) ->
                 "--jq".into(),
                 ".[].name".into(),
             ],
-            "10m",
+            &crate::cache::slow_ttl(1),
             false,
         )
         .map(|s| name_lines(s, 100))
@@ -2612,7 +2616,7 @@ pub fn form_data(repo: &str, head: Option<&str>, workflow_path: Option<&str>) ->
             "--jq".into(),
             ".[].name".into(),
         ],
-        "1h",
+        &crate::cache::slow_ttl(24),
         false,
     )
     .map(|s| name_lines(s, 300))
@@ -2624,7 +2628,7 @@ pub fn form_data(repo: &str, head: Option<&str>, workflow_path: Option<&str>) ->
                     "api".into(),
                     format!("repos/{repo}/contents/.github/ISSUE_TEMPLATE"),
                 ],
-                "1h",
+                &crate::cache::slow_ttl(24),
                 false,
             ) {
                 for (name, path) in parse_template_list(&list).into_iter().take(10) {
@@ -2986,15 +2990,33 @@ mod tests {
         form_data("o/r", None, None);
         let calls = shim.calls();
         assert!(
-            calls[0].starts_with("api --cache 10m repos/o/r/tags"),
+            calls[0].starts_with("api --cache 3600s repos/o/r/tags"),
             "{calls:?}"
         );
         assert!(!calls[1].contains("--cache"), "fresh: {calls:?}");
         assert!(
             calls
                 .iter()
-                .any(|c| c.contains("--cache 1h") && c.contains("labels")),
-            "labels cached an hour: {calls:?}"
+                .any(|c| c.contains("--cache 86400s") && c.contains("labels")),
+            "labels cached a day: {calls:?}"
+        );
+        // [cache] slow_s moves every slow lookup: tags follow it, labels keep their 24x
+        crate::cache::set_slow(60);
+        list("o/r", 7, 0, false).unwrap();
+        form_data("o/r", None, None);
+        let calls = shim.calls();
+        crate::cache::set_slow(3600);
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("api --cache 60s repos/o/r/tags")),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("--cache 1440s") && c.contains("labels")),
+            "{calls:?}"
         );
         let envs = shim.envs();
         assert!(

@@ -12,10 +12,12 @@ use serde::{Deserialize, Serialize};
 
 /// Largest detail entry written (a huge diff is simply not kept).
 const MAX_DETAIL_BYTES: usize = 4 * 1024 * 1024;
-/// Detail files kept; the oldest go first.
+/// Detail files kept, and the room they may take together; the oldest go first.
 pub const KEEP_DETAILS: usize = 400;
-/// List files kept.
+const DETAILS_BYTES: u64 = 150 * 1024 * 1024;
+/// List files kept, and their room.
 pub const KEEP_LISTS: usize = 200;
+const LISTS_BYTES: u64 = 20 * 1024 * 1024;
 pub const DETAIL_PREFIX: &str = "d-";
 pub const LIST_PREFIX: &str = "l-";
 
@@ -278,8 +280,8 @@ pub fn digest<I: IntoIterator<Item = S>, S: AsRef<str>>(parts: I) -> String {
 /// Drop old and surplus detail and list files (once per run, off the UI thread).
 pub fn prune() {
     if let Some(st) = Store::default_if_enabled() {
-        st.prune(DETAIL_PREFIX, KEEP_DETAILS);
-        st.prune(LIST_PREFIX, KEEP_LISTS);
+        st.prune(DETAIL_PREFIX, KEEP_DETAILS, DETAILS_BYTES);
+        st.prune(LIST_PREFIX, KEEP_LISTS, LISTS_BYTES);
     }
 }
 
@@ -392,10 +394,12 @@ mod tests {
             f.files[0].lines[1].text
         );
         // an unfinished Comments tab (more pages to come) is not kept; a complete one is
-        let mut c = CommentsData::default();
-        c.pend = Pending {
-            conn: [Some("cursor".into()), None, None],
-            replies: vec![],
+        let c = CommentsData {
+            pend: Pending {
+                conn: [Some("cursor".into()), None, None],
+                replies: vec![],
+            },
+            ..Default::default()
         };
         write_detail(
             "o/r",
