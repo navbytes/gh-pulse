@@ -1,21 +1,21 @@
-# gh-pulse
+# gh-tui
 
 **lazygit for GitHub: a keyboard-driven TUI over the `gh` CLI.**
 
-[Website](https://navbytes.github.io/gh-pulse/) · [Install](#installation) · [Documentation](docs/configuration.md)
+[Website](https://navbytes.github.io/gh-tui/) · [Install](#installation) · [Documentation](docs/configuration.md)
 
 Numbered panels on the left, a detail pane on the right. Review pull requests (diffs, checks, review threads),
 triage issues, watch workflow runs, browse branches and releases, and act on all of it without leaving the
 terminal. It shells out to [`gh`](https://cli.github.com), so there is no token handling: whatever `gh` can
-see, gh-pulse can see.
+see, gh-tui can see.
 
-![gh-pulse main layout](docs/img/1-main.png)
+![gh-tui main layout](docs/img/1-main.png)
 
 <sub>Real session against a public repository (login shown as `you`).</sub>
 
 ## Screenshots
 
-Captured from the real binary (`scripts/screenshots.py`) on public repositories: gh-pulse itself (its own merged PRs, CI runs
+Captured from the real binary (`scripts/screenshots.py`) on public repositories: gh-tui itself (its own merged PRs, CI runs
 and v0.1.0 release) and [cli/cli](https://github.com/cli/cli) for the comment thread. The **global home** shots further down
 use **synthetic data**: the binary runs against a fake `gh` (`scripts/fake-gh`) serving made-up users, orgs, repos, PRs and
 notifications, so nothing of a real account appears.
@@ -77,7 +77,7 @@ notifications, so nothing of a real account appears.
 ![Global home at 80x24](docs/img/17-global-compact.png)
 *The global home at 80x24.*
 
-Regenerate with `GH_PULSE_SHOT_BLOCKLIST=word,word python3 scripts/screenshots.py` (needs `pyte`, `rsvg-convert` and `cargo build --release`; public repos only; the blocklist aborts a shot if a private string shows). The global-home shots are `python3 scripts/screenshots.py --fake [shot ...]`: offline, synthetic data from [scripts/fake-gh](scripts/fake-gh/README.md), in a throwaway `HOME` and config.
+Regenerate with `GH_TUI_SHOT_BLOCKLIST=word,word python3 scripts/screenshots.py` (needs `pyte`, `rsvg-convert` and `cargo build --release`; public repos only; the blocklist aborts a shot if a private string shows). The global-home shots are `python3 scripts/screenshots.py --fake [shot ...]`: offline, synthetic data from [scripts/fake-gh](scripts/fake-gh/README.md), in a throwaway `HOME` and config.
 
 ## Features
 
@@ -100,7 +100,7 @@ Regenerate with `GH_PULSE_SHOT_BLOCKLIST=word,word python3 scripts/screenshots.p
 - **Actions with a seatbelt**: approve, request changes, comment, merge, close, label, assign, reply to or
   resolve threads, comment on a diff line, re-run or cancel runs, create issues/releases, delete branches. Every
   one shows the exact command first.
-- **Global home**: outside a repo (or with `--start global`) gh-pulse opens a cross-repo home: **Review requested**,
+- **Global home**: outside a repo (or with `--start global`) gh-tui opens a cross-repo home: **Review requested**,
   **My PRs** (Open / Merged / Closed), **Issues** (Assigned / Mine / Mentioned), an optional **Involved**, and a
   **Repos** panel (Favorites / Recent). Rows read `owner/repo#N`; the detail pane, diffs, checks, comments and every
   action work across repos without switching. `s` narrows the home to all repos, your favorites, one org or one repo;
@@ -129,27 +129,36 @@ Regenerate with `GH_PULSE_SHOT_BLOCKLIST=word,word python3 scripts/screenshots.p
 ### As a GitHub CLI extension
 
 ```sh
-gh extension install navbytes/gh-pulse
-gh pulse                      # same flags as the standalone binary
-gh extension upgrade pulse
+gh extension install navbytes/gh-tui
+gh tui                      # same flags as the standalone binary
+gh extension upgrade tui
 ```
 
 This downloads a precompiled binary from the latest GitHub release.
+
+### Moving from gh-pulse
+
+The new extension can coexist with an existing `gh pulse` installation. Install it with
+`gh extension install navbytes/gh-tui`, then check `gh tui --version` before removing the old extension with
+`gh extension remove pulse` if you no longer need it. Whether `gh extension upgrade pulse` follows the repository
+rename is still to be verified against a published release. If a new XDG directory does not exist, gh-tui keeps
+using its existing gh-pulse config, state, or cache directory for reads and writes; it does not move files. A
+previously installed standalone `gh-pulse` binary is not removed automatically.
 
 Prebuilt platforms: macOS (arm64, amd64) and Linux (arm64, amd64; glibc 2.35 or newer, built on Ubuntu 22.04).
 Windows is unsupported and untested.
 
 Each release carries a `SHA256SUMS` file and build provenance attestations. To verify a downloaded binary: `sha256sum -c SHA256SUMS --ignore-missing` (Linux) or `shasum -a 256 -c SHA256SUMS --ignore-missing` (macOS), or
-`gh attestation verify gh-pulse-linux-amd64 --repo navbytes/gh-pulse`.
+`gh attestation verify gh-tui-linux-amd64 --repo navbytes/gh-tui`.
 
 ### With cargo
 
 ```sh
 # from GitHub
-cargo install --git https://github.com/navbytes/gh-pulse
+cargo install --git https://github.com/navbytes/gh-tui
 
 # from a clone
-git clone https://github.com/navbytes/gh-pulse && cd gh-pulse
+git clone https://github.com/navbytes/gh-tui && cd gh-tui
 cargo install --path .
 
 # smaller plain build without syntax highlighting
@@ -160,21 +169,21 @@ Syntax highlighting (the `syntax` cargo feature, built on the pure-Rust `syntect
 2.8 MB: the release binary is about 5.4 MB with it and about 2.6 MB with `--no-default-features`, and a clean
 build takes a few seconds longer. Diffs fall back to plain +/- coloring in the small build. Highlighting is
 incremental and cached per file; jumping to the end of a huge diff skips the lines in between (they stay plain).
-(To opt out when installing from GitHub: `cargo install --git https://github.com/navbytes/gh-pulse --no-default-features`.)
+(To opt out when installing from GitHub: `cargo install --git https://github.com/navbytes/gh-tui --no-default-features`.)
 
 ## Usage
 
 Run it inside a clone of a GitHub repository, point it at one, or run it anywhere for the global home:
 
 ```sh
-gh-pulse                       # in a clone: that repo. Outside a repo: the global home (--start auto)
-gh-pulse -R cli/cli            # any repo you can access
-gh-pulse --start global        # the global home even inside a clone (G reaches the repo)
-gh-pulse --theme light --ascii
-gh-pulse                       # then press B to browse every repo you can access
+gh-tui                       # in a clone: that repo. Outside a repo: the global home (--start auto)
+gh-tui -R cli/cli            # any repo you can access
+gh-tui --start global        # the global home even inside a clone (G reaches the repo)
+gh-tui --theme light --ascii
+gh-tui                       # then press B to browse every repo you can access
 ```
 
-Outside a repo there is no error any more: gh-pulse opens the global home (`--start repo` / `[ui] start = "repo"`
+Outside a repo there is no error any more: gh-tui opens the global home (`--start repo` / `[ui] start = "repo"`
 brings the old "not in a GitHub repo" message back).
 
 | Flag | Meaning |
@@ -184,16 +193,18 @@ brings the old "not in a GitHub repo" message back).
 | `--theme dark\|light` | Color palette (default `dark`). |
 | `--ascii` | ASCII icons and borders. Also automatic when the locale is not UTF-8. |
 | `--nerd` | Nerd Font icons. |
-| `--clear-cache` | Delete gh-pulse's on-disk cache (`~/.cache/gh-pulse`) and exit. |
+| `--clear-cache` | Delete gh-tui's on-disk cache (`~/.cache/gh-tui`) and exit. |
 
-gh-pulse needs an interactive terminal; piping stdin/stdout prints a message and exits.
+gh-tui needs an interactive terminal; piping stdin/stdout prints a message and exits.
 
 ## Configuration
 
-Optional `~/.config/gh-pulse/config.toml` (`$XDG_CONFIG_HOME` is honored): theme and icons, start mode, panels and
+Optional `~/.config/gh-tui/config.toml` (`$XDG_CONFIG_HOME` is honored): theme and icons, start mode, panels and
 tabs, custom sections, API tuning, favorite and hidden repos (written by the repo browser), and key remapping. Flags override the file; a missing file means
 defaults; an invalid file stops startup with `file:line: message`. See [docs/configuration.md](docs/configuration.md).
 The file never contains credentials; authentication stays entirely with `gh`.
+If `gh-tui` has no config directory and `gh-pulse` does, gh-tui keeps using the old directory for reads and writes.
+Nothing is moved automatically. The same directory fallback applies to state and cache.
 
 Custom sections are your own GitHub searches as panels (gh-dash style); each is one search, run when you focus it.
 Three examples (`where` defaults to `"global"`; full reference in [docs/configuration.md](docs/configuration.md#custom-sections)):
@@ -218,13 +229,13 @@ limit  = 50                   # optional, 1..100 (default 30)
 
 ## Local state
 
-`$XDG_STATE_HOME/gh-pulse` (default `~/.local/state/gh-pulse`) holds `viewed.json` (files marked viewed), `scope.json`
+`$XDG_STATE_HOME/gh-tui` (default `~/.local/state/gh-tui`) holds `viewed.json` (files marked viewed), `scope.json`
 (the global home's last scope) and `recent.json` (the last 20 repos you entered, per host). Files are `0600`, written
 atomically, and a corrupt one is ignored. The directory is `0700` and must be yours (a foreign-owned or symlinked one
 is refused with a notice); files are read without following links. `scope.json` and `recent.json` remember their host.
 None of it contains credentials.
 
-Slow-changing lookups are cached under `$XDG_CACHE_HOME/gh-pulse` (default `~/.cache/gh-pulse`; a `0700` directory
+Slow-changing lookups are cached under `$XDG_CACHE_HOME/gh-tui` (default `~/.cache/gh-tui`; a `0700` directory
 you own, files `0600`; a relative `XDG_CACHE_HOME` is ignored, and if the directory is not yours or is a symlink the
 cache switches itself off with a notice). What is stored:
 
@@ -232,9 +243,9 @@ cache switches itself off with a notice). What is stored:
   login, so another account or host never sees them. Cached rows are cleaned again when read.
 - **Raw file text from repos: issue/PR templates and workflow YAML (1 h), labels (1 h) and tags (10 min).** These come
   from the repo you opened, private ones included, so their contents sit on your disk for up to an hour. They are
-  gh's own cache entries (`gh api --cache`, keyed on host, token and request), kept inside gh-pulse's directory.
+  gh's own cache entries (`gh api --cache`, keyed on host, token and request), kept inside gh-tui's directory.
 
-Never cached: tokens, comments, notifications, PR details, diffs, anything from a write. `gh-pulse --clear-cache`
+Never cached: tokens, comments, notifications, PR details, diffs, anything from a write. `gh-tui --clear-cache`
 deletes the whole directory; `[api] cache = false` turns caching off; `r` and `R` skip it.
 
 Files you mark viewed (`v`) reset when the PR's head commit changes; nothing is written to GitHub unless you set `sync_viewed`.
@@ -289,7 +300,7 @@ The full reference is in [docs/keybindings.md](docs/keybindings.md). The essenti
 
 ## Safety model
 
-gh-pulse never writes without asking.
+gh-tui never writes without asking.
 
 1. Every mutation opens a **confirm popup that shows the exact command line** (`gh pr merge 12 -R owner/repo --squash`).
 2. Only **`y`** runs it. `Enter` does not, so a double-tapped menu key can't fire it; `n` or `Esc` cancels.
@@ -327,15 +338,15 @@ Details and every `[api]` key: [docs/configuration.md](docs/configuration.md#api
 ## FAQ and troubleshooting
 
 - **"not in a GitHub repo" / "repo not found or no access".** The first only appears with `--start repo`; by default
-  gh-pulse opens the global home outside a clone. For the second, pass a repo you can see with `-R owner/repo` and
+  gh-tui opens the global home outside a clone. For the second, pass a repo you can see with `-R owner/repo` and
   check `gh auth status`.
-- **Panels sit on "loading...".** gh-pulse waits on `gh`; slow networks or a large account mean several
+- **Panels sit on "loading...".** gh-tui waits on `gh`; slow networks or a large account mean several
   seconds. `L` shows what is running.
 - **"Terminal too small".** The minimum is 50x12. On short terminals unfocused panels collapse to one line.
 - **Colors look washed out or odd.** Your terminal probably lacks truecolor: set `COLORTERM=truecolor` if it
   supports it, or try `--theme light` on light backgrounds.
 - **Boxes and icons are garbled.** Use `--ascii`, or install a Nerd Font and use `--nerd`.
-- **A huge PR shows its diff anyway.** Over 300 files `gh pr diff` refuses; gh-pulse falls back to the files API.
+- **A huge PR shows its diff anyway.** Over 300 files `gh pr diff` refuses; gh-tui falls back to the files API.
 
 ## Roadmap
 

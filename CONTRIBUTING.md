@@ -1,11 +1,11 @@
 # Contributing
 
-Thanks for helping. gh-pulse is small on purpose: a thin TUI over `gh`. Prefer the shortest change that works.
+Thanks for helping. gh-tui is small on purpose: a thin TUI over `gh`. Prefer the shortest change that works.
 
 ## Setup
 
 ```sh
-git clone https://github.com/navbytes/gh-pulse && cd gh-pulse
+git clone https://github.com/navbytes/gh-tui && cd gh-tui
 cargo run -- -R owner/repo          # needs `gh auth login`
 ```
 
@@ -25,8 +25,8 @@ cargo test --no-default-features
 Optional live tests (they call `gh`, read-only) take their target from the environment:
 
 ```sh
-GH_PULSE_REPO=owner/repo cargo test -- --ignored --nocapture
-GH_PULSE_HUGE_PR=owner/repo#123 cargo test -- --ignored --nocapture
+GH_TUI_REPO=owner/repo cargo test -- --ignored --nocapture
+GH_TUI_HUGE_PR=owner/repo#123 cargo test -- --ignored --nocapture
 cargo test --release perf_5k -- --ignored --nocapture
 ```
 
@@ -50,7 +50,7 @@ toolchain.
 
 1. Bump `version` in `Cargo.toml` (and `Cargo.lock`, via `cargo build`) and add the release's section to `CHANGELOG.md` in a PR and merge it.
 2. Tag the merge commit `vX.Y.Z` (or `vX.Y.Z-rc.1`, published as a pre-release) and push the tag.
-3. The `Release` workflow builds `gh-pulse-<os>-<arch>` for macOS and Linux (arm64, amd64), writes `SHA256SUMS`,
+3. The `Release` workflow builds `gh-tui-<os>-<arch>` for macOS and Linux (arm64, amd64), writes `SHA256SUMS`,
    attests provenance and creates the GitHub release. It fails if the tag does not match the `Cargo.toml` version.
 
 To rehearse without publishing, run the workflow manually (Actions, Release): it builds and uploads artifacts only

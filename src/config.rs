@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-/// `~/.config/gh-pulse/config.toml`. Never holds credentials: auth stays with `gh`.
+/// `~/.config/gh-tui/config.toml`. Never holds credentials: auth stays with `gh`.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -28,7 +28,7 @@ pub struct Config {
     pub sections: Vec<SectionCfg>,
 }
 
-/// Where gh-pulse opens: the repo of the current directory, or the cross-repo home.
+/// Where gh-tui opens: the repo of the current directory, or the cross-repo home.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StartMode {
@@ -81,7 +81,7 @@ pub enum Counts {
     Off,
 }
 
-/// `[api]`: how gently gh-pulse talks to GitHub.
+/// `[api]`: how gently gh-tui talks to GitHub.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ApiCfg {
@@ -843,7 +843,7 @@ pub fn path() -> Option<PathBuf> {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".config")))?;
-    Some(base.join("gh-pulse").join("config.toml"))
+    Some(crate::paths::data_dir(&base).join("config.toml"))
 }
 
 /// 1-based line of `key` inside the `nth` table headed `header`; the header's line if the key is implied.
@@ -1241,7 +1241,7 @@ mod tests {
 
     #[test]
     fn atomic_save_round_trips_and_never_clobbers() {
-        let dir = std::env::temp_dir().join(format!("gh-pulse-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("gh-tui-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("nested").join("config.toml");
         assert_eq!(
@@ -1384,7 +1384,7 @@ mod tests {
 
     #[test]
     fn panels_round_trip_through_save() {
-        let dir = std::env::temp_dir().join(format!("gh-pulse-panels-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("gh-tui-panels-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("config.toml");
         let mut c = parse(
@@ -1456,7 +1456,7 @@ mod tests {
             );
         }
         // a non-default section survives the app's own saves; the default one is not written
-        let dir = std::env::temp_dir().join(format!("gh-pulse-api-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("gh-tui-api-{}", std::process::id()));
         let path = dir.join("config.toml");
         let c = parse("[api]\nmax_concurrent = 2\n", "t").unwrap();
         save_to(&path, &c).unwrap();
@@ -1490,7 +1490,7 @@ mod tests {
         let e = parse("[ui]\nstat = \"auto\"\n", "cfg").unwrap_err();
         assert!(e.starts_with("cfg:2:") && e.contains("stat"), "{e}");
         // a non-default value survives the app's own saves; the default is not written
-        let dir = std::env::temp_dir().join(format!("gh-pulse-ui-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("gh-tui-ui-{}", std::process::id()));
         let path = dir.join("config.toml");
         let c = parse("[ui]\nstart = \"global\"\n", "t").unwrap();
         save_to(&path, &c).unwrap();

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Drive the real gh-pulse binary in a pty (pyte) against public repos and render docs/img/*.svg|png.
+"""Drive the real gh-tui binary in a pty (pyte) against public repos and render docs/img/*.svg|png.
 
-Usage: GH_PULSE_SHOT_BLOCKLIST=a,b scripts/screenshots.py [--fake] [shot ...]   (needs `pip install pyte`,
+Usage: GH_TUI_SHOT_BLOCKLIST=a,b scripts/screenshots.py [--fake] [shot ...]   (needs `pip install pyte`,
 `cargo build --release`; PNG conversion uses rsvg-convert if present). Read-only: never confirms an action.
 The header login becomes `you`, the unread badge is blanked, and a shot is aborted if a blocklisted string shows.
 `--fake` renders the global-home shots (11-17) offline against scripts/fake-gh, a `gh` stub with synthetic data,
@@ -11,7 +11,7 @@ import fcntl, html, os, pty, re, select, shutil, signal, struct, subprocess, sys
 import pyte
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = os.path.join(ROOT, 'target/release/gh-pulse')
+BIN = os.path.join(ROOT, 'target/release/gh-tui')
 OUT = os.path.join(ROOT, 'docs/img')
 COLS, ROWS = 140, 40
 FONT = "JetBrains Mono, Menlo, Consolas, 'DejaVu Sans Mono', monospace"
@@ -23,8 +23,8 @@ PAL = ['#484f58', '#ff7b72', '#3fb950', '#d29922', '#58a6ff', '#bc8cff', '#39c5c
 NAMED = {n: PAL[i] for i, n in enumerate(ANSI)}
 NAMED.update({'brightblack': PAL[8], 'brightred': PAL[9], 'brightgreen': PAL[10], 'brightbrown': PAL[11],
               'brightblue': PAL[12], 'brightmagenta': PAL[13], 'brightcyan': PAL[14], 'brightwhite': PAL[15]})
-# screens are aborted if any of these appear (case-insensitive); add your own via GH_PULSE_SHOT_BLOCKLIST=a,b,c
-SECRETS = ['/Users/', '@gmail'] + [x for x in os.environ.get('GH_PULSE_SHOT_BLOCKLIST', '').split(',') if x]
+# screens are aborted if any of these appear (case-insensitive); add your own via GH_TUI_SHOT_BLOCKLIST=a,b,c
+SECRETS = ['/Users/', '@gmail'] + [x for x in os.environ.get('GH_TUI_SHOT_BLOCKLIST', os.environ.get('GH_PULSE_SHOT_BLOCKLIST', '')).split(',') if x]
 
 
 def _disp(self):
@@ -152,7 +152,7 @@ def launch(repo, tmp):
             t.wait_for(r'\[1\] (PRs|Pull requests)', 15); return t
         except SystemExit:
             t.close(); time.sleep(30)
-    raise SystemExit('gh-pulse never started (rate limited?)')
+    raise SystemExit('gh-tui never started (rate limited?)')
 
 
 def pr(t, nums, tab=3):
@@ -217,7 +217,7 @@ def s_compact(t):
     pr(t, [])  # the narrow layout moves the detail pane, so the row search in pr() would never match
 
 
-GP, CLI = 'navbytes/gh-pulse', 'cli/cli'
+GP, CLI = os.environ.get('GH_TUI_SHOT_REPO', 'navbytes/gh-tui'), 'cli/cli'
 SHOTS = {  # name -> (repo, steps, (cols, rows))
     '1-main': (GP, s_main, (140, 40)),
     '2-diff-split': (GP, s_diff_split, (140, 40)),
@@ -237,15 +237,15 @@ FAKE = os.path.join(ROOT, 'scripts/fake-gh')
 
 
 def launch_fake(tmp):
-    """Start gh-pulse from a non-git cwd with a hermetic environment: fake `gh` first on PATH, empty gh config,
+    """Start gh-tui from a non-git cwd with a hermetic environment: fake `gh` first on PATH, empty gh config,
     and a config/state seeded with synthetic favorites, hidden repos and recent repos."""
     fx = os.path.join(FAKE, 'fixtures')
     cfg, state, cwd = (os.path.join(tmp, d) for d in ('config', 'state', 'cwd'))
-    for d in ('config/gh-pulse', 'state/gh-pulse', 'gh', 'cwd', 'log'): os.makedirs(os.path.join(tmp, d))
-    shutil.copy(os.path.join(fx, 'config.toml'), os.path.join(cfg, 'gh-pulse/config.toml'))
-    shutil.copy(os.path.join(fx, 'recent.json'), os.path.join(state, 'gh-pulse/recent.json'))
-    os.chmod(os.path.join(state, 'gh-pulse'), 0o700)
-    open(os.path.join(tmp, 'gh/hosts.yml'), 'w').write('github.com:\n    user: you\n')  # what gh-pulse keys its disk cache by; no token
+    for d in ('config/gh-tui', 'state/gh-tui', 'gh', 'cwd', 'log'): os.makedirs(os.path.join(tmp, d))
+    shutil.copy(os.path.join(fx, 'config.toml'), os.path.join(cfg, 'gh-tui/config.toml'))
+    shutil.copy(os.path.join(fx, 'recent.json'), os.path.join(state, 'gh-tui/recent.json'))
+    os.chmod(os.path.join(state, 'gh-tui'), 0o700)
+    open(os.path.join(tmp, 'gh/hosts.yml'), 'w').write('github.com:\n    user: you\n')  # what gh-tui keys its disk cache by; no token
     env = {'PATH': f'{FAKE}:/usr/bin:/bin', 'HOME': tmp, 'LANG': 'en_US.UTF-8', 'XDG_CONFIG_HOME': cfg, 'XDG_STATE_HOME': state,
            'XDG_CACHE_HOME': os.path.join(tmp, 'cache'), 'GH_CONFIG_DIR': os.path.join(tmp, 'gh'), 'FAKE_GH_LOG': os.path.join(tmp, 'log')}
     for warm in (True, False):  # the first run only opens the repo browser, which fills the on-disk repo list the Repos panel reads
@@ -298,8 +298,8 @@ if __name__ == '__main__':
     if '--fake' in sys.argv:
         for name in args or FAKE_SHOTS:
             steps, (COLS, ROWS) = FAKE_SHOTS[name]
-            shoot(name, launch_fake, steps, 'gh-pulse · global home (synthetic data)', True)
+            shoot(name, launch_fake, steps, 'gh-tui · global home (synthetic data)', True)
     else:
         for name in args or SHOTS:
             repo, steps, (COLS, ROWS) = SHOTS[name]
-            shoot(name, lambda tmp: launch(repo, tmp), steps, f'gh-pulse · {repo}', False)
+            shoot(name, lambda tmp: launch(repo, tmp), steps, f'gh-tui · {repo}', False)

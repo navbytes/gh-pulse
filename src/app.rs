@@ -4120,7 +4120,7 @@ mod tests {
 
     #[test]
     fn refused_save_leaves_favorites_and_hidden_unchanged() {
-        let dir = std::env::temp_dir().join(format!("gh-pulse-app-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("gh-tui-app-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
@@ -5388,7 +5388,7 @@ mod tests {
 
     #[test]
     fn the_scope_picker_sets_persists_and_reloads_the_sections() {
-        let dir = std::env::temp_dir().join(format!("gh-pulse-scope-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("gh-tui-scope-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut a = home();
         a.state_dir = Some(dir.clone());
@@ -5655,7 +5655,7 @@ mod tests {
 
     /// The home with a config file to save to, favorites and recent repos, and a state directory.
     fn repos_home(tag: &str) -> (App, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("gh-pulse-repos-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("gh-tui-repos-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut a = home();
@@ -6257,7 +6257,7 @@ mod tests {
 
     #[test]
     fn the_org_picker_accepts_an_org_you_are_not_a_member_of() {
-        let dir = std::env::temp_dir().join(format!("gh-pulse-freeorg-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("gh-tui-freeorg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut a = home();
         a.state_dir = Some(dir.clone());
@@ -6411,7 +6411,7 @@ mod tests {
 
     #[test]
     fn unhiding_in_the_browser_refreshes_the_global_sections_and_hiding_trims_them() {
-        let dir = std::env::temp_dir().join(format!("gh-pulse-unhide-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("gh-tui-unhide-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut a = home();

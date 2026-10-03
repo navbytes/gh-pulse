@@ -1,5 +1,5 @@
 //! Local, per-user state that isn't configuration: which files of which PR head you marked viewed.
-//! `$XDG_STATE_HOME/gh-pulse/viewed.json` (default `~/.local/state/...`), keyed by repo + PR number and
+//! `$XDG_STATE_HOME/gh-tui/viewed.json` (default `~/.local/state/...`), keyed by repo + PR number and
 //! tied to the head sha, so new commits reset the marks. No GitHub write happens.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -23,11 +23,7 @@ pub struct Viewed {
 }
 
 pub fn path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".local").join("state")))?;
-    Some(base.join("gh-pulse").join("viewed.json"))
+    Some(dir()?.join("viewed.json"))
 }
 
 fn now() -> u64 {
@@ -171,7 +167,7 @@ pub fn set_dir(p: Option<PathBuf>) {
     *DIR_OVERRIDE.lock().unwrap() = p;
 }
 
-/// The state directory (`$XDG_STATE_HOME/gh-pulse`, default `~/.local/state/gh-pulse`); only absolute
+/// The state directory (`$XDG_STATE_HOME/gh-tui`, default `~/.local/state/gh-tui`); only absolute
 /// paths are honored.
 pub fn dir() -> Option<PathBuf> {
     #[cfg(test)]
@@ -184,7 +180,7 @@ pub fn dir() -> Option<PathBuf> {
             .filter(|p| p.is_absolute())
     };
     let base = abs("XDG_STATE_HOME").or_else(|| abs("HOME").map(|h| h.join(".local/state")))?;
-    Some(base.join("gh-pulse"))
+    Some(crate::paths::data_dir(&base))
 }
 
 /// Writes `body` to `path` through a unique, exclusively created `0600` temp file and a rename.
@@ -294,7 +290,7 @@ mod tests_recent {
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("gh-pulse-state-{name}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("gh-tui-state-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
     }
@@ -378,7 +374,7 @@ mod tests_recent {
         use std::os::unix::fs::{PermissionsExt, symlink};
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         let root = tmp("private");
-        let d = root.join("nested/gh-pulse");
+        let d = root.join("nested/gh-tui");
         save_scope(&d.join("scope.json"), "github.com", "all").unwrap();
         assert_eq!(mode(&d), 0o700, "created private");
         assert_eq!(mode(&d.join("scope.json")), 0o600);
@@ -395,7 +391,7 @@ mod tests_recent {
         assert!(e.contains("not a plain directory"), "{e}");
         assert!(std::fs::read_dir(&target).unwrap().next().is_none());
         // somebody else's directory is refused (the file system root is not ours)
-        let e = Recent::new("github.com").save(Path::new("/gh-pulse-recent.json"));
+        let e = Recent::new("github.com").save(Path::new("/gh-tui-recent.json"));
         assert!(e.is_err());
         // reads go through the same checks: a file, ours, not a link
         assert!(crate::cache::read_nofollow(&d.join("scope.json")).is_some());
@@ -474,7 +470,7 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("gh-pulse-state-{name}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("gh-tui-state-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d.join("viewed.json")
     }

@@ -18,9 +18,12 @@ pub fn set_program(p: Option<OsString>) {
 fn program() -> OsString {
     let set = PROGRAM.lock().ok().and_then(|g| g.clone());
     // unit tests never reach the real GitHub by accident (a job outliving its shim would): the
-    // `--ignored` live tests opt in with GH_PULSE_LIVE=1
+    // `--ignored` live tests opt in with GH_TUI_LIVE=1
     #[cfg(test)]
-    if set.is_none() && std::env::var_os("GH_PULSE_LIVE").is_none() {
+    if set.is_none()
+        && std::env::var_os("GH_TUI_LIVE").is_none()
+        && std::env::var_os("GH_PULSE_LIVE").is_none()
+    {
         return "false".into();
     }
     set.unwrap_or_else(|| "gh".into())
@@ -471,7 +474,7 @@ fn throttle_note(e: String) -> String {
 
 /// `gh api --cache <ttl>` for a slow-changing GET or query; `fresh` (the user pressed r/R) or
 /// `[api] cache = false` runs it uncached. The cache files are gh's own (0600, no tokens), kept in
-/// gh-pulse's cache directory so `--clear-cache` can remove exactly them.
+/// gh-tui's cache directory so `--clear-cache` can remove exactly them.
 pub fn gh_cached(args: Vec<String>, ttl: &str, fresh: bool) -> Result<String, String> {
     let (args, env) = cached_call(args, ttl, fresh);
     run_gh(args.into_iter().map(OsString::from).collect(), &env)
@@ -2988,7 +2991,7 @@ mod tests {
         let envs = shim.envs();
         assert!(
             envs[0].ends_with("cache"),
-            "gh's cache lives in gh-pulse's directory: {envs:?}"
+            "gh's cache lives in gh-tui's directory: {envs:?}"
         );
         assert_eq!(envs[1], "", "uncached calls leave the environment alone");
         use std::os::unix::fs::PermissionsExt;
@@ -3518,11 +3521,13 @@ mod tests {
     }
 
     /// Live: a >300-file PR (gh pr diff refuses) must still produce a diff via the files API.
-    /// GH_PULSE_LIVE=1 GH_PULSE_HUGE_PR=owner/repo#N cargo test -- --ignored --nocapture
+    /// GH_TUI_LIVE=1 GH_TUI_HUGE_PR=owner/repo#N cargo test -- --ignored --nocapture
     #[test]
     #[ignore]
     fn huge_pr_diff_falls_back() {
-        let Ok(spec) = std::env::var("GH_PULSE_HUGE_PR") else {
+        let Ok(spec) =
+            std::env::var("GH_TUI_HUGE_PR").or_else(|_| std::env::var("GH_PULSE_HUGE_PR"))
+        else {
             return;
         };
         let (repo, n) = spec.split_once('#').expect("owner/repo#N");
@@ -3539,11 +3544,13 @@ mod tests {
         assert!(f.len() > 300 && f.iter().any(|f| f.lines.len() > 1));
     }
 
-    /// Live smoke test: GH_PULSE_LIVE=1 GH_PULSE_REPO=o/r cargo test -- --ignored --nocapture
+    /// Live smoke test: GH_TUI_LIVE=1 GH_TUI_REPO=o/r cargo test -- --ignored --nocapture
     #[test]
     #[ignore]
     fn live_smoke() {
-        let repo = std::env::var("GH_PULSE_REPO").unwrap();
+        let repo = std::env::var("GH_TUI_REPO")
+            .or_else(|_| std::env::var("GH_PULSE_REPO"))
+            .unwrap();
         for (panel, tab) in [
             (0, 0),
             (1, 0),

@@ -9,6 +9,7 @@ mod form;
 mod gh;
 mod global;
 mod md;
+mod paths;
 mod pool;
 mod rate;
 mod sanitize;
@@ -28,11 +29,11 @@ use std::io::IsTerminal;
 use std::time::Duration;
 use theme::{IconSet, Theme};
 
-const USAGE: &str = "usage: gh-pulse [-R owner/repo] [--start auto|repo|global] [--theme dark|light] [--ascii] [--nerd] [--clear-cache] [-V]";
+const USAGE: &str = "usage: gh-tui [-R owner/repo] [--start auto|repo|global] [--theme dark|light] [--ascii] [--nerd] [--clear-cache] [-V]";
 
-const HELP: &str = "gh-pulse: a lazygit-style terminal UI for GitHub
+const HELP: &str = "gh-tui: a lazygit-style terminal UI for GitHub
 
-usage: gh-pulse [-R owner/repo] [--start auto|repo|global] [--theme dark|light] [--ascii] [--nerd] [--clear-cache] [-V]
+usage: gh-tui [-R owner/repo] [--start auto|repo|global] [--theme dark|light] [--ascii] [--nerd] [--clear-cache] [-V]
 
   -R, --repo owner/repo   open this repo
   --start MODE            where to open (config: [ui] start):
@@ -42,14 +43,14 @@ usage: gh-pulse [-R owner/repo] [--start auto|repo|global] [--theme dark|light] 
                                     (G switches between it and a repo)
   --theme dark|light      color palette
   --ascii | --nerd        ASCII icons and borders | Nerd Font icons
-  --clear-cache           delete gh-pulse's on-disk cache and exit
+  --clear-cache           delete gh-tui's on-disk cache and exit
   -V, --version           print the version
   -h, --help              this text
 
-also runs as a GitHub CLI extension: `gh pulse [flags]`";
+also runs as a GitHub CLI extension: `gh tui [flags]`";
 
 fn version() -> String {
-    format!("gh-pulse {}", env!("CARGO_PKG_VERSION"))
+    format!("gh-tui {}", env!("CARGO_PKG_VERSION"))
 }
 
 struct MouseGuard;
@@ -116,7 +117,7 @@ fn main() -> std::io::Result<()> {
         die(&format!("{at}: {e}"))
     });
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        die("gh-pulse needs an interactive terminal");
+        die("gh-tui needs an interactive terminal");
     }
     let mode = start_flag.unwrap_or(cfg.ui.start);
     // `gh repo view` (an API call) only runs inside a git work tree, and never when -R is given
@@ -186,7 +187,7 @@ mod tests {
     fn version_line_uses_package_version() {
         assert_eq!(
             super::version(),
-            format!("gh-pulse {}", env!("CARGO_PKG_VERSION"))
+            format!("gh-tui {}", env!("CARGO_PKG_VERSION"))
         );
     }
 }

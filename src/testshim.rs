@@ -52,7 +52,7 @@ impl Shim {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         let dir = std::env::temp_dir().join(format!(
-            "gh-pulse-shim-{}-{}",
+            "gh-tui-shim-{}-{}",
             std::process::id(),
             crate::rate::now()
         ));
