@@ -7,7 +7,7 @@ Press `?` in the app for the same list. Keys are checked against `src/app.rs` (`
 
 | Key | Action |
 |---|---|
-| `?` | Help popup (sized to its content; `j` `k` scroll when the terminal is short, any other key closes) |
+| `?` | Keybindings menu (lazygit style): grouped rows with a key column; `j` `k` / arrows move, `/` filters by key, description or section (Enter keeps the filter), `Esc` clears the filter and then closes (`q` closes too) |
 | `q` | Quit (closes the log view first when one is open) |
 | `Ctrl-C` | Quit, from anywhere including popups |
 | `1`-`7` | Focus panel by number (`1` to the number of panels shown, at most `7`; `Tab` / `Shift-Tab` reach any beyond that, e.g. with custom `[[sections]]`; a PR drill-in has 4). Pressing the number of the already focused panel steps to its next list tab |
@@ -60,6 +60,7 @@ and `s` applies to those whose filter has no `repo:` / `org:` / `user:` of its o
 | `S` | Open the row's repo as the app's repo; `G` leads back |
 | `r` | Search this section again |
 | Repos panel: `Enter` | Open the repo (`S` too) |
+| `H` | On any row of a global section (Review requested, My PRs, Issues, custom...): hide that row's repo everywhere; unhide it in the Repos panel or the browser (`.` shows hidden repos) |
 | Repos panel: `s` / `f` / `H` | Scope the home to it / toggle favorite (same list as the repo browser) / hide it everywhere |
 
 ## PR drill-in (after `Enter` on a PR)

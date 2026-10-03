@@ -603,7 +603,11 @@ pub struct App {
     pub filter: String,
     pub typing: bool,
     pub help: bool,
+    /// The `?` menu: cursor over the visible rows, its filter, whether `/` is typing, first line shown.
     pub help_scroll: usize,
+    pub help_filter: String,
+    pub help_typing: bool,
+    pub help_top: Cell<usize>,
     /// Set by the renderer: how far the help popup can scroll.
     pub help_max: Cell<usize>,
     /// The global home is on screen (otherwise a repo).
@@ -935,6 +939,9 @@ impl App {
             typing: false,
             help: false,
             help_scroll: 0,
+            help_filter: String::new(),
+            help_typing: false,
+            help_top: Cell::new(0),
             help_max: Cell::new(0),
             global,
             other: (global && repo.is_some()).then(|| Side::empty(repo_name)),
@@ -2740,16 +2747,7 @@ impl App {
             return false;
         }
         if self.help {
-            let m = self.help_max.get();
-            match k.code {
-                KeyCode::Char('j') | KeyCode::Down => {
-                    self.help_scroll = (self.help_scroll + 1).min(m)
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    self.help_scroll = self.help_scroll.saturating_sub(1)
-                }
-                _ => (self.help, self.help_scroll) = (false, 0),
-            }
+            self.help_key(k);
             return false;
         }
         if self.typing {
@@ -2801,7 +2799,7 @@ impl App {
             KeyCode::Esc => self.filter.clear(),
             KeyCode::Char('w') if self.diff_active() => self.wrap = !self.wrap,
             KeyCode::Char('v') if self.cur_tab() == Tab::Diff => self.toggle_viewed(),
-            KeyCode::Char('H') if self.on_repo_row() => self.toggle_hide(),
+            KeyCode::Char('H') if self.on_repo_row() || self.on_global_row() => self.toggle_hide(),
             KeyCode::Char('l') | KeyCode::Right if self.selected().is_some() => {
                 self.detail_focus = true
             }
@@ -3566,7 +3564,7 @@ impl App {
         }
     }
 
-    /// `H` on a Repos row: hide or unhide the repo everywhere.
+    /// `H` on a Repos row or a row of a global section: hide or unhide its repo everywhere.
     fn toggle_hide(&mut self) {
         let Some(r) = self.selected_in(self.focus).map(|i| i.repo.clone()) else {
             return;
@@ -3633,6 +3631,57 @@ impl App {
     }
 
     /// The selected row is a repo in the Repos panel (list focus).
+    /// Keys inside the `?` menu: j/k move, `/` filters, Esc clears the filter and then closes.
+    fn help_key(&mut self, k: KeyEvent) {
+        let max = self.help_max.get().saturating_sub(1);
+        let close = |a: &mut App| {
+            (a.help, a.help_typing) = (false, false);
+            (a.help_scroll, a.help_filter) = (0, String::new());
+            a.help_top.set(0);
+        };
+        match k.code {
+            KeyCode::Down => self.help_scroll = (self.help_scroll + 1).min(max),
+            KeyCode::Up => self.help_scroll = self.help_scroll.saturating_sub(1),
+            KeyCode::PageDown => self.help_scroll = (self.help_scroll + 10).min(max),
+            KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(10),
+            KeyCode::Home => self.help_scroll = 0,
+            KeyCode::End => self.help_scroll = max,
+            KeyCode::Esc if self.help_typing => {
+                (self.help_typing, self.help_filter, self.help_scroll) = (false, String::new(), 0)
+            }
+            KeyCode::Esc if !self.help_filter.is_empty() => {
+                (self.help_filter, self.help_scroll) = (String::new(), 0)
+            }
+            KeyCode::Esc => close(self),
+            KeyCode::Enter if self.help_typing => self.help_typing = false,
+            KeyCode::Backspace if self.help_typing => {
+                self.help_filter.pop();
+                self.help_scroll = 0;
+            }
+            KeyCode::Char(c) if self.help_typing => {
+                self.help_filter.push(c);
+                self.help_scroll = 0;
+            }
+            KeyCode::Char('/') => self.help_typing = true,
+            KeyCode::Char('j') => self.help_scroll = (self.help_scroll + 1).min(max),
+            KeyCode::Char('k') => self.help_scroll = self.help_scroll.saturating_sub(1),
+            KeyCode::Char('g') => self.help_scroll = 0,
+            KeyCode::Char('G') => self.help_scroll = max,
+            KeyCode::Char('q') => close(self),
+            _ if self.keys.get(&k) == Some(Act::Help) => close(self),
+            _ => {}
+        }
+    }
+
+    /// A row of a global search section (Review, My PRs, Issues, custom...): its repo can be hidden.
+    fn on_global_row(&self) -> bool {
+        self.global
+            && self.panels[self.focus].kind.is_global_search()
+            && !self.detail_focus
+            && self.ctx.is_none()
+            && self.selected_in(self.focus).is_some()
+    }
+
     fn on_repo_row(&self) -> bool {
         self.panels[self.focus].kind == PK::Repos
             && !self.detail_focus
@@ -6407,6 +6456,23 @@ mod tests {
         }];
         (b.typing, b.loading, b.show_hidden) = (false, false, true);
         a.browser = Some(b);
+    }
+
+    #[test]
+    fn h_on_a_review_row_hides_that_repo_without_a_search() {
+        let dir = std::env::temp_dir().join(format!("gh-tui-hide-row-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = home();
+        a.cfg_path = Some(dir.join("config.toml"));
+        a.panels[0].items = vec![gitem("e/f", 5), gitem("a/b", 1), gitem("e/f", 6)];
+        a.panels[0].unloaded = false;
+        a.focus = 0;
+        press(&mut a, 'H');
+        assert!(a.cfg.repos.is_hidden("e/f"));
+        assert_eq!(a.panels[0].items.len(), 1);
+        assert_eq!((a.panels[0].hidden, a.panels[0].loading), (2, false));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
