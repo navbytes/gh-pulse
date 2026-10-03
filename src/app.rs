@@ -1,7 +1,8 @@
-use crate::act::{self, Action, Sel};
+use crate::act::{self, Action, FormKind, Sel};
 use crate::browse::{self, Browser, Out, RepoRow};
 use crate::config::{self, Act, Config, Keymap};
 use crate::diff::{self, DiffMode};
+use crate::form::{self, Form};
 use crate::gh::{self, Data, FilesData, Item, Kind, Tab};
 use crate::state::Viewed;
 use crate::syn::Hl;
@@ -94,21 +95,45 @@ pub enum Load {
     Done(Result<Data, String>),
 }
 
+/// What to do after a confirmed command succeeds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Then {
+    None,
+    /// Select the item the command created (its number is the URL's last segment).
+    Select(PK),
+}
+
 pub struct Confirm {
     pub cmd: Vec<String>,
+    /// Piped to the command's stdin (large bodies); the popup says so.
+    pub stdin: Option<String>,
+    pub then: Then,
+    /// The form this came from; n/Esc reopens it with its content.
+    back: Option<Box<Form>>,
     local_of: Option<String>,
     pub scroll: u16,
     /// Set by the renderer so scrolling can't overshoot.
     pub max_scroll: Cell<u16>,
+    /// Rows visible in the popup (set by the renderer), for paging.
+    pub view_h: Cell<u16>,
 }
 
 impl Confirm {
+    #[cfg(test)]
+    pub fn new_for_test(cmd: Vec<String>) -> Self {
+        Self::new(cmd, None)
+    }
+
     fn new(cmd: Vec<String>, local_of: Option<String>) -> Self {
         Confirm {
             cmd,
+            stdin: None,
+            then: Then::None,
+            back: None,
             local_of,
             scroll: 0,
             max_scroll: Cell::new(0),
+            view_h: Cell::new(10),
         }
     }
 }
@@ -122,6 +147,7 @@ pub enum Modal {
         build: act::Build,
     },
     Confirm(Confirm),
+    Form(Box<Form>),
 }
 
 /// Screen regions recorded by the last draw, for mouse hit-testing.
@@ -157,9 +183,12 @@ enum Msg {
     More(String, u64, gh::More),
     Log(String, String, u64, Result<String, String>),
     Status(Result<String, String>),
-    Done(Result<String, String>),
+    Done(Result<String, String>, Then),
+    FormData(u64, Box<gh::FormData>),
+    /// The branch checked out in the working directory, when it is a clone of the repo.
+    Branch(u64, Option<String>),
     Repos(u64, Result<RepoMsg, String>),
-    Header(String),
+    Header(u64, String),
 }
 
 pub struct App {
@@ -191,6 +220,14 @@ pub struct App {
     pub row: usize,
     pub ctx: Option<Ctx>,
     pub zoom: bool,
+    form_seq: u64,
+    /// False in layout tests: nothing may start a `gh` process.
+    net: bool,
+    cwd_branch: Option<String>,
+    /// Bumped per header lookup so a late answer for the previous repo is dropped.
+    hgen: u64,
+    /// (panel, number, repo) of an item just created; honoured by the next list reload only.
+    pending_select: Option<(PK, u64, String)>,
     /// File shown from the selected commit (Commits panel).
     pub cfile: usize,
     /// When the last comments page was requested (pages are at least PAGE_GAP apart).
@@ -331,6 +368,7 @@ impl App {
     /// The real entry point: config and keymap come from the user's config file.
     pub fn from_config(repo: String, theme: Theme, cfg: Config, keys: Keymap) -> Self {
         let mut app = Self::new(repo, theme);
+        gh::set_sync_viewed(cfg.sync_viewed);
         (app.cfg, app.keys, app.cfg_path) = (cfg, keys, config::path());
         let (viewed, warn) = Viewed::load(crate::state::path());
         app.viewed = viewed;
@@ -382,6 +420,11 @@ impl App {
             row: 0,
             ctx: None,
             zoom: false,
+            form_seq: 0,
+            net: load,
+            cwd_branch: None,
+            hgen: 0,
+            pending_select: None,
             cfile: 0,
             last_more: None,
             expanded: HashSet::new(),
@@ -412,7 +455,8 @@ impl App {
     }
 
     fn spawn_header(&mut self) {
-        let (tx, repo) = (self.tx.clone(), self.repo.clone());
+        self.hgen += 1;
+        let (tx, repo, g) = (self.tx.clone(), self.repo.clone(), self.hgen);
         thread::spawn(move || {
             // The cwd's branch only describes `repo` when cwd is a clone of it.
             let local = gh::repo_here().is_ok_and(|h| h.eq_ignore_ascii_case(&repo));
@@ -425,10 +469,14 @@ impl App {
             } else {
                 String::new()
             };
-            let _ = tx.send(Msg::Header(format!(
-                " {repo}  branch: {branch}  user: {}",
-                gh::user()
-            )));
+            let _ = tx.send(Msg::Branch(
+                g,
+                local.then_some(branch.clone()).filter(|b| !b.is_empty()),
+            ));
+            let _ = tx.send(Msg::Header(
+                g,
+                format!(" {repo}  branch: {branch}  user: {}", gh::user()),
+            ));
         });
     }
 
@@ -477,11 +525,13 @@ impl App {
     }
 
     pub fn poll(&mut self) {
+        let mut select_focus = None;
         self.tick = self.tick.wrapping_add(1);
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 Msg::List(kind, tab, seq, res) => {
                     let (global, hidden) = (self.global, self.cfg.repos.clone());
+                    let (pending, cur) = (self.pending_select.clone(), self.repo.clone());
                     let Some(p) = self.panel_mut(kind) else {
                         continue;
                     };
@@ -489,6 +539,7 @@ impl App {
                         continue;
                     }
                     p.loading = false;
+                    let consumed = pending.as_ref().is_some_and(|x| x.0 == kind);
                     match res {
                         Ok(mut items) => {
                             // hidden repos disappear from the cross-repo (global) results
@@ -498,12 +549,31 @@ impl App {
                                 items.retain(|i| !hidden.is_hidden(&i.repo));
                             }
                             p.cursor = p.cursor.min(items.len().saturating_sub(1));
+                            if let Some((pk, n, repo)) = pending
+                                && pk == p.kind
+                                && repo == cur
+                                && let Some(pos) = items.iter().position(|i| i.number == n)
+                            {
+                                p.cursor = pos;
+                                select_focus = Some(pk);
+                            }
                             p.items = items;
                         }
                         Err(e) => p.error = Some(e),
                     }
+                    if consumed {
+                        self.pending_select = None;
+                    }
                 }
                 Msg::Detail(key, tab, g, res) => {
+                    // GitHub's own viewed marks join the local ones (opt-in; never removes any)
+                    if g == self.dgen
+                        && let Ok(Data::Files(fd)) = &res
+                        && !fd.gh_viewed.is_empty()
+                        && let Err(e) = self.viewed.merge(&fd.viewed_key, &fd.sha, &fd.gh_viewed)
+                    {
+                        self.status = e;
+                    }
                     if g == self.dgen {
                         self.cache.insert((key, tab), Load::Done(res));
                     }
@@ -529,9 +599,64 @@ impl App {
                 }
                 Msg::Log(_, _, _, Err(e)) | Msg::Status(Err(e)) => self.status = e,
                 Msg::Status(Ok(s)) => self.status = s,
-                Msg::Done(res) => {
+                Msg::Done(res, then) => {
+                    let ok = res.is_ok();
                     self.status = res.unwrap_or_else(|e| e);
+                    if let (true, Then::Select(pk)) = (ok, then)
+                        && let Some(n) = self
+                            .status
+                            .trim_end_matches('/')
+                            .rsplit('/')
+                            .next()
+                            .and_then(|s| s.parse().ok())
+                    {
+                        self.pending_select = Some((pk, n, self.repo.clone()));
+                        // the new item must be in the list: show everything open
+                        if let Some(p) = self.panel_mut(pk) {
+                            p.tab = 2;
+                        }
+                    }
                     self.reload_all();
+                }
+                Msg::Branch(g, b) => {
+                    if g == self.hgen {
+                        self.cwd_branch = b;
+                    }
+                }
+                Msg::FormData(seq, d) => {
+                    if seq == self.form_seq
+                        && let Some(Modal::Form(f)) = &mut self.modal
+                    {
+                        f.note = None;
+                        f.set_labels(d.labels.clone());
+                        f.set_templates(d.templates.clone());
+                        if matches!(f.spec, form::Spec::Dispatch { .. }) {
+                            let base = if d.default_branch.is_empty() {
+                                "main"
+                            } else {
+                                &d.default_branch
+                            };
+                            f.set_dispatch(
+                                base,
+                                d.branches.clone(),
+                                d.tags.clone(),
+                                d.dispatch.clone(),
+                            );
+                        }
+                        if matches!(f.spec, form::Spec::Pr { .. }) {
+                            let base = if d.default_branch.is_empty() {
+                                "main"
+                            } else {
+                                &d.default_branch
+                            };
+                            f.set_pr_data(
+                                base,
+                                d.branches.clone(),
+                                d.head_pushed,
+                                d.pr_template.clone(),
+                            );
+                        }
+                    }
                 }
                 Msg::Repos(g, _) if g != self.repos_seq => {}
                 Msg::Repos(_, Ok(m)) => {
@@ -548,7 +673,17 @@ impl App {
                         (b.loading, b.error) = (false, Some(e));
                     }
                 }
-                Msg::Header(h) => self.header = crate::sanitize::clean(&h).into_owned(),
+                Msg::Header(g, h) => {
+                    if g == self.hgen {
+                        self.header = crate::sanitize::clean(&h).into_owned();
+                    }
+                }
+            }
+        }
+        if let Some(pk) = select_focus {
+            self.pending_select = None;
+            if let Some(i) = self.panel_idx(pk) {
+                self.set_focus(i);
             }
         }
         self.sync_derived();
@@ -574,6 +709,7 @@ impl App {
                 sha: it.meta.clone(),
                 files: diff::parse(diff),
                 threads: Default::default(),
+                ..Default::default()
             };
             self.cache
                 .insert((it.key(), Tab::Diff), Load::Done(Ok(Data::Files(fd))));
@@ -1046,6 +1182,31 @@ impl App {
     }
 
     /// Returns true to quit.
+    /// Bracketed paste: literal text into whichever text box has focus; anything else ignores it.
+    pub fn on_paste(&mut self, s: &str) {
+        let clean = |multi: bool| -> String {
+            s.replace("\r\n", "\n")
+                .chars()
+                .filter(|c| (*c == '\n' && multi) || !c.is_control())
+                .collect()
+        };
+        match &mut self.modal {
+            Some(Modal::Form(f)) => f.paste(s),
+            Some(Modal::Input { buf, .. }) => buf.push_str(&clean(true)),
+            Some(_) => {}
+            None => {
+                if let Some(b) = self.browser.as_mut().filter(|b| b.typing) {
+                    b.query.push_str(&clean(false));
+                    b.cursor = 0;
+                } else if self.typing && self.browser.is_none() && !self.help {
+                    self.filter.push_str(&clean(false));
+                    self.panels.iter_mut().for_each(|p| p.cursor = 0);
+                    self.reset_view();
+                }
+            }
+        }
+    }
+
     pub fn on_key(&mut self, k: KeyEvent) -> bool {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && k.code == KeyCode::Char('c') {
@@ -1124,7 +1285,32 @@ impl App {
                 (self.mode, self.row) = (self.mode.next(), 0);
                 self.scroll.set(0);
             }
+            KeyCode::Char('d')
+                if !self.detail_focus
+                    && self.panels[self.focus].kind == PK::Actions
+                    && self
+                        .selected()
+                        .is_some_and(|i| i.kind == Kind::Workflow && i.state == "active") =>
+            {
+                let it = self.selected().cloned().unwrap_or_default();
+                self.modal = self.form_for(FormKind::Dispatch(
+                    it.number.to_string(),
+                    it.title.clone(),
+                    it.cmd.clone(),
+                ));
+            }
             KeyCode::Char('n') if self.diff_active() => self.file_step(1),
+            KeyCode::Char('n')
+                if !self.detail_focus
+                    && matches!(self.panels[self.focus].kind, PK::Issues | PK::Prs) =>
+            {
+                let kind = if self.panels[self.focus].kind == PK::Issues {
+                    FormKind::Issue
+                } else {
+                    FormKind::PrCwd
+                };
+                self.modal = self.form_for(kind);
+            }
             KeyCode::Char('p') if self.diff_active() => self.file_step(-1),
             KeyCode::Char('j') | KeyCode::Down => self.nav(1),
             KeyCode::Char('k') | KeyCode::Up => self.nav(-1),
@@ -1186,12 +1372,15 @@ impl App {
         }
         match items.len() {
             0 => self.status = "no such action here".into(),
-            1 if filter.is_some() => self.modal = Self::pick(items.remove(0)),
+            1 if filter.is_some() => self.modal = self.pick(items.remove(0)),
             _ => self.modal = Some(Modal::Menu(items, 0)),
         }
     }
 
-    fn pick(a: Action) -> Option<Modal> {
+    fn pick(&mut self, a: Action) -> Option<Modal> {
+        if let Some(kind) = a.form {
+            return self.form_for(kind);
+        }
         Some(match a.prompt {
             Some((title, required)) => Modal::Input {
                 title,
@@ -1201,6 +1390,48 @@ impl App {
             },
             None => Modal::Confirm(Confirm::new((a.build)(""), a.local_of)),
         })
+    }
+
+    /// Open the create-issue / create-PR form and start fetching labels, templates and branches.
+    fn form_for(&mut self, kind: FormKind) -> Option<Modal> {
+        let repo = self.repo.clone();
+        let head = match kind {
+            FormKind::Issue => None,
+            FormKind::Dispatch(id, name, path) => {
+                self.form_seq += 1;
+                let (tx, seq, repo2) = (self.tx.clone(), self.form_seq, repo.clone());
+                if self.net {
+                    thread::spawn(move || {
+                        let d = gh::form_data(&repo2, None, Some(&path));
+                        let _ = tx.send(Msg::FormData(seq, Box::new(d)));
+                    });
+                }
+                return Some(Modal::Form(Box::new(Form::dispatch(&repo, &id, &name))));
+            }
+            FormKind::Pr(h) => Some(h),
+            FormKind::PrCwd => match self.cwd_branch.clone() {
+                Some(h) => Some(h),
+                None => {
+                    self.status = format!(
+                        "the current directory is not a clone of {repo} (or no branch is checked out); use the Branches panel"
+                    );
+                    return None;
+                }
+            },
+        };
+        let form = match &head {
+            Some(h) => Form::pr(&repo, h),
+            None => Form::issue(&repo),
+        };
+        self.form_seq += 1;
+        let (tx, seq) = (self.tx.clone(), self.form_seq);
+        if self.net {
+            thread::spawn(move || {
+                let d = gh::form_data(&repo, head.as_deref(), None);
+                let _ = tx.send(Msg::FormData(seq, Box::new(d)));
+            });
+        }
+        Some(Modal::Form(Box::new(form)))
     }
 
     fn run_act(&mut self, a: Act, k: KeyEvent) -> bool {
@@ -1324,6 +1555,7 @@ impl App {
         self.browser = None;
         self.exit_ctx();
         self.repo = repo;
+        (self.cwd_branch, self.pending_select) = (None, None);
         (self.global, self.header) = (false, format!(" {}", self.repo));
         self.panels.iter_mut().for_each(|p| p.cursor = 0);
         self.reset_view();
@@ -1361,7 +1593,7 @@ impl App {
         match m {
             Modal::Menu(mut items, i) => match k.code {
                 KeyCode::Esc | KeyCode::Char('q') => None,
-                KeyCode::Enter => Self::pick(items.swap_remove(i)),
+                KeyCode::Enter => self.pick(items.swap_remove(i)),
                 _ => {
                     let i = mv(i, items.len());
                     Some(Modal::Menu(items, i))
@@ -1403,28 +1635,62 @@ impl App {
                 }
             },
             // Only `y` runs it: Enter would also fire from a double-tapped menu Enter.
+            Modal::Form(mut f) => match f.key(k) {
+                form::Out::Cancel => None,
+                form::Out::Picked("template") => {
+                    f.apply_template();
+                    Some(Modal::Form(f))
+                }
+                form::Out::Submit => match f.build() {
+                    Ok(b) => {
+                        let mut c = Confirm::new(b.argv, None);
+                        c.stdin = b.stdin;
+                        c.then = match f.spec {
+                            form::Spec::Issue => Then::Select(PK::Issues),
+                            form::Spec::Pr { .. } => Then::Select(PK::Prs),
+                            form::Spec::Dispatch { .. } => Then::None,
+                        };
+                        c.back = Some(f);
+                        Some(Modal::Confirm(c))
+                    }
+                    Err(e) => {
+                        f.error = Some(e);
+                        Some(Modal::Form(f))
+                    }
+                },
+                _ => Some(Modal::Form(f)),
+            },
             Modal::Confirm(mut c) => match k.code {
+                // the whole command must have been on screen before it can run
+                KeyCode::Char('y') if c.scroll < c.max_scroll.get() => {
+                    self.status = "scroll to the end of the command first (G)".into();
+                    Some(Modal::Confirm(c))
+                }
                 KeyCode::Char('y') => {
                     self.status = format!("running: {}", gh::shell(&c.cmd));
                     let tx = self.tx.clone();
                     thread::spawn(move || {
                         let r = match &c.local_of {
-                            Some(repo) => gh::require_clone(repo).and_then(|()| gh::run(&c.cmd)),
-                            None => gh::run(&c.cmd),
+                            Some(repo) => gh::require_clone(repo)
+                                .and_then(|()| gh::run_with(&c.cmd, c.stdin.as_deref())),
+                            None => gh::run_with(&c.cmd, c.stdin.as_deref()),
                         };
-                        let _ = tx.send(Msg::Done(r));
+                        let _ = tx.send(Msg::Done(r, c.then));
                     });
                     None
                 }
-                KeyCode::Char('n') | KeyCode::Esc => None,
+                KeyCode::Char('n') | KeyCode::Esc => c.back.map(Modal::Form),
                 _ => {
-                    c.scroll = (if down {
-                        c.scroll + 1
-                    } else if up {
-                        c.scroll.saturating_sub(1)
-                    } else {
-                        c.scroll
-                    })
+                    let page = c.view_h.get().max(2) - 1;
+                    c.scroll = match k.code {
+                        _ if down => c.scroll.saturating_add(1),
+                        _ if up => c.scroll.saturating_sub(1),
+                        KeyCode::PageDown | KeyCode::Char(' ') => c.scroll.saturating_add(page),
+                        KeyCode::PageUp => c.scroll.saturating_sub(page),
+                        KeyCode::Home | KeyCode::Char('g') => 0,
+                        KeyCode::End | KeyCode::Char('G') => u16::MAX,
+                        _ => c.scroll,
+                    }
                     .min(c.max_scroll.get());
                     Some(Modal::Confirm(c))
                 }
@@ -1469,14 +1735,36 @@ impl App {
                     Viewed::key(&pr.repo, pr.number),
                     sha.to_string(),
                     f.path.clone(),
+                    f.raw_path.clone(),
+                    fd.pr_id.clone(),
                 )
             }),
             _ => None,
         };
-        if let Some((key, sha, path)) = target
-            && let Err(e) = self.viewed.toggle(&key, &sha, &path)
-        {
-            self.status = e;
+        let Some((key, sha, path, raw_path, pr_id)) = target else {
+            return;
+        };
+        match self.viewed.toggle(&key, &sha, &path) {
+            Err(e) => self.status = e,
+            // `sync_viewed = true` in config.toml is the consent for this GitHub write
+            Ok(now_on) if self.cfg.sync_viewed && !pr_id.is_empty() => {
+                let (tx, cmd) = (
+                    self.tx.clone(),
+                    gh::viewed_mutation(&pr_id, &raw_path, now_on),
+                );
+                thread::spawn(move || {
+                    let r = gh::run_with(&cmd, None)
+                        .map(|_| {
+                            format!(
+                                "{} on GitHub",
+                                if now_on { "marked viewed" } else { "unmarked" }
+                            )
+                        })
+                        .map_err(|e| format!("GitHub viewed sync failed (local mark kept): {e}"));
+                    let _ = tx.send(Msg::Status(r));
+                });
+            }
+            Ok(_) => {}
         }
     }
 
@@ -1732,5 +2020,66 @@ mod tests {
         );
         a.filter = "docs".into();
         assert_eq!(a.visible(i).len(), 1);
+    }
+
+    #[test]
+    fn github_viewed_marks_are_merged_into_the_local_ones() {
+        let mut a = App::with(
+            "o/r".into(),
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+        );
+        let fd = FilesData {
+            sha: "s1".into(),
+            viewed_key: Viewed::key("o/r", 7),
+            gh_viewed: vec!["src/a.rs".into()],
+            pr_id: "PR_1".into(),
+            ..Default::default()
+        };
+        a.tx.send(Msg::Detail(
+            "k".into(),
+            Tab::Diff,
+            a.dgen,
+            Ok(Data::Files(fd)),
+        ))
+        .unwrap();
+        a.poll();
+        assert!(a.viewed.is_viewed(&Viewed::key("o/r", 7), "s1", "src/a.rs"));
+        assert!(!a.viewed.is_viewed(&Viewed::key("o/r", 7), "s1", "src/b.rs"));
+    }
+
+    #[test]
+    fn late_or_stale_state_is_dropped_on_repo_switch() {
+        let mut a = App::with("o/r".into(), Theme::new(false, IconSet::Ascii, true), false);
+        a.cwd_branch = Some("feat".into());
+        a.pending_select = Some((PK::Prs, 7, "o/r".into()));
+        a.switch_repo("x/y".into());
+        assert!(a.cwd_branch.is_none() && a.pending_select.is_none());
+        let stale = a.hgen - 1;
+        a.tx.send(Msg::Branch(stale, Some("old".into()))).unwrap();
+        a.tx.send(Msg::Header(stale, "old header".into())).unwrap();
+        a.poll();
+        assert!(a.cwd_branch.is_none() && !a.header.contains("old header"));
+        a.tx.send(Msg::Branch(a.hgen, Some("new".into()))).unwrap();
+        a.poll();
+        assert_eq!(a.cwd_branch.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn paste_goes_to_the_focused_text_box_only() {
+        let mut a = App::with("o/r".into(), Theme::new(false, IconSet::Ascii, true), false);
+        a.on_paste("ignored");
+        assert!(a.filter.is_empty(), "no text box focused");
+        a.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        a.on_paste("a\nb\x1b");
+        assert_eq!(a.filter, "ab");
+        a.modal = Some(Modal::Input {
+            title: "t",
+            buf: String::new(),
+            required: false,
+            build: Box::new(|_| vec![]),
+        });
+        a.on_paste("x\r\ny");
+        assert!(matches!(&a.modal, Some(Modal::Input { buf, .. }) if buf == "x\ny"));
     }
 }

@@ -140,7 +140,8 @@ pub fn parse(diff: &str) -> Vec<File> {
             Some('\\') => continue,
             _ => (Op::Ctx, l.get(1..).unwrap_or("")),
         };
-        let text = crate::sanitize::clean(&text.replace('\t', "    ")).into_owned();
+        let text =
+            crate::sanitize::clean(&text.replace('\t', "    ").replace('\r', "")).into_owned();
         let (o, n) = match op {
             Op::Add => (None, Some(new)),
             Op::Del => (Some(old), None),
@@ -324,6 +325,18 @@ mod tests {
     use super::*;
 
     const DIFF: &str = "diff --git a/a.txt b/a.txt\nindex 1..2 100644\n--- a/a.txt\n+++ b/a.txt\n@@ -1,3 +1,3 @@ fn x\n keep\n-old1\n-old2\n+new1\n tail\ndiff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -0,0 +1 @@\n+hello\n";
+
+    #[test]
+    fn crlf_files_show_no_cr_marker() {
+        let d = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\r\n+new\r\n";
+        let f = parse(d);
+        let t: Vec<_> = f[0].lines.iter().map(|l| l.text.clone()).collect();
+        assert!(t.contains(&"old".to_string()));
+        assert!(
+            t.iter().all(|x| !x.contains("U+000D") && !x.contains('\r')),
+            "{t:?}"
+        );
+    }
 
     #[test]
     fn parses_files_and_numbers() {

@@ -80,6 +80,34 @@ impl Viewed {
             .is_some_and(|s| s.sha == sha && s.files.iter().any(|f| f == file))
     }
 
+    /// Add GitHub's viewed files to the local marks (never removes any). True when something changed.
+    pub fn merge(&mut self, key: &str, sha: &str, files: &[String]) -> Result<bool, String> {
+        let before = self.map.clone();
+        let e = self.map.entry(key.to_string()).or_default();
+        if e.sha != sha {
+            *e = Stored {
+                sha: sha.to_string(),
+                ..Default::default()
+            };
+        }
+        let missing: Vec<&String> = files.iter().filter(|f| !e.files.contains(f)).collect();
+        if missing.is_empty() {
+            if e.files.is_empty() {
+                self.map.remove(key);
+            }
+            return Ok(false);
+        }
+        e.files.extend(missing.into_iter().cloned());
+        e.t = now();
+        match self.save() {
+            Ok(()) => Ok(true),
+            Err(err) => {
+                self.map = before;
+                Err(err)
+            }
+        }
+    }
+
     /// Flip the mark and save atomically. On a failed save the change is undone and the error returned.
     pub fn toggle(&mut self, key: &str, sha: &str, file: &str) -> Result<bool, String> {
         let before = self.map.clone();
@@ -205,6 +233,31 @@ mod tests {
             !v.is_viewed("o/r#1", "s", "f"),
             "failed save leaves the mark off"
         );
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn merging_github_marks_adds_without_removing() {
+        let p = tmp("merge");
+        let (mut v, _) = Viewed::load(Some(p.clone()));
+        let k = Viewed::key("o/r", 3);
+        v.toggle(&k, "s1", "local.rs").unwrap();
+        assert!(
+            v.merge(&k, "s1", &["gh.rs".into(), "local.rs".into()])
+                .unwrap()
+        );
+        assert!(v.is_viewed(&k, "s1", "gh.rs") && v.is_viewed(&k, "s1", "local.rs"));
+        assert!(
+            !v.merge(&k, "s1", &["gh.rs".into()]).unwrap(),
+            "nothing new, nothing written"
+        );
+        assert!(
+            v.merge(&k, "s2", &["only-new.rs".into()]).unwrap(),
+            "a new head starts over with GitHub's marks"
+        );
+        assert!(!v.is_viewed(&k, "s2", "local.rs") && v.is_viewed(&k, "s2", "only-new.rs"));
+        let (v2, _) = Viewed::load(Some(p.clone()));
+        assert!(v2.is_viewed(&k, "s2", "only-new.rs"), "persisted");
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 }

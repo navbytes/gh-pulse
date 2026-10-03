@@ -7,40 +7,37 @@ triage issues, watch workflow runs, browse branches and releases, and act on all
 terminal. It shells out to [`gh`](https://cli.github.com), so there is no token handling: whatever `gh` can
 see, gh-pulse can see.
 
-```text
- cli/cli  branch:   user: you
-╭ [1] Status ───────────────────────────────╮╭ Overview │ Checks │ Comments │ Diff ──────────────────────────────────╮
-│cli/cli                                    ││`gh issue artifact` stack 8/10: Add `edit`                             │
-╰───────────────────────────────────────────╯│cli/cli #14571  [open]                                                 │
-╭ [2] Pull requests · All open (72) ────────╮│───────────────────────────────────────────────────────────────────────│
-│#14577 [draft] Bump go-runewidth to v0.0.30││author    octocat                                                      │
-│#14572 `gh issue artifact` stack 9/10: Docu││branch    octocat/artifact-create <- octocat/artifact-edit             │
-│#14571 `gh issue artifact` stack 8/10: Add ││mergeable mergeable                                                    │
-│#14570 `gh issue artifact` stack 7/10: Add ││decision  REVIEW_REQUIRED                                              │
-│#14569 `gh issue artifact` stack 6/10: Add ││  hubot (requested)                                                     │
-╰───────────────────────────────────────────╯│                                                                       │
-╭ [3] Files (9) ────────────────────────────╮│Part of the pull request stack tracked in #14563.                      │
-│M artifact.go  pkg/cmd/is…/artifact/  +2 -0││                                                                       │
-╰───────────────────────────────────────────╯│<!--                                                                   │
-╭ [4] Issues · Assigned (0) ────────────────╮│Thank you for contributing to GitHub CLI!                              │
-│nothing here                               ││                                                                       │
-╰───────────────────────────────────────────╯│If you are proposing a fix for a security issue, STOP and follow       │
-╭ [5] Actions · Runs (100+) ────────────────╮│.github/SECURITY.md instead.                                           │
-│✓ Triage Scheduled Tasks  Triage Scheduled ││                                                                       │
-╰───────────────────────────────────────────╯│Keep the entire pull request self-contained, reviewer-facing, and      │
-╭ [6] Branches (100+) ──────────────────────╮│diegetic: describe the                                                 │
-│⎇ 1119-support-for-owner-based-queries     ││change, rationale, and evidence within the context of the repository   │
-╰───────────────────────────────────────────╯│and pull request. Do not                                               │
-╭ [7] Releases (100+) ──────────────────────╮│narrate how the pull request was produced or refer to private          │
-│★ GitHub CLI 2.102.0                       ││conversations, prior agent work,                                       │
-╰───────────────────────────────────────────╯│or other behind-the-scenes context. Omit those details unless they     │
-╭ [8] Notifications (0) ────────────────────╮│materially affect review;                                              │
-│nothing here                               ││if they do, state the relevant fact and its significance directly.     │
-╰───────────────────────────────────────────╯╰───────────────────────────────────────────────────────────────────────╯
-j/k move  Enter drill in  [ ] detail tab  { } list tab  / filter  x actions  ? help  q quit
-```
+![gh-pulse main layout](docs/img/1-main.png)
 
 <sub>Text capture of a real session against a public repository (usernames replaced).</sub>
+
+## Screenshots
+
+Captured from the real binary against public repos (`scripts/screenshots.py`).
+
+![Split diff with syntax highlighting](docs/img/2-diff-split.png)
+*Zoomed Diff tab: auto layout picks side-by-side at width, with syntax highlighting and intra-line highlights.*
+
+![Unified diff of a Markdown file with wrap](docs/img/3-diff-prose.png)
+*Unified layout with soft wrap (`t` / `w`) keeps long prose lines readable.*
+
+![PR drill-in](docs/img/4-files.png)
+*Enter on a PR drills into Files / Commits / Checks / Comments; markers show files with review comments.*
+
+![Comments tab](docs/img/5-comments.png)
+*Comment cards with markdown, reactions, review summaries and threads.*
+
+![Actions panel](docs/img/6-actions.png)
+*Workflow runs with their jobs and steps.*
+
+![Action menu](docs/img/7-menu.png)
+![Confirm popup](docs/img/7b-confirm.png)
+*Every action is confirmed first and shows the exact `gh` command it will run.*
+
+![Help](docs/img/8-help.png)
+*`?` lists every key.*
+
+Regenerate with `python3 scripts/screenshots.py` (needs `pyte` and `rsvg-convert`; uses public repos only).
 
 ## Features
 
@@ -62,6 +59,10 @@ j/k move  Enter drill in  [ ] detail tab  { } list tab  / filter  x actions  ? h
 - **Global view**: your PRs and issues across all repositories (`G`), plus a full-screen **repo browser** (`B`) over every repo you can access, with search, sort, favorites and hide.
 - **Mouse and keyboard**: click panels, rows and tabs; wheel scrolls. `?` shows every key.
 - **Themes**: dark and light palettes, truecolor with a 256-color fallback, ASCII and Nerd Font icon sets.
+- **Create from the terminal**: new issue (labels validated, `.md` templates, body in a multi-line field), new PR
+  (base picker, draft, reviewers, `--fill`, PR template, warns if the branch isn't pushed), and run a workflow with
+  a form generated from its `workflow_dispatch` inputs (read from the default branch; branches and tags offered as the ref). Each ends in the exact-command confirm popup.
+- **Viewed files**: remembered locally per PR head; optionally mirrored to GitHub (`sync_viewed`).
 - **Command log**: `L` shows every `gh`/`git` command that was run.
 
 ## Requirements

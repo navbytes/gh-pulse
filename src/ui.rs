@@ -39,6 +39,8 @@ Comments
   Enter  expand/collapse (long comments, <details>)   e  show who reacted
 Actions (always asks to confirm, shows the exact command)
   {actions}  action menu for the selected item / row    {approve} approve  {comment} comment  {merge} merge
+  n  new issue (Issues panel) / new PR from the cwd branch (PR panel)   d  run workflow (Actions panel)
+  Forms: Tab/S-Tab fields, Space toggles, Left/Right pickers, Ctrl-S review the command, Esc cancel
   Input popups: Enter newline, Ctrl-S submit, Esc cancel
 Mouse: click panel/row/tab, wheel scrolls
 Anywhere
@@ -533,6 +535,11 @@ fn bordered_line(app: &App, title: Line<'static>, on: bool) -> Block<'static> {
         .border_set(th.border)
         .border_style(Style::new().fg(col))
         .title(title.style(ts))
+}
+
+/// Focus/rail bar; the block glyph does not exist in ASCII mode.
+fn bar(th: &Theme) -> &'static str {
+    if th.ascii { "|" } else { "\u{258e}" }
 }
 
 fn popup_block(app: &App, title: String) -> Block<'static> {
@@ -1210,12 +1217,7 @@ fn card_lines(
     let key = (app.selected().map(Item::key).unwrap_or_default(), idx);
     let (expanded, open) = (app.expanded.contains(&key), app.react_open.contains(&key));
     let hl = md_highlighter(app);
-    let rail = |on: bool| {
-        Span::styled(
-            if on { "\u{258e}" } else { " " },
-            Style::new().fg(th.accent),
-        )
-    };
+    let rail = |on: bool| Span::styled(if on { bar(th) } else { " " }, Style::new().fg(th.accent));
     let body = |text: &str, width: usize| {
         crate::md::render(
             text,
@@ -1980,15 +1982,16 @@ fn modal(f: &mut Frame, app: &App) {
             f.render_widget(Paragraph::new(lines).scroll((skip as u16, 0)), area);
         }
         Modal::Confirm(c) => {
-            // Always the full command: grow to fit, scroll (j/k) only if the terminal is too small.
+            // Always the full command: grow to fit; when the terminal is too small, scroll, and `y`
+            // stays refused until the end has been seen.
             let w = f.area().width.saturating_sub(4).clamp(20, 100);
-            let lines = wrap(&gh::shell(&c.cmd), w as usize - 2);
+            let mut lines = wrap(&gh::shell(&c.cmd), w as usize - 2);
+            if let Some(body) = &c.stdin {
+                lines.push(format!("(the {}-byte body is piped on stdin)", body.len()));
+            }
             let h = (lines.len() as u16 + 2).min(f.area().height.saturating_sub(2));
-            let hint = if lines.len() as u16 + 2 > h {
-                "j/k scroll, "
-            } else {
-                ""
-            };
+            let tall = lines.len() as u16 + 2 > h;
+            let hint = if tall { "j/k PgDn G scroll, " } else { "" };
             let area = popup(
                 f,
                 app,
@@ -1996,12 +1999,142 @@ fn modal(f: &mut Frame, app: &App) {
                 h,
                 &format!("Run this command?  [{hint}y yes, n/Esc no]"),
             );
-            c.max_scroll
-                .set((lines.len() as u16).saturating_sub(area.height));
+            // a tall command keeps its last row for the "more" marker
+            let view = if tall {
+                area.height.saturating_sub(1)
+            } else {
+                area.height
+            };
+            c.max_scroll.set((lines.len() as u16).saturating_sub(view));
+            c.view_h.set(view);
+            let scroll = c.scroll.min(c.max_scroll.get());
+            let [body, foot] =
+                Layout::vertical([Constraint::Length(view), Constraint::Min(0)]).areas(area);
             let lines: Vec<Line> = lines.into_iter().map(Line::raw).collect();
-            f.render_widget(Paragraph::new(lines).scroll((c.scroll, 0)), area);
+            f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), body);
+            if tall {
+                let m = if scroll < c.max_scroll.get() {
+                    format!("{} more (command continues: scroll)", th.ic.down)
+                } else {
+                    format!("{} end of command", th.ic.up)
+                };
+                f.render_widget(
+                    Paragraph::new(Span::styled(m, Style::new().fg(th.warn).bold())),
+                    foot,
+                );
+            }
+        }
+        Modal::Form(form) => form_popup(f, app, form),
+    }
+}
+
+/// The create-issue / create-PR form: one block per field, the focused one highlighted.
+fn form_popup(f: &mut Frame, app: &App, form: &crate::form::Form) {
+    use crate::form::Kind;
+    let th = &app.theme;
+    let w = f.area().width.saturating_sub(4).clamp(30, 100);
+    let inner_w = w.saturating_sub(4) as usize;
+    let show = |s: &str| crate::sanitize::clean(s).into_owned();
+    // an input's description, shown after its label
+    let hint = |fl: &crate::form::Field| {
+        if fl.hint.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", show(&fl.hint))
+        }
+    };
+    let mut lines: Vec<Line> = vec![];
+    if let Some(n) = &form.note {
+        for r in wrap(&show(n), inner_w) {
+            lines.push(Line::styled(r, Style::new().fg(th.muted).italic()));
         }
     }
+    let mut focus_at = 0;
+    for (i, fl) in form.fields.iter().enumerate() {
+        let on = i == form.focus;
+        if on {
+            focus_at = lines.len();
+        }
+        let label_style = if on {
+            Style::new().fg(th.accent).bold()
+        } else {
+            Style::new().fg(th.muted)
+        };
+        let mark = if on { bar(th) } else { " " };
+        let cursor = if on { "_" } else { "" };
+        match fl.kind {
+            Kind::Toggle => {
+                let b = if fl.on { "[x]" } else { "[ ]" };
+                lines.push(Line::from(vec![
+                    Span::styled(mark, Style::new().fg(th.accent)),
+                    Span::styled(format!("{b} {}", show(&fl.label)), label_style),
+                    Span::styled(hint(fl), Style::new().fg(th.muted)),
+                ]));
+            }
+            Kind::Pick => lines.push(Line::from(vec![
+                Span::styled(mark, Style::new().fg(th.accent)),
+                Span::styled(format!("{}: ", show(&fl.label)), label_style),
+                Span::styled(hint(fl), Style::new().fg(th.muted)),
+                Span::raw(if fl.hint.is_empty() { "" } else { " " }),
+                Span::styled(
+                    format!(
+                        "< {} >",
+                        show(fl.options.get(fl.idx).map_or("", String::as_str))
+                    ),
+                    Style::new().bold(),
+                ),
+            ])),
+            Kind::Line | Kind::Text => {
+                lines.push(Line::from(vec![
+                    Span::styled(mark, Style::new().fg(th.accent)),
+                    Span::styled(show(&fl.label), label_style),
+                    Span::styled(hint(fl), Style::new().fg(th.muted)),
+                ]));
+                let text = show(&format!("{}{cursor}", fl.text));
+                let rows: Vec<String> = wrap(&text, inner_w);
+                let keep = if fl.kind == Kind::Text { 6 } else { 1 };
+                let from = rows.len().saturating_sub(keep);
+                for r in &rows[from..] {
+                    lines.push(Line::from(vec![
+                        Span::styled(mark, Style::new().fg(th.accent)),
+                        Span::raw(format!(" {r}")),
+                    ]));
+                }
+            }
+        }
+    }
+    if let Some(e) = &form.error {
+        lines.push(Line::raw(""));
+        for r in wrap(&show(e), inner_w) {
+            lines.push(Line::styled(
+                format!(" {} {r}", th.ic.fail),
+                Style::new().fg(th.err),
+            ));
+        }
+    }
+    let max_h = f.area().height.saturating_sub(2) as usize;
+    let h = (lines.len() + 3).min(max_h).max(5) as u16;
+    let area = popup(f, app, w, h, &form.title);
+    let body_h = area.height.saturating_sub(1) as usize;
+    let scroll = (focus_at + 1).saturating_sub(body_h);
+    let [body, foot] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+    f.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), body);
+    let (hint, style) = if form.discarding {
+        ("Discard this form? y/n", Style::new().fg(th.err).bold())
+    } else {
+        let long =
+            "Tab/Shift-Tab field  Space toggle  Left/Right pick  Ctrl-S review command  Esc cancel";
+        let hint = [
+            long,
+            "Tab field  Ctrl-S review command  Esc cancel",
+            "Tab next  ^S review  Esc cancel",
+        ]
+        .into_iter()
+        .find(|h| h.len() <= foot.width as usize)
+        .unwrap_or("^S review  Esc cancel");
+        (hint, Style::new().fg(th.muted))
+    };
+    f.render_widget(Paragraph::new(Span::styled(hint, style)), foot);
 }
 
 #[cfg(test)]
@@ -2101,6 +2234,7 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
                         sha: "abc".into(),
                         files,
                         threads,
+                        ..Default::default()
                     }),
                 ),
                 (Tab::Checks, Data::Checks(checks)),
@@ -2627,6 +2761,7 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
                         sha: "x".into(),
                         files,
                         threads: Default::default(),
+                        ..Default::default()
                     }),
                 )],
             );
@@ -2867,11 +3002,235 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
                     sha: "x".into(),
                     files,
                     threads: Default::default(),
+                    ..Default::default()
                 }),
             )],
         );
         let s = render_app(&a, 120, 40);
         assert!(s.contains("[3] Files (252)") && !s.contains("252+"), "{s}");
+    }
+
+    fn type_str(a: &mut App, s: &str) {
+        for c in s.chars() {
+            key(a, KeyCode::Char(c));
+        }
+    }
+
+    fn ctrl_s(a: &mut App) {
+        a.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    }
+
+    fn form_mut(a: &mut App) -> &mut crate::form::Form {
+        match &mut a.modal {
+            Some(Modal::Form(f)) => f,
+            _ => panic!("no form open"),
+        }
+    }
+
+    #[test]
+    fn new_issue_form_validates_then_confirms_the_exact_command() {
+        for (w, h) in [(80, 24), (120, 40)] {
+            let mut a = seeded();
+            key(&mut a, KeyCode::Char('4')); // Issues panel
+            key(&mut a, KeyCode::Char('n'));
+            let s = render_app(&a, w, h);
+            for want in [
+                "New issue",
+                "Title",
+                "Body",
+                "Labels",
+                "Assignees",
+                "Ctrl-S review",
+            ] {
+                assert!(s.contains(want), "{w}x{h} missing {want:?}\n{s}");
+            }
+            ctrl_s(&mut a); // empty title
+            assert!(
+                render_app(&a, w, h).contains("Title is required"),
+                "{w}x{h}"
+            );
+            form_mut(&mut a).set_labels(vec!["bug".into(), "docs".into()]);
+            type_str(&mut a, "Crash on start");
+            key(&mut a, KeyCode::Tab); // body
+            type_str(&mut a, "steps");
+            key(&mut a, KeyCode::Tab); // labels
+            type_str(&mut a, "nope");
+            ctrl_s(&mut a);
+            let s = render_app(&a, w, h);
+            assert!(
+                s.contains("Unknown label 'nope'") && s.contains("bug, docs"),
+                "{w}x{h}\n{s}"
+            );
+            for _ in 0..4 {
+                key(&mut a, KeyCode::Backspace);
+            }
+            type_str(&mut a, "BUG");
+            ctrl_s(&mut a);
+            let s = render_app(&a, w, h);
+            assert!(
+                s.contains("Run this command?")
+                    && s.contains(
+                        "gh issue create -R o/r --title 'Crash on start' --body steps --label bug"
+                    ),
+                "{w}x{h}\n{s}"
+            );
+            key(&mut a, KeyCode::Enter); // Enter must not run it
+            assert!(render_app(&a, w, h).contains("Run this command?"));
+            key(&mut a, KeyCode::Esc);
+            assert!(
+                render_app(&a, w, h).contains("New issue") && !a.status.contains("running"),
+                "cancelling the confirm goes back to the form, nothing ran"
+            );
+            key(&mut a, KeyCode::Esc);
+            assert!(render_app(&a, w, h).contains("Discard this form? y/n"));
+            key(&mut a, KeyCode::Char('y'));
+            assert!(a.modal.is_none());
+        }
+    }
+
+    #[test]
+    fn new_pr_form_from_a_branch_warns_when_it_is_not_pushed() {
+        let mut a = seeded();
+        let i = a.panel_idx_for_test(crate::app::PK::Branches);
+        a.panels[i].items = vec![Item {
+            title: "feat/x".into(),
+            cmd: "feat/x".into(),
+            repo: "o/r".into(),
+            kind: Kind::Branch,
+            ..Default::default()
+        }];
+        key(&mut a, KeyCode::Char('6')); // Branches
+        key(&mut a, KeyCode::Char('x'));
+        let menu = render_app(&a, 120, 40);
+        assert!(menu.contains("Create pull request..."), "{menu}");
+        key(&mut a, KeyCode::Char('j'));
+        key(&mut a, KeyCode::Enter);
+        let s = render_app(&a, 120, 40);
+        assert!(
+            s.contains("New pull request from feat/x")
+                && s.contains("Base branch")
+                && s.contains("Open as draft"),
+            "{s}"
+        );
+        form_mut(&mut a).set_pr_data("main", vec!["dev".into()], Some(false), None);
+        type_str(&mut a, "Add x");
+        let s = render_app(&a, 120, 40);
+        assert!(
+            s.contains("not found on o/r") && s.contains("git push -u origin feat/x"),
+            "pushing is the user's job\n{s}"
+        );
+        ctrl_s(&mut a);
+        let s = render_app(&a, 120, 40);
+        assert!(s.contains("gh pr create"), "a warning, not a block\n{s}");
+        key(&mut a, KeyCode::Char('n'));
+        let s = render_app(&a, 120, 40);
+        assert!(
+            s.contains("New pull request from feat/x") && s.contains("Add x"),
+            "cancelling the confirm reopens the form with its text\n{s}"
+        );
+        form_mut(&mut a).set_pr_data(
+            "main",
+            vec!["dev".into()],
+            Some(true),
+            Some("## Summary\n".into()),
+        );
+        ctrl_s(&mut a);
+        let s = render_app(&a, 120, 40);
+        assert!(
+            s.contains("gh pr create -R o/r --head feat/x --base main --title 'Add x' --body"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn new_pr_needs_a_local_clone_for_the_current_branch() {
+        let mut a = seeded(); // PR panel focus, cwd is not a clone in tests
+        key(&mut a, KeyCode::Char('n'));
+        assert!(
+            a.modal.is_none() && a.status.contains("not a clone"),
+            "{}",
+            a.status
+        );
+    }
+
+    #[test]
+    fn run_workflow_form_from_the_workflows_tab() {
+        for (w, h) in [(80, 24), (120, 40)] {
+            let mut a = seeded();
+            let i = a.panel_idx_for_test(crate::app::PK::Actions);
+            a.panels[i].tab = 1;
+            let wf = |n: u64, name: &str, state: &str| Item {
+                number: n,
+                title: name.into(),
+                state: state.into(),
+                cmd: format!(".github/workflows/{name}.yml"),
+                repo: "o/r".into(),
+                kind: Kind::Workflow,
+                ..Default::default()
+            };
+            a.panels[i].items = vec![
+                wf(4242, "Deploy", "active"),
+                wf(7, "Old", "disabled_manually"),
+            ];
+            key(&mut a, KeyCode::Char('5')); // Actions
+            key(&mut a, KeyCode::Char('d'));
+            let s = render_app(&a, w, h);
+            assert!(
+                s.contains("Run workflow: Deploy") && s.contains("Branch or tag to run on"),
+                "{w}x{h}\n{s}"
+            );
+            form_mut(&mut a).set_dispatch(
+                "main",
+                vec!["dev".into()],
+                vec![],
+                Some(crate::dispatch::parse(include_str!(
+                    "../tests/workflow_inputs.yml"
+                ))),
+            );
+            let s = render_app(&a, 120, 60);
+            for want in [
+                "message",
+                "(required) What to say",
+                "[x] verbose",
+                "level",
+                "< warn >",
+                "count",
+                "target",
+                "plain",
+            ] {
+                assert!(s.contains(want), "missing {want:?}\n{s}");
+            }
+            ctrl_s(&mut a);
+            assert!(
+                render_app(&a, w, h).contains("'message' is required"),
+                "{w}x{h}"
+            );
+            key(&mut a, KeyCode::Tab); // first input
+            type_str(&mut a, "ship it");
+            ctrl_s(&mut a);
+            let s = render_app(&a, w, h);
+            // (the box wraps the command at 80 columns: compare with borders and line breaks removed)
+            let flat: String = s
+                .chars()
+                .filter(|c| !"\u{2502}\u{256d}\u{256e}\u{2570}\u{256f}".contains(*c))
+                .collect();
+            let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                flat.contains("gh workflow run 4242 -R o/r --ref main -f 'message=ship it' -f verbose=true -f level=warn -f count=3"),
+                "{w}x{h}\n{s}"
+            );
+            key(&mut a, KeyCode::Esc);
+            assert!(render_app(&a, w, h).contains("Run workflow: Deploy"));
+            key(&mut a, KeyCode::Esc);
+            if a.modal.is_some() {
+                key(&mut a, KeyCode::Char('y'));
+            }
+            assert!(a.modal.is_none());
+            // a disabled workflow offers no run
+            key(&mut a, KeyCode::Char('j'));
+            key(&mut a, KeyCode::Char('d'));
+            assert!(a.modal.is_none());
+        }
     }
 
     #[test]
@@ -2937,6 +3296,7 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
                     sha: "x".into(),
                     files,
                     threads: Default::default(),
+                    ..Default::default()
                 }),
             )],
         );
@@ -2959,5 +3319,92 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
                 t.elapsed() / 10
             );
         }
+    }
+
+    #[test]
+    fn form_neutralizes_yaml_names_and_fits_the_minimum_size() {
+        let mut a = seeded();
+        let mut f = crate::form::Form::dispatch("o/r", "1", "CI");
+        let y = "on:\n  workflow_dispatch:\n    inputs:\n      \"ev\u{202e}il\":\n        required: true\n";
+        f.set_dispatch("main", vec![], vec![], Some(crate::dispatch::parse(y)));
+        a.modal = Some(crate::app::Modal::Form(Box::new(f)));
+        let s = render_app(&a, 50, 14);
+        assert!(s.contains("ev<U+202E>il") && !s.contains('\u{202e}'), "{s}");
+        assert!(
+            s.contains("Esc cancel"),
+            "footer fits the minimum width\n{s}"
+        );
+        ctrl_s(&mut a);
+        let s = render_app(&a, 50, 14);
+        assert!(
+            !s.contains('\u{202e}'),
+            "error text is neutralized too\n{s}"
+        );
+    }
+
+    fn long_confirm() -> App {
+        let mut a = seeded();
+        let mut c = crate::app::Confirm::new_for_test(
+            [
+                "gh",
+                "pr",
+                "create",
+                "--body",
+                &"line of the body\n".repeat(60),
+                "--reviewer",
+                "rev1",
+            ]
+            .map(String::from)
+            .to_vec(),
+        );
+        c.scroll = 0;
+        a.modal = Some(crate::app::Modal::Confirm(c));
+        a
+    }
+
+    #[test]
+    fn long_confirm_scrolls_to_the_end_and_refuses_y_until_then() {
+        for (w, h) in [(80u16, 24u16), (120, 30)] {
+            let mut a = long_confirm();
+            let s = render_app(&a, w, h);
+            assert!(
+                s.contains("more (command continues") && !s.contains("--reviewer rev1"),
+                "{w}x{h}\n{s}"
+            );
+            key(&mut a, KeyCode::Char('y'));
+            assert!(
+                a.modal.is_some() && a.status.contains("scroll to the end"),
+                "y refused"
+            );
+            key(&mut a, KeyCode::PageDown);
+            assert!(
+                render_app(&a, w, h).contains("more"),
+                "PgDn moves a page, not to the end"
+            );
+            key(&mut a, KeyCode::Char('G'));
+            let s = render_app(&a, w, h);
+            assert!(
+                s.contains("--reviewer rev1") && s.contains("end of command"),
+                "{w}x{h}\n{s}"
+            );
+            key(&mut a, KeyCode::Home);
+            assert!(render_app(&a, w, h).contains("more"));
+            key(&mut a, KeyCode::End);
+            render_app(&a, w, h);
+            key(&mut a, KeyCode::Esc);
+            assert!(a.modal.is_none());
+        }
+    }
+
+    #[test]
+    fn ascii_focus_bar_and_choice_spacing() {
+        let mut a = App::with("o/r".into(), Theme::new(false, IconSet::Ascii, true), false);
+        let mut f = crate::form::Form::dispatch("o/r", "1", "CI");
+        let y = "on:\n  workflow_dispatch:\n    inputs:\n      test:\n        description: which\n        type: choice\n        options: [all, fast]\n";
+        f.set_dispatch("main", vec![], vec![], Some(crate::dispatch::parse(y)));
+        a.modal = Some(crate::app::Modal::Form(Box::new(f)));
+        let s = render_app(&a, 100, 20);
+        assert!(!s.contains('\u{258e}') && s.contains('|'), "{s}");
+        assert!(s.contains("test:   which < all >"), "{s}");
     }
 }

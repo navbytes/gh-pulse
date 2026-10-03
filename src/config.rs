@@ -11,6 +11,9 @@ pub struct Config {
     pub theme: Option<String>,
     pub ascii: bool,
     pub nerd: bool,
+    /// Also mark files viewed on GitHub when you press `v` (and read GitHub's marks). Opting in is the
+    /// consent for that write, so there is no extra confirm.
+    pub sync_viewed: bool,
     pub repos: ReposCfg,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub keys: BTreeMap<String, Keys>,
@@ -364,6 +367,8 @@ mod tests {
         .unwrap();
         assert_eq!(c.theme.as_deref(), Some("light"));
         assert!(c.ascii && !c.nerd);
+        assert!(!c.sync_viewed, "opt-in, off by default");
+        assert!(parse("sync_viewed = true\n", "t").unwrap().sync_viewed);
         assert!(c.repos.is_fav("O/A") && c.repos.is_hidden("o/b"));
         assert_eq!(c.keys.len(), 2);
     }

@@ -64,6 +64,19 @@ Right pane: Files shows the diff of the selected file, Commits the diff of the s
 | `Enter` | On the Checks tab: show the check's failed-step log (`Esc`, `q`, `h` close it). On Comments: expand / collapse the selected comment (long comments, `<details>` blocks). In the drill-in Comments panel it works straight from the list |
 | `h` / `Left` / `Esc` | Back to the list |
 
+## Creating things
+
+| Key | Action |
+|---|---|
+| `n` | In the Issues panel: new issue. In the Pull requests panel: new PR from the branch checked out in the current directory (if it is a clone of the repo) |
+| `d` | In the Actions panel on an active workflow: run it (`workflow_dispatch`) |
+| `x` | The menu has the same entries: "New issue...", "New pull request from the current branch...", "Run workflow...", and on a branch "Create pull request..." |
+
+Forms: `Tab` / `Shift-Tab` (or `Up` / `Down` on one-line fields) move between fields, `Enter` adds a newline in a Body and
+moves on in a one-line field, `Space` toggles, `Left` / `Right` change a picker (template, base branch, ref, choice
+input), `Ctrl-S` validates and shows the exact `gh ...` command in the usual confirm popup (only `y` runs it), `Esc`
+cancels. Nothing is created without that confirm.
+
 ## Comments (Comments tab, issue Comments, drill-in Comments)
 
 | Key | Action |
@@ -83,7 +96,7 @@ Right pane: Files shows the diff of the selected file, Commits the diff of the s
 | `j` `k`, `Ctrl-d` `Ctrl-u`, `g` `G` | Move the line cursor / half page / first and last row (the cursor line is what inline comments attach to) |
 | `t` | Cycle layout: auto, unified, split. Auto goes side-by-side when each half has at least 60 columns |
 | `w` | Toggle soft-wrap / clip |
-| `v` | Mark the file viewed (saved to `$XDG_STATE_HOME/gh-pulse/viewed.json`, per PR head commit; PR files only) |
+| `v` | Mark the file viewed (saved to `$XDG_STATE_HOME/gh-pulse/viewed.json`, per PR head commit; PR files only; also on GitHub with `sync_viewed = true`) |
 | `f` | Zoom |
 | `x` | Menu, including "Comment on file:line" for the cursor line |
 
@@ -93,7 +106,8 @@ Right pane: Files shows the diff of the selected file, Commits the diff of the s
 |---|---|
 | Action menu | `j` `k` / arrows move, `Enter` picks, `Esc` / `q` cancels |
 | Text input | typing, `Enter` newline, `Backspace`, `Ctrl-S` continue, `Esc` cancel |
-| Confirm | `y` runs the command; `n` / `Esc` cancels; `j` `k` scroll if the command is taller than the screen. `Enter` does nothing on purpose |
+| Form | `Tab` / `Shift-Tab` fields, `Ctrl-S` review command, `Esc` cancel (asks `y/n` once you typed something); bracketed paste inserts literally (newlines only in the body) |
+| Confirm | `y` runs the command; `n` / `Esc` cancels (a form-originated command goes back to its form); if the command is taller than the screen it scrolls (`j` `k` `PgUp` `PgDn` `Home` `End`/`G`) and `y` is refused until the end has been shown. `Enter` does nothing on purpose |
 | Filter prompt | typing, `Backspace`, `Enter` applies, `Esc` clears |
 
 ## Repo browser (`B` / `Ctrl-r`)

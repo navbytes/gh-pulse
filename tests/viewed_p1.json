@@ -1,0 +1,4 @@
+{"data":{"repository":{"pullRequest":{"id":"PR_kwDOexample1","files":{"pageInfo":{"hasNextPage":true,"endCursor":"F1"},"nodes":[
+{"path":"src/a.rs","viewerViewedState":"VIEWED"},
+{"path":"src/b.rs","viewerViewedState":"UNVIEWED"},
+{"path":"docs/c.md","viewerViewedState":"DISMISSED"}]}}}}}

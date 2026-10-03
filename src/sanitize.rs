@@ -21,7 +21,11 @@ fn selector(c: char) -> bool {
     matches!(c, '\u{FE0E}' | '\u{FE0F}')
 }
 
+/// CRLF and lone CR become `\n` first (GitHub web-written bodies use CRLF), then the rest is neutralized.
 pub fn clean(s: &str) -> Cow<'_, str> {
+    if s.contains('\r') {
+        return Cow::Owned(clean(&s.replace("\r\n", "\n").replace('\r', "\n")).into_owned());
+    }
     if !s
         .chars()
         .any(|c| risky(c) || selector(c) || c == '\u{200D}')
@@ -61,6 +65,12 @@ pub fn clean_in_place(s: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_endings_are_normalized_but_escapes_stay_visible() {
+        assert_eq!(clean("a\r\nb\rc\n"), "a\nb\nc\n");
+        assert_eq!(clean("a\r\n\u{1b}[2J"), "a\n<U+001B>[2J");
+    }
 
     #[test]
     fn neutralizes_bidi_zero_width_and_escapes() {

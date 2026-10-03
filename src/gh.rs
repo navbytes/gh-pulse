@@ -30,7 +30,8 @@ pub fn shell(args: &[String]) -> String {
     let q = |a: &String| {
         let safe = |c: char| c.is_ascii_alphanumeric() || "_-./:=@,+%".contains(c);
         if a.is_empty() || !a.chars().all(safe) {
-            format!("'{}'", a.replace('\'', "'\\''").replace('\n', "\\n"))
+            // real newlines inside single quotes are valid sh, so the line pastes back exactly
+            format!("'{}'", a.replace('\'', "'\\''"))
         } else {
             a.clone()
         }
@@ -40,6 +41,88 @@ pub fn shell(args: &[String]) -> String {
 }
 
 pub const LIMIT: usize = 100;
+
+static SYNC_VIEWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set once at startup from `sync_viewed` in the config.
+pub fn set_sync_viewed(on: bool) {
+    SYNC_VIEWED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn sync_viewed() -> bool {
+    SYNC_VIEWED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+const VIEWED_Q: &str = "query($o:String!,$n:String!,$p:Int!,$a:String){repository(owner:$o,name:$n){pullRequest(number:$p){id files(first:100,after:$a){pageInfo{hasNextPage endCursor} nodes{path viewerViewedState}}}}}";
+const MARK_Q: &str = "mutation($id:ID!,$path:String!){markFileAsViewed(input:{pullRequestId:$id,path:$path}){clientMutationId}}";
+const UNMARK_Q: &str = "mutation($id:ID!,$path:String!){unmarkFileAsViewed(input:{pullRequestId:$id,path:$path}){clientMutationId}}";
+
+/// (PR node id, paths GitHub has as VIEWED, next cursor) from one page of `pullRequest.files`.
+pub fn parse_viewed_page(graphql: &str) -> Result<(String, Vec<String>, Option<String>), String> {
+    let v: Value = json(graphql)?;
+    if let Some(e) = v["errors"][0]["message"].as_str() {
+        return Err(e.to_string());
+    }
+    let pr = &v["data"]["repository"]["pullRequest"];
+    let viewed = pr["files"]["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| f["viewerViewedState"] == "VIEWED")
+        .filter_map(|f| f["path"].as_str().map(str::to_string))
+        .collect();
+    Ok((
+        pr["id"].as_str().unwrap_or("").to_string(),
+        viewed,
+        next_cursor(&pr["files"]),
+    ))
+}
+
+/// The PR's node id and the files GitHub has marked viewed (up to 3000 files).
+fn fetch_viewed(repo: &str, n: &str) -> Result<(String, Vec<String>), String> {
+    let (owner, name) = repo.split_once('/').ok_or("bad repo")?;
+    let (mut id, mut all, mut after) = (String::new(), vec![], None::<String>);
+    for _ in 0..30 {
+        let mut a = vec![
+            "api".to_string(),
+            "graphql".into(),
+            "-f".into(),
+            format!("query={VIEWED_Q}"),
+            "-f".into(),
+            format!("o={owner}"),
+            "-f".into(),
+            format!("n={name}"),
+            "-F".into(),
+            format!("p={n}"),
+        ];
+        if let Some(c) = &after {
+            a.extend(["-f".to_string(), format!("a={c}")]);
+        }
+        let (pid, viewed, next) = parse_viewed_page(&gh(a)?)?;
+        (id, all) = (pid, [all, viewed].concat());
+        match next {
+            Some(c) => after = Some(c),
+            None => break,
+        }
+    }
+    Ok((id, all))
+}
+
+/// The mutation as argv. Values travel as GraphQL variables (`-f`), never spliced into the query.
+pub fn viewed_mutation(pr_id: &str, path: &str, viewed: bool) -> Vec<String> {
+    let q = if viewed { MARK_Q } else { UNMARK_Q };
+    ["gh", "api", "graphql", "-f"]
+        .map(String::from)
+        .into_iter()
+        .chain([
+            format!("query={q}"),
+            "-f".into(),
+            format!("id={pr_id}"),
+            "-f".into(),
+            format!("path={path}"),
+        ])
+        .collect()
+}
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -233,6 +316,7 @@ struct Workflow {
     id: u64,
     name: String,
     state: String,
+    path: String,
 }
 
 const PR_FIELDS: &str = "number,title,url,state,isDraft,author,labels,body";
@@ -444,13 +528,21 @@ fn list_raw(repo: &str, global: bool, panel: usize, tab: usize) -> Result<Vec<It
                 .collect())
         }
         3 => {
-            let out = gh(["workflow", "list", "-R", repo, "--json", "id,name,state"])?;
+            let out = gh([
+                "workflow",
+                "list",
+                "-R",
+                repo,
+                "--json",
+                "id,name,state,path",
+            ])?;
             Ok(json::<Vec<Workflow>>(&out)?
                 .into_iter()
                 .map(|w| Item {
                     number: w.id,
                     title: w.name,
                     state: w.state,
+                    cmd: w.path, // .github/workflows/x.yml, to read its dispatch inputs
                     url: format!("https://github.com/{repo}/actions"),
                     repo: repo.into(),
                     kind: Kind::Workflow,
@@ -578,12 +670,18 @@ pub struct Entry {
     pub card: Card,
 }
 
+#[derive(Default)]
 pub struct FilesData {
     /// Head sha; anchors inline comments.
     pub sha: String,
     pub files: Vec<diff::File>,
     /// Review threads per path.
     pub threads: std::collections::HashMap<String, u32>,
+    /// With `sync_viewed`: the PR's GraphQL node id, the key of its local viewed marks, and the paths
+    /// GitHub already has marked viewed for you.
+    pub pr_id: String,
+    pub viewed_key: String,
+    pub gh_viewed: Vec<String>,
 }
 
 pub enum Data {
@@ -1292,10 +1390,19 @@ fn detail_raw(repo: &str, it: &Item, tab: Tab) -> Result<Data, String> {
             for t in threads(repo, &n).unwrap_or_default() {
                 *counts.entry(t.path).or_insert(0u32) += 1;
             }
+            // opted-in: also learn the PR node id and what GitHub has marked viewed (best effort)
+            let (pr_id, gh_viewed) = if sync_viewed() {
+                fetch_viewed(repo, &n).unwrap_or_default()
+            } else {
+                Default::default()
+            };
             Ok(Data::Files(FilesData {
                 sha: sha.trim().into(),
                 files: diff::parse(&d),
                 threads: counts,
+                pr_id,
+                viewed_key: crate::state::Viewed::key(repo, it.number),
+                gh_viewed,
             }))
         }
         (Kind::Check, Tab::Logs) => {
@@ -1387,6 +1494,7 @@ fn detail_raw(repo: &str, it: &Item, tab: Tab) -> Result<Data, String> {
                 sha: sha.to_string(),
                 files: diff::parse(&diff),
                 threads: Default::default(),
+                ..Default::default()
             }))
         }
         (Kind::Branch, Tab::Commits) => {
@@ -1629,14 +1737,31 @@ fn status(repo: &str) -> Result<String, String> {
 }
 
 /// Runs a full command line (program first), as built by an Action.
-pub fn run(cmd: &[String]) -> Result<String, String> {
+/// Like `run`, optionally piping `stdin` to the command (large bodies via `--body-file -`).
+pub fn run_with(cmd: &[String], stdin: Option<&str>) -> Result<String, String> {
+    use std::io::Write;
+    use std::process::Stdio;
     let Some((prog, args)) = cmd.split_first() else {
         return Err("empty command".into());
     };
     log_cmd(prog, args);
-    let o = Command::new(prog)
+    let mut child = Command::new(prog)
         .args(args)
-        .output()
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run {prog}: {e}"))?;
+    if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        // the child reads it all before answering; a broken pipe just means it failed early
+        let _ = pipe.write_all(text.as_bytes());
+    }
+    let o = child
+        .wait_with_output()
         .map_err(|e| format!("cannot run {prog}: {e}"))?;
     let (out, err) = (
         String::from_utf8_lossy(&o.stdout),
@@ -1648,6 +1773,166 @@ pub fn run(cmd: &[String]) -> Result<String, String> {
         push_log(format!("  error: {}", err.lines().next().unwrap_or("")));
         Err(err.trim().to_string())
     }
+}
+
+/// Everything the create-issue / create-PR / run-workflow forms look up in the background (each part
+/// optional). Names and bodies are the real ones, because they end up in the command; the popups
+/// neutralize them for display only.
+#[derive(Default)]
+pub struct FormData {
+    pub labels: Vec<String>,
+    pub templates: Vec<(String, String)>,
+    pub default_branch: String,
+    pub branches: Vec<String>,
+    pub tags: Vec<String>,
+    pub head_pushed: Option<bool>,
+    pub pr_template: Option<String>,
+    /// The workflow's dispatch inputs, parsed here in the background thread (None: file not fetched).
+    pub dispatch: Option<Result<Option<Vec<crate::dispatch::InputDef>>, String>>,
+}
+
+/// "---\nname: Bug\n---\nbody" -> ("Bug", "body"); no front matter -> (None, whole text).
+pub fn split_front_matter(t: &str) -> (Option<String>, String) {
+    let Some(rest) = t.strip_prefix("---\n") else {
+        return (None, t.to_string());
+    };
+    let Some((head, body)) = rest
+        .split_once("\n---\n")
+        .or_else(|| rest.split_once("\n---\r\n"))
+    else {
+        return (None, t.to_string());
+    };
+    let name = head
+        .lines()
+        .find_map(|l| l.strip_prefix("name:"))
+        .map(|n| n.trim().trim_matches(['"', '\'']).to_string());
+    (
+        name.filter(|n| !n.is_empty()),
+        body.trim_start_matches('\n').to_string(),
+    )
+}
+
+/// (display name, path) of the Markdown files in a contents-API directory listing.
+pub fn parse_template_list(json_text: &str) -> Vec<(String, String)> {
+    let v: Value = serde_json::from_str(json_text).unwrap_or_default();
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| f["type"] == "file")
+        .filter_map(|f| {
+            let (name, path) = (f["name"].as_str()?, f["path"].as_str()?);
+            let stem = name.strip_suffix(".md")?; // YAML issue forms can't prefill a body
+            Some((stem.replace(['_', '-'], " "), path.to_string()))
+        })
+        .collect()
+}
+
+/// A file from the default branch via the contents API. Path segments are percent-encoded and `..` is refused.
+fn raw_file(repo: &str, path: &str) -> Option<String> {
+    if path.split('/').any(|seg| seg == ".." || seg.is_empty()) {
+        return None;
+    }
+    gh([
+        "api",
+        "-H",
+        "Accept: application/vnd.github.raw",
+        &format!("repos/{repo}/contents/{}", crate::act::enc_path(path)),
+    ])
+    .ok()
+}
+
+/// Names, one per line (--paginate output), at most `cap` of them.
+fn name_lines(s: String, cap: usize) -> Vec<String> {
+    s.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .take(cap)
+        .map(String::from)
+        .collect()
+}
+
+fn default_branch(repo: &str) -> String {
+    gh([
+        "repo",
+        "view",
+        repo,
+        "--json",
+        "defaultBranchRef",
+        "-q",
+        ".defaultBranchRef.name",
+    ])
+    .map(|s| s.trim().to_string())
+    .unwrap_or_default()
+}
+
+fn branch_names(repo: &str) -> Vec<String> {
+    let path = format!("repos/{repo}/branches?per_page=100");
+    gh(["api", &path, "--paginate", "--jq", ".[].name"])
+        .map(|s| name_lines(s, 1000))
+        .unwrap_or_default()
+}
+
+/// Best effort: a failed lookup just leaves that part empty. `head` is set for the PR form.
+pub fn form_data(repo: &str, head: Option<&str>, workflow_path: Option<&str>) -> FormData {
+    let mut d = FormData::default();
+    if let Some(path) = workflow_path {
+        d.default_branch = default_branch(repo);
+        d.branches = branch_names(repo);
+        d.tags = gh([
+            "api",
+            &format!("repos/{repo}/tags?per_page=100"),
+            "--jq",
+            ".[].name",
+        ])
+        .map(|s| name_lines(s, 100))
+        .unwrap_or_default();
+        // parsed here, off the UI thread, with the size and alias limits of `dispatch::parse`
+        d.dispatch = raw_file(repo, path).map(|y| crate::dispatch::parse(&y));
+        return d;
+    }
+    d.labels = gh([
+        "label", "list", "-R", repo, "--limit", "300", "--json", "name", "-q", ".[].name",
+    ])
+    .map(|s| name_lines(s, 300))
+    .unwrap_or_default();
+    match head {
+        None => {
+            if let Ok(list) = gh([
+                "api",
+                &format!("repos/{repo}/contents/.github/ISSUE_TEMPLATE"),
+            ]) {
+                for (name, path) in parse_template_list(&list).into_iter().take(10) {
+                    if let Some(text) = raw_file(repo, &path) {
+                        let (fm_name, body) = split_front_matter(&text);
+                        d.templates.push((fm_name.unwrap_or(name), body));
+                    }
+                }
+            }
+        }
+        Some(h) => {
+            d.default_branch = default_branch(repo);
+            d.branches = branch_names(repo);
+            d.head_pushed = match gh([
+                "api",
+                &format!("repos/{repo}/branches/{}", crate::act::enc_path(h)),
+                "--jq",
+                ".name",
+            ]) {
+                Ok(_) => Some(true),
+                Err(e) if e.contains("Not Found") || e.contains("404") => Some(false),
+                Err(_) => None,
+            };
+            d.pr_template = [
+                ".github/pull_request_template.md",
+                ".github/PULL_REQUEST_TEMPLATE.md",
+                "docs/pull_request_template.md",
+                "pull_request_template.md",
+            ]
+            .iter()
+            .find_map(|p| raw_file(repo, p));
+        }
+    }
+    d
 }
 
 /// Canonical owner/name, or an error when the repo doesn't exist or isn't accessible.
@@ -1662,7 +1947,14 @@ pub fn resolve_repo(repo: &str) -> Result<String, String> {
         ".nameWithOwner",
     ])
     .map(|s| s.trim().to_string())
-    .map_err(|_| format!("repo not found or no access: {repo}"))
+    .map_err(|e| resolve_error(repo, &e))
+}
+
+fn resolve_error(repo: &str, stderr: &str) -> String {
+    match rate_limit_secs(stderr) {
+        Some(s) => format!("GitHub rate limit exceeded; retry in ~{s}s"),
+        None => format!("repo not found or no access: {repo}"),
+    }
 }
 
 pub fn repo_here() -> Result<String, String> {
@@ -1704,6 +1996,52 @@ pub fn checkout(repo: &str, n: u64) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shell_line_round_trips_through_sh() {
+        let args: Vec<String> = [
+            "a b",
+            "it's",
+            "two\nlines\n",
+            "back\\slash $HOME `x`",
+            "",
+            "plain",
+        ]
+        .map(String::from)
+        .to_vec();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s\\0' {}", shell(&args)))
+            .output()
+            .unwrap();
+        let got: Vec<&str> = std::str::from_utf8(&out.stdout)
+            .unwrap()
+            .split_terminator('\0')
+            .collect();
+        assert_eq!(got, args);
+    }
+
+    #[test]
+    fn resolve_errors_tell_rate_limits_from_missing_repos() {
+        for e in [
+            "GraphQL: API rate limit already exceeded for user ID 1234.",
+            "HTTP 403: API rate limit exceeded for user ID 1234. (https://api.github.com/x)",
+            "HTTP 403: You have exceeded a secondary rate limit. Retry-After: 45",
+        ] {
+            assert!(
+                resolve_error("o/r", e).starts_with("GitHub rate limit exceeded; retry in ~"),
+                "{e}"
+            );
+        }
+        assert!(resolve_error("o/r", "x Retry-After: 45").contains("~45s"));
+        assert_eq!(
+            resolve_error(
+                "o/r",
+                "GraphQL: Could not resolve to a Repository with the name 'o/r'."
+            ),
+            "repo not found or no access: o/r"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -1986,6 +2324,61 @@ mod tests {
     }
 
     #[test]
+    fn issue_templates_front_matter_and_listing() {
+        let t = "---\nname: \"Bug report\"\nabout: Something broke\nlabels: bug\n---\n### Steps\n1. do\n";
+        let (name, body) = split_front_matter(t);
+        assert_eq!(name.as_deref(), Some("Bug report"));
+        assert_eq!(body, "### Steps\n1. do\n");
+        assert_eq!(
+            split_front_matter("no front matter"),
+            (None, "no front matter".to_string())
+        );
+        let list = r#"[{"name":"bug_report.md","path":".github/ISSUE_TEMPLATE/bug_report.md","type":"file"},
+                       {"name":"config.yml","path":".github/ISSUE_TEMPLATE/config.yml","type":"file"},
+                       {"name":"form.yml","path":".github/ISSUE_TEMPLATE/form.yml","type":"file"},
+                       {"name":"sub","path":".github/ISSUE_TEMPLATE/sub","type":"dir"}]"#;
+        assert_eq!(
+            parse_template_list(list),
+            [(
+                "bug report".to_string(),
+                ".github/ISSUE_TEMPLATE/bug_report.md".to_string()
+            )],
+            "only Markdown templates can prefill a body"
+        );
+        assert!(parse_template_list("not json").is_empty());
+    }
+
+    #[test]
+    fn github_viewed_state_pages_and_the_mutation_uses_variables() {
+        let (id, viewed, next) =
+            parse_viewed_page(include_str!("../tests/viewed_p1.json")).unwrap();
+        assert_eq!(
+            (id.as_str(), viewed.as_slice(), next.as_deref()),
+            (
+                "PR_kwDOexample1",
+                ["src/a.rs".to_string()].as_slice(),
+                Some("F1")
+            )
+        );
+        let (_, viewed, next) = parse_viewed_page(include_str!("../tests/viewed_p2.json")).unwrap();
+        assert_eq!((viewed, next), (vec!["src/d.rs".to_string()], None));
+        assert!(parse_viewed_page(r#"{"errors":[{"message":"nope"}]}"#).is_err());
+        // GraphQL variables only: the path (even a nasty one) never touches the query text
+        let nasty = "dir/\"quote\" $x.rs";
+        let m = viewed_mutation("PR_1", nasty, true);
+        assert_eq!(&m[..4], ["gh", "api", "graphql", "-f"]);
+        assert!(
+            m[4].starts_with("query=mutation")
+                && m[4].contains("markFileAsViewed")
+                && !m[4].contains("quote"),
+            "{}",
+            m[4]
+        );
+        assert_eq!(&m[5..], ["-f", "id=PR_1", "-f", &format!("path={nasty}")]);
+        assert!(viewed_mutation("PR_1", "a", false)[4].contains("unmarkFileAsViewed"));
+    }
+
+    #[test]
     fn issue_comments_query_pages_only_comments() {
         let q = comments_query(false, Some("comments"));
         assert!(
@@ -2069,7 +2462,7 @@ mod tests {
         assert_eq!(run_ids("https://x/actions/runs/1a/job/2"), None);
         assert_eq!(run_ids("https://x/actions/runs/1/job/--x"), None);
         let q = |a: &[&str]| shell(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        assert_eq!(q(&["gh", "-b", "a;b `c` *\n#"]), "gh -b 'a;b `c` *\\n#'");
+        assert_eq!(q(&["gh", "-b", "a;b `c` *\n#"]), "gh -b 'a;b `c` *\n#'");
     }
 
     /// Live: a >300-file PR (gh pr diff refuses) must still produce a diff via the files API.

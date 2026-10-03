@@ -3,6 +3,8 @@ mod app;
 mod browse;
 mod config;
 mod diff;
+mod dispatch;
+mod form;
 mod gh;
 mod md;
 mod sanitize;
@@ -12,7 +14,8 @@ mod theme;
 mod ui;
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyEventKind, MouseEventKind,
 };
 use std::io::IsTerminal;
 use std::time::Duration;
@@ -24,7 +27,11 @@ struct MouseGuard;
 
 impl Drop for MouseGuard {
     fn drop(&mut self) {
-        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
     }
 }
 
@@ -82,12 +89,16 @@ fn main() -> std::io::Result<()> {
     // Mouse capture must be undone on panic too, or the shell keeps receiving click escape codes.
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |i| {
-        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
         prev(i);
     }));
     // ratatui::run installs a panic hook and restores the terminal on every exit path.
     ratatui::run(|term| {
-        crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
+        crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
         let _guard = MouseGuard;
         let mut app = app::App::from_config(repo, theme, cfg, keys);
         loop {
@@ -104,6 +115,7 @@ fn main() -> std::io::Result<()> {
                     }
                 }
                 Event::Mouse(m) if !matches!(m.kind, MouseEventKind::Moved) => app.on_mouse(m),
+                Event::Paste(t) => app.on_paste(&t),
                 _ => {} // Resize: the next draw re-lays-out from the new size
             }
         }

@@ -17,6 +17,7 @@ gh-pulse reads an optional `config.toml` from `$XDG_CONFIG_HOME/gh-pulse/` (defa
 theme = "dark"      # "dark" or "light"
 ascii = false       # ASCII icons and borders
 nerd = false        # Nerd Font icons
+sync_viewed = false # also mark files viewed on GitHub with `v` (see below)
 
 [repos]
 favorites = ["octocat/hello-world"]
@@ -26,6 +27,15 @@ hidden = ["octocat/old-experiments"]
 quit = ["q", "ctrl-q"]
 actions = "space"
 ```
+
+## Syncing viewed marks with GitHub
+
+`v` always remembers viewed files locally (`$XDG_STATE_HOME/gh-pulse/viewed.json`). With `sync_viewed = true` it also
+tells GitHub, through the `markFileAsViewed` / `unmarkFileAsViewed` GraphQL mutations (PR id and path travel as
+GraphQL variables), and when you open a PR's files, the files GitHub already has marked viewed are added to your local
+marks. This is a write to GitHub, so it is **off by default and setting it to true is the consent**: there is no
+confirm popup per keypress. The calls show up in the command log (`L`). If one fails, the local mark is kept and the
+status line says so. Local marks are never removed because of GitHub's state.
 
 ## Key remapping
 

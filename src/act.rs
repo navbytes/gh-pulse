@@ -10,6 +10,29 @@ pub struct Action {
     pub build: Build,
     /// Repo the cwd must be a clone of (checked when the command runs).
     pub local_of: Option<String>,
+    /// Opens a form instead of running `build`.
+    pub form: Option<FormKind>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FormKind {
+    Issue,
+    /// New PR from this (raw) branch name.
+    Pr(String),
+    /// New PR from the branch checked out in the current directory.
+    PrCwd,
+    /// Run this workflow: (numeric id, display name, file path).
+    Dispatch(String, String, String),
+}
+
+fn form_act(label: &str, kind: FormKind) -> Action {
+    Action {
+        label: label.into(),
+        prompt: None,
+        build: Box::new(|_| vec![]),
+        local_of: None,
+        form: Some(kind),
+    }
 }
 
 /// What the detail pane has selected, for tab-specific actions.
@@ -36,6 +59,7 @@ fn act(
         prompt,
         build: Box::new(build),
         local_of: None,
+        form: None,
     }
 }
 
@@ -66,14 +90,11 @@ const UNRESOLVE: &str = "mutation($t:ID!){unresolveReviewThread(input:{threadId:
 pub fn actions(it: Option<&Item>, panel: usize, repo: &str, sel: &Sel) -> Vec<Action> {
     let mut v = vec![];
     match panel {
-        2 => {
-            let r = repo.to_string();
-            v.push(act(
-                "New issue",
-                Some(("New issue title", true)),
-                move |t| cmd!["gh", "issue", "create", "-R", &r, "-t", t, "-b", ""],
-            ));
-        }
+        1 => v.push(form_act(
+            "New pull request from the current branch...",
+            FormKind::PrCwd,
+        )),
+        2 => v.push(form_act("New issue...", FormKind::Issue)),
         5 => {
             let r = repo.to_string();
             v.push(act(
@@ -265,6 +286,10 @@ pub fn actions(it: Option<&Item>, panel: usize, repo: &str, sel: &Sel) -> Vec<Ac
             v.push(edit("issue", "Remove label", "--remove-label", &r, &n));
             v.push(edit("issue", "Add assignee", "--add-assignee", &r, &n));
         }
+        Kind::Workflow if it.state == "active" => v.push(form_act(
+            "Run workflow...",
+            FormKind::Dispatch(it.number.to_string(), it.title.clone(), it.cmd.clone()),
+        )),
         Kind::Run => {
             let live = matches!(
                 it.state.as_str(),
@@ -299,10 +324,10 @@ pub fn actions(it: Option<&Item>, panel: usize, repo: &str, sel: &Sel) -> Vec<Ac
             sw.local_of = Some(r.clone());
             v.push(sw);
             if it.number == 0 {
-                let (r1, name1) = (r.clone(), name.clone());
-                v.push(act("Create PR from branch (--fill)", None, move |_| {
-                    cmd!["gh", "pr", "create", "-R", &r1, "--head", &name1, "--fill"]
-                }));
+                v.push(form_act(
+                    "Create pull request...",
+                    FormKind::Pr(name.clone()),
+                ));
             }
             v.push(act("Delete remote branch", None, move |_| {
                 cmd![

@@ -19,6 +19,8 @@ gh-pulse is a single binary: a synchronous ratatui event loop that talks to GitH
 | `src/md.rs` | Markdown to styled, wrapped lines (pulldown-cmark): headings, code, quotes, lists, tables, folding of `<details>` and long comments |
 | `src/sanitize.rs` | Makes bidi/zero-width/control characters visible (`<U+202E>`) in everything GitHub-sourced and in confirm-popup commands |
 | `src/state.rs` | Persistent viewed marks (`viewed.json`), keyed by repo + PR + head sha |
+| `src/form.rs` | Multi-field popups (new issue, new PR, run workflow): editing, validation, and building the exact argv (+ optional stdin) |
+| `src/dispatch.rs` | Reads `workflow_dispatch.inputs` from a workflow's YAML (`serde_yaml_ng`); refuses files over 256 KB or with more than 20 aliases (the form then falls back to `key=value`), and runs in the fetch thread |
 | `src/theme.rs` | Palettes, icon sets, color depth fallback, locale/truecolor detection |
 
 ## Data flow
@@ -48,6 +50,14 @@ loaded end, or on `m`. Every message carries the cursors still to fetch, so load
 (GraphQL "rate limit", HTTP 403, secondary limit, or a later page suddenly "not found") shows "GitHub rate limit - retry
 in Ns" and is never retried automatically. The tab shows "loading more... (n/total)", the drill-in list ends with an
 "N more" row, and a failed page says why (`m` retries).
+
+## Forms
+
+A form never runs anything. `Form::build` validates and returns the argv (and, for bodies over 60 KB, a stdin
+payload for `--body-file -`); the app puts that into the normal confirm popup. Labels, templates, branches and the
+workflow YAML are fetched in the background after the form opens (`gh::form_data`), so validation against the repo's
+labels starts once they arrive. Typed text reaches `gh` untouched; the popups show it neutralized like everything else.
+After a confirmed create, the new item's number (the URL's last segment) is selected once the lists reload.
 
 ## Hardening
 
