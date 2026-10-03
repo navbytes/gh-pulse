@@ -10,7 +10,7 @@ Press `?` in the app for the same list. Keys are checked against `src/app.rs` (`
 | `?` | Help popup (sized to its content; `j` `k` scroll when the terminal is short, any other key closes) |
 | `q` | Quit (closes the log view first when one is open) |
 | `Ctrl-C` | Quit, from anywhere including popups |
-| `1`-`7` | Focus panel by number (only as many as are shown; a PR drill-in has 4). Pressing the number of the already focused panel steps to its next list tab |
+| `1`-`7` | Focus panel by number (`1` to the number of panels shown, at most `7`; `Tab` / `Shift-Tab` reach any beyond that, e.g. with custom `[[sections]]`; a PR drill-in has 4). Pressing the number of the already focused panel steps to its next list tab |
 | `Tab` / `Shift-Tab` | Next / previous panel |
 | `x` | Action menu for the selected item or row |
 | `a` | Approve (shortcut into the menu, PRs) |

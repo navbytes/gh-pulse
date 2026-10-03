@@ -3225,6 +3225,10 @@ impl App {
             // REST-backed panels are looked at again before they are fetched again
             p.unloaded =
                 i != focus && !matches!(p.kind, PK::Prs | PK::Issues | PK::Files | PK::Repos);
+            // a section searched the old repo: its rows and count must not outlive the switch
+            if p.kind.custom().is_some() {
+                (p.items, p.error, p.hidden, p.not_shown) = (vec![], None, 0, 0);
+            }
         }
         self.refresh_repos_panels();
         self.reset_view();
@@ -6334,6 +6338,33 @@ mod tests {
         (a.panels[i].unloaded, a.panels[i].items) = (false, vec![gitem("o/r", 1)]);
         a.hidden_changed("x/y", false);
         assert!(a.panels[i].unloaded && a.panels[i].items.is_empty());
+    }
+
+    #[test]
+    fn repo_sections_forget_the_old_repos_rows_and_count_on_a_repo_switch() {
+        let mut sc = section("R", config::SectionKind::Prs, "is:open");
+        sc.at = config::Where::Repo;
+        let cfg = Config {
+            sections: vec![sc],
+            ..Default::default()
+        };
+        let mut a = App::build(
+            "o1/alpha".into(),
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+            cfg,
+        );
+        let i = a.panels.len() - 1;
+        (a.panels[i].unloaded, a.panels[i].items) =
+            (false, vec![gitem("o1/alpha", 1), gitem("o1/alpha", 2)]);
+        assert_eq!(a.active_count(i), Some((2, false)));
+        a.switch_repo("o2/beta".into());
+        assert!(a.panels[i].items.is_empty() && a.panels[i].unloaded);
+        assert_eq!(
+            a.active_count(i),
+            None,
+            "the title shows ? until it is focused and searched"
+        );
     }
 
     #[test]

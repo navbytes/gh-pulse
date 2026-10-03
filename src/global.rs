@@ -17,7 +17,10 @@ pub enum Scope {
 
 /// A GitHub login or organization name.
 pub fn valid_owner(s: &str) -> bool {
-    !s.is_empty() && s.len() <= 39 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    !s.is_empty()
+        && s.len() <= 39
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && crate::state::hyphens_ok(s)
 }
 
 impl Scope {
@@ -544,7 +547,15 @@ mod tests {
 
     #[test]
     fn scopes_round_trip_and_reject_anything_that_could_inject_a_qualifier() {
-        for s in ["all", "favorites", "org:cli", "repo:cli/cli", "org:my-org"] {
+        for s in [
+            "all",
+            "favorites",
+            "org:cli",
+            "repo:cli/cli",
+            "org:my-org",
+            "org:a-b-c",
+            "repo:my-org/a--b",
+        ] {
             assert_eq!(Scope::parse(s).unwrap().key(), s);
         }
         for bad in [
@@ -558,6 +569,13 @@ mod tests {
             "team:x",
             "all:",
             "ORG:cli",
+            "org:-o",
+            "org:--org",
+            "org:x-",
+            "org:a--b",
+            "repo:-o/r",
+            "repo:x-/r",
+            "repo:a--b/r",
         ] {
             assert!(Scope::parse(bad).is_none(), "{bad:?} must not parse");
         }
@@ -586,6 +604,9 @@ mod tests {
             "a b/c".into(),
             "o/r label:bug".into(),
             "nope".into(),
+            "-o/r".into(),
+            "x-/r".into(),
+            "a--b/r".into(),
         ];
         let (c, left) = scope_chunks(&Scope::Favorites, &junk);
         assert_eq!(

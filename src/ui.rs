@@ -17,10 +17,12 @@ const MIN_H: u16 = 12;
 /// The `?` text. Remappable actions show whatever keys the active keymap gives them.
 fn help_text(app: &App) -> String {
     let k = |a: Act| app.keys.labels(a);
+    let n = app.panels.len();
     format!(
         "\
 Panels (default: Pull requests, Files, Issues, Actions, Repo; choose them in [panels])
-  1-5, Tab/S-Tab  focus panel (its number again: next list tab)   {{ }}  previous/next list tab
+  {nums}, Tab/S-Tab  focus panel{rest} (its number again: next list tab)   {{ }}  previous/next list tab
+  Your own searches: [[sections]] in config.toml add panels (see docs/configuration.md)
   j/k, arrows     move             Ctrl-d/u  half page     g/G or Home/End  top/bottom
   {filter}  filter (Enter apply, Esc clear)
   l/Right         focus the detail pane   h/Esc/Left  back to the list
@@ -55,6 +57,8 @@ Anywhere
   {refresh}  refresh the selected item and its list      {refresh_all}  reload everything (skips the cache)    {log}  command log
   {help}  this help    {quit}  quit
 (remap the keys marked above in config.toml, see docs/configuration.md)",
+        nums = if n > 1 { format!("1-{}", n.min(7)) } else { "1".into() },
+        rest = if n > 7 { " (digits stop at 7, Tab reaches the rest)" } else { "" },
         filter = k(Act::Filter),
         global = k(Act::Global),
         browser = k(Act::Browser),
@@ -4634,6 +4638,44 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
         a.panels[1].items = vec![it("cli/cli", 99, "Mine one", Kind::Pr)];
         a.panels[2].items = vec![it("acme/widgets", 12, "Crash on start", Kind::Issue)];
         a
+    }
+
+    #[test]
+    fn the_help_panel_line_follows_the_active_layout() {
+        use crate::config::{SectionCfg, SectionKind, Where};
+        let help = |a: &App| help_text(a).lines().nth(1).unwrap().to_string();
+        let a = app(false, IconSet::Unicode);
+        assert!(
+            help(&a).starts_with("  1-5, Tab/S-Tab  focus panel (its number"),
+            "{}",
+            help(&a)
+        );
+        assert!(help_text(&a).contains("[[sections]] in config.toml"));
+        let cfg = crate::config::Config {
+            sections: (0..3)
+                .map(|i| SectionCfg {
+                    title: format!("S{i}"),
+                    kind: SectionKind::Prs,
+                    filter: "is:open".into(),
+                    limit: None,
+                    at: Where::Both,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let b = App::build(
+            "o/r".into(),
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+            cfg,
+        );
+        assert!(
+            help(&b).starts_with(
+                "  1-7, Tab/S-Tab  focus panel (digits stop at 7, Tab reaches the rest)"
+            ),
+            "{}",
+            help(&b)
+        );
     }
 
     #[test]

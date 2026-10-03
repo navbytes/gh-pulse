@@ -281,7 +281,12 @@ pub fn valid_repo(s: &str) -> bool {
                 .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
     };
     s.split_once('/')
-        .is_some_and(|(o, n)| ok(o) && ok(n) && !n.contains('/'))
+        .is_some_and(|(o, n)| ok(o) && hyphens_ok(o) && ok(n) && !n.contains('/'))
+}
+
+/// GitHub logins and orgs never start or end with `-` or contain `--`.
+pub fn hyphens_ok(owner: &str) -> bool {
+    !owner.starts_with('-') && !owner.ends_with('-') && !owner.contains("--")
 }
 
 #[cfg(test)]
@@ -436,9 +441,31 @@ mod tests_recent {
             "/r",
             "o/r\n",
             "o/r;x",
+            "-o/r",
+            "o-/r",
+            "a--b/r",
         ] {
             assert!(!valid_repo(bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn owners_with_odd_hyphens_in_saved_files_are_ignored_on_load() {
+        let d = tmp("hyphens");
+        std::fs::create_dir_all(&d).unwrap();
+        let (rp, sp) = (d.join("recent.json"), d.join("scope.json"));
+        std::fs::write(
+            &rp,
+            r#"{"host":"h","repos":["ok-o/r","-o/r","x-/r","a--b/r","fine/r"]}"#,
+        )
+        .unwrap();
+        assert_eq!(Recent::load(&rp, "h").repos, ["ok-o/r", "fine/r"]);
+        for bad in ["org:-o", "org:--org", "org:x-", "org:a--b", "repo:x-/r"] {
+            save_scope(&sp, "h", bad).unwrap();
+            let saved = load_scope(&sp, "h").unwrap();
+            assert!(crate::global::Scope::parse(&saved).is_none(), "{bad}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
 
