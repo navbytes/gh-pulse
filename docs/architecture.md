@@ -14,6 +14,9 @@ gh-pulse is a single binary: a synchronous ratatui event loop that talks to GitH
 | `src/act.rs` | Mutations as data: `Action` = label + optional prompt + `build(text) -> argv` |
 | `src/diff.rs` | Unified-diff parser, split-row builder, word-partner pairing, `wrap_ranges`, layout mode |
 | `src/syn.rs` | syntect highlighter (cargo feature `syntax`, on by default); a no-op stub with `--no-default-features` |
+| `src/pool.rs` | The worker pool every `gh` job runs on: two queues (user first), a cap on processes in flight, stale-job dropping, background work standing down under rate pressure |
+| `src/rate.rs` | Shared quota state (graphql / core / search, backoff), thresholds, the chip and pause rules (pure, take `now`) |
+| `src/cache.rs` | `0600` JSON cache in `$XDG_CACHE_HOME/gh-pulse` (repo list, repo facts) and the directory `gh --cache` uses |
 | `src/config.rs` | `config.toml` model (incl. `[panels]` layout and tab sets), validation with line numbers, atomic save, the named-action `Keymap` |
 | `src/browse.rs` | Repo browser: GraphQL page parser, filter/sort/favorite/hide logic, browser key handling |
 | `src/md.rs` | Markdown to styled, wrapped lines (pulldown-cmark): headings, code, quotes, lists, tables, folding of `<details>` and long comments |
@@ -45,6 +48,25 @@ key/mouse event -> App (state change) -> spawn thread -> gh subprocess
   ordinary `Action` through the confirm popup.
 - Files, Checks and Comments are *derived panels*: their rows are rebuilt from that cache for the selected (or
   drilled-into) PR by `sync_derived`, so they never fetch on their own.
+
+## API usage
+
+- Writes bypass the pool (`App::mutation_job`: one thread each, panics reported as failures). Pool workers wrap each job
+  in `catch_unwind` and call its "dropped" callback on a panic, so the pool never shrinks and nothing waits forever.
+  `gh::run_child` is the one place a process is spawned and waited for: a deadline, a registry of live pids (killed on
+  quit) and reader threads for stdout/stderr.
+- Cache entries carry the host and login they were fetched as (`gh::identity()`, read from gh's `hosts.yml`, never a
+  token); `cache.rs` validates the directory (owner, mode, not a symlink) and writes through exclusive temp files.
+- Every `gh` job is submitted to `pool` with a priority (`User`, `Background`, `Probe`), a staleness test and a
+  "dropped" callback. Panel lists carry a stamp, detail fetches a `wanted` set rebuilt by each `ensure()` tick, counts a
+  generation; a dropped detail fetch removes its `Loading` placeholder, a dropped comment page reports `Paused`.
+- `gh::gh` is the single spawn point for the app's own calls: it logs, notes rate-limit errors (`rate::note_error`) and
+  adds the reset time. `gh::graphql` also reads `data.rateLimit` of the answer; `gh::gh_cached` adds `--cache <ttl>` and
+  `XDG_CACHE_HOME` for slow lookups unless the user refreshed or `[api] cache = false`.
+- Startup: `gh::startup` sends one aliased query (constant text; `@include` flags and search strings are variables).
+  `graphql_items` adapts the nodes to the `Item`s the CLI lists produce, so the UI is unchanged.
+- Counts: `fetch_counts` (background priority) obeys `[api] counts`, skips search-backed tabs, the global view and
+  any pause; the title shows `?` for what will not be fetched by itself.
 
 ## Paged data
 

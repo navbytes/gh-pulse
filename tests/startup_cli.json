@@ -1,0 +1,4 @@
+[
+ {"number":7,"title":"Add notes","url":"https://github.com/o/r/pull/7","state":"OPEN","isDraft":false,"body":"Fixes things","author":{"login":"alice"},"labels":[{"name":"docs"},{"name":"bug"}]},
+ {"number":9,"title":"Draft: ghost author","url":"https://github.com/o/r/pull/9","state":"OPEN","isDraft":true,"body":"","author":{"login":""},"labels":[]}
+]

@@ -19,6 +19,88 @@ pub struct Config {
     pub keys: BTreeMap<String, Keys>,
     #[serde(skip_serializing_if = "PanelsCfg::is_default")]
     pub panels: PanelsCfg,
+    #[serde(skip_serializing_if = "ApiCfg::is_default")]
+    pub api: ApiCfg,
+}
+
+/// How tab counts are fetched: `lazy` = the focused panel's other tabs after a second of idling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Counts {
+    Lazy,
+    Eager,
+    Off,
+}
+
+/// `[api]`: how gently gh-pulse talks to GitHub.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ApiCfg {
+    /// `gh` processes allowed at once (1..=8).
+    pub max_concurrent: usize,
+    /// Show the `⚡ remaining/limit` chip in the header below this share of the quota (percent).
+    pub low_quota_percent: u8,
+    /// Pause all background refreshing below this share (percent, at most `low_quota_percent`).
+    pub pause_percent: u8,
+    /// Show the quota chip at all.
+    pub rate_header: bool,
+    pub counts: Counts,
+    /// Idle time before an expensive detail tab (Comments, Diff, Commits, Checks) is fetched.
+    pub settle_ms: u64,
+    /// Cache slow-changing lookups (labels, templates, tags, repo facts, repo list) on disk.
+    pub cache: bool,
+    /// Seconds a `gh` read may take before it is killed (pagination gets double, writes five times).
+    pub timeout_s: u64,
+}
+
+impl Default for ApiCfg {
+    fn default() -> Self {
+        ApiCfg {
+            max_concurrent: 4,
+            low_quota_percent: 20,
+            pause_percent: 10,
+            rate_header: true,
+            counts: Counts::Lazy,
+            settle_ms: 250,
+            cache: true,
+            timeout_s: 60,
+        }
+    }
+}
+
+impl ApiCfg {
+    fn is_default(&self) -> bool {
+        *self == ApiCfg::default()
+    }
+
+    fn check(&self) -> Result<(), (&'static str, String)> {
+        let bad = |key, m: String| Err((key, format!("api.{key}: {m}")));
+        if !(1..=8).contains(&self.max_concurrent) {
+            return bad(
+                "max_concurrent",
+                format!("must be 1..8, got {}", self.max_concurrent),
+            );
+        }
+        if !(1..=99).contains(&self.low_quota_percent) {
+            return bad("low_quota_percent", "must be 1..99".into());
+        }
+        if !(1..=99).contains(&self.pause_percent) || self.pause_percent > self.low_quota_percent {
+            return bad(
+                "pause_percent",
+                format!(
+                    "must be 1..99 and at most low_quota_percent ({})",
+                    self.low_quota_percent
+                ),
+            );
+        }
+        if self.settle_ms > 5000 {
+            return bad("settle_ms", "must be at most 5000".into());
+        }
+        if !(5..=600).contains(&self.timeout_s) {
+            return bad("timeout_s", "must be 5..600".into());
+        }
+        Ok(())
+    }
 }
 
 /// Left-column panels, as named in `[panels] show`.
@@ -315,6 +397,21 @@ pub fn parse(src: &str, name: &str) -> Result<Config, String> {
         // the key inside its section; the section header if the key is implied (default tabs)
         let lines: Vec<&str> = src.lines().collect();
         let head = lines.iter().position(|l| l.trim() == section);
+        let line = head
+            .and_then(|h| {
+                lines[h + 1..]
+                    .iter()
+                    .take_while(|l| !l.trim_start().starts_with('['))
+                    .position(|l| l.trim_start().starts_with(key))
+                    .map(|k| h + 2 + k)
+            })
+            .or(head.map(|h| h + 1))
+            .unwrap_or(1);
+        return Err(format!("{name}:{line}: {msg}"));
+    }
+    if let Err((key, msg)) = cfg.api.check() {
+        let lines: Vec<&str> = src.lines().collect();
+        let head = lines.iter().position(|l| l.trim() == "[api]");
         let line = head
             .and_then(|h| {
                 lines[h + 1..]
@@ -804,6 +901,67 @@ mod tests {
         };
         save_to(&path, &d).unwrap();
         assert!(!std::fs::read_to_string(&path).unwrap().contains("panels"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn api_section_has_gentle_defaults_and_validates_ranges() {
+        let c = parse("", "t").unwrap();
+        assert_eq!(c.api, ApiCfg::default());
+        assert_eq!(
+            (
+                c.api.max_concurrent,
+                c.api.low_quota_percent,
+                c.api.pause_percent,
+                c.api.settle_ms
+            ),
+            (4, 20, 10, 250)
+        );
+        assert!(c.api.rate_header && c.api.cache && c.api.counts == Counts::Lazy);
+        let c = parse(
+            "[api]\nmax_concurrent = 8\ncounts = \"eager\"\nsettle_ms = 0\ncache = false\nrate_header = false\nlow_quota_percent = 30\npause_percent = 30\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(
+            (c.api.max_concurrent, c.api.counts, c.api.cache),
+            (8, Counts::Eager, false)
+        );
+        for (src, line, want) in [
+            (
+                "[api]\nmax_concurrent = 0\n",
+                2,
+                "max_concurrent: must be 1..8",
+            ),
+            ("[api]\nmax_concurrent = 9\n", 2, "1..8"),
+            (
+                "[api]\nx = 1\nlow_quota_percent = 100\n",
+                2,
+                "unknown field",
+            ),
+            ("[api]\ncounts = \"sometimes\"\n", 2, "lazy"),
+            (
+                "[api]\nlow_quota_percent = 10\npause_percent = 15\n",
+                3,
+                "pause_percent: must be 1..99 and at most low_quota_percent (10)",
+            ),
+            ("[api]\nsettle_ms = 9000\n", 2, "settle_ms"),
+            ("[api]\ntimeout_s = 1\n", 2, "timeout_s: must be 5..600"),
+        ] {
+            let e = parse(src, "cfg").unwrap_err();
+            assert!(
+                e.starts_with(&format!("cfg:{line}:")) && e.contains(want),
+                "{src:?}: {e}"
+            );
+        }
+        // a non-default section survives the app's own saves; the default one is not written
+        let dir = std::env::temp_dir().join(format!("gh-pulse-api-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let c = parse("[api]\nmax_concurrent = 2\n", "t").unwrap();
+        save_to(&path, &c).unwrap();
+        assert_eq!(load_from(&path).unwrap(), c);
+        save_to(&path, &Config::default()).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("api"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

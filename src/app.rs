@@ -4,6 +4,8 @@ use crate::config::{self, Act, Config, Keymap, PanelName, PanelsCfg, TabDef};
 use crate::diff::{self, DiffMode};
 use crate::form::{self, Form};
 use crate::gh::{self, Data, FilesData, Item, Kind, Tab};
+use crate::pool::{self, Prio};
+use crate::rate::{self, RateState};
 use crate::state::Viewed;
 use crate::syn::Hl;
 use crate::theme::Theme;
@@ -14,8 +16,56 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::thread;
+
+/// Seconds the repo's header facts stay cached.
+const META_TTL: u64 = 300;
+
+/// A repo's header facts as cached: with the host and login they were fetched as, so another
+/// account (or host) never sees them.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedMeta {
+    host: String,
+    viewer: String,
+    meta: gh::RepoMeta,
+}
+
+fn meta_key(host: &str, repo: &str) -> String {
+    format!("meta-{host}-{repo}")
+}
+
+/// Cached facts for `repo` if fresh and stored for this host and login (None when the login is
+/// unknown: nothing user-specific is cached then).
+fn read_meta(repo: &str) -> Option<gh::RepoMeta> {
+    let (host, login) = gh::identity()?;
+    let st = crate::cache::Store::default_if_enabled()?;
+    let c: CachedMeta = st.fresh(&meta_key(&host, repo), META_TTL, rate::now())?;
+    let mut m = c.meta;
+    (c.host == host && c.viewer.eq_ignore_ascii_case(&login)).then(|| {
+        m.clean();
+        m
+    })
+}
+
+/// `viewer` is who the answer says we are; it must match the login the entry is stored under.
+fn write_meta(repo: &str, meta: &gh::RepoMeta, viewer: &str) {
+    let (Some((host, login)), Some(st)) =
+        (gh::identity(), crate::cache::Store::default_if_enabled())
+    else {
+        return;
+    };
+    if viewer.eq_ignore_ascii_case(&login) {
+        let c = CachedMeta {
+            host: host.clone(),
+            viewer: login,
+            meta: meta.clone(),
+        };
+        let _ = st.write(&meta_key(&host, repo), &c, rate::now());
+    }
+}
 
 /// Panel identity. Files / Checks / Comments are derived from the selected (or drilled-into) PR.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -57,6 +107,10 @@ pub struct Panel {
     pub error: Option<String>,
     pub cursor: usize,
     seq: u64,
+    /// Mirrors `seq` for queued jobs: a job whose number is no longer current never starts.
+    stamp: Arc<AtomicU64>,
+    /// Not loaded yet: the REST-backed panels wait for their first focus (saves startup calls).
+    pub unloaded: bool,
 }
 
 impl Panel {
@@ -71,7 +125,15 @@ impl Panel {
             error: None,
             cursor: 0,
             seq: 0,
+            stamp: Arc::new(AtomicU64::new(0)),
+            unloaded: false,
         }
+    }
+
+    /// Searches (GitHub's search API / GraphQL search) are the tightest-limited lists: their counts
+    /// are never fetched in the background.
+    fn search_backed(kind: PK, id: usize) -> bool {
+        matches!((kind, id), (PK::Prs | PK::Issues, 0 | 1))
     }
 
     /// The `gh::list` id of the active tab.
@@ -223,6 +285,117 @@ struct RepoMsg {
     rows: Vec<RepoRow>,
     last: bool,
     truncated: bool,
+    /// Replace the rows instead of appending (cached rows being swapped for fresh ones).
+    replace: bool,
+}
+
+/// Seconds the repo list stays fresh; older cached rows still show at once, then refresh.
+const REPOS_TTL: u64 = 600;
+
+/// The repo list as cached, with who it was fetched as.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedRepos {
+    host: String,
+    viewer: String,
+    rows: Vec<RepoRow>,
+    truncated: bool,
+}
+
+fn repos_key(host: &str, login: &str) -> String {
+    format!("repos-{host}-{login}")
+}
+
+/// Cached rows and their age, for this host and login only (and re-cleaned: the disk is not trusted).
+fn read_repos() -> Option<(CachedRepos, u64)> {
+    let (host, login) = gh::identity()?;
+    let st = crate::cache::Store::default_if_enabled()?;
+    let (mut c, age): (CachedRepos, u64) = st.read(&repos_key(&host, &login), rate::now())?;
+    if c.host != host || !c.viewer.eq_ignore_ascii_case(&login) {
+        return None;
+    }
+    use crate::sanitize::clean_in_place as cl;
+    for r in &mut c.rows {
+        [&mut r.name, &mut r.owner, &mut r.lang, &mut r.pushed]
+            .into_iter()
+            .for_each(cl);
+    }
+    Some((c, age))
+}
+
+/// One listing in progress: a page per pool job, so a long account never holds a worker.
+struct BrowseJob {
+    tx: Sender<Msg>,
+    seq: u64,
+    seq_a: Arc<AtomicU64>,
+    /// Cached rows are already on screen: the new listing lands in one piece at the end.
+    cached: bool,
+    all: Vec<RepoRow>,
+    total: usize,
+}
+
+fn browse_step(j: BrowseJob, after: Option<String>) {
+    let (seq_a, seq, tx) = (j.seq_a.clone(), j.seq, j.tx.clone());
+    pool::global().submit(
+        Prio::User,
+        move || seq_a.load(Relaxed) != seq,
+        move || browse_run(j, after),
+        move || {
+            let _ = tx.send(Msg::Repos(seq, Err("could not load the repo list".into())));
+        },
+    );
+}
+
+fn browse_run(mut j: BrowseJob, after: Option<String>) {
+    let p = match browse::fetch_page(after.as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = j.tx.send(Msg::Repos(j.seq, Err(e)));
+            return;
+        }
+    };
+    j.total += p.rows.len();
+    let capped = p.next.is_some() && j.total >= browse::MAX_REPOS;
+    let last = p.next.is_none() || capped;
+    let next = p.next.clone();
+    j.all.extend(p.rows.iter().cloned());
+    if last
+        && let (Some((host, login)), Some(st)) =
+            (gh::identity(), crate::cache::Store::default_if_enabled())
+        && p.viewer.eq_ignore_ascii_case(&login)
+    {
+        let c = CachedRepos {
+            host: host.clone(),
+            viewer: login.clone(),
+            rows: j.all.clone(),
+            truncated: capped,
+        };
+        let _ = st.write(&repos_key(&host, &login), &c, rate::now());
+    }
+    let m = if j.cached {
+        last.then(|| RepoMsg {
+            viewer: p.viewer.clone(),
+            rows: j.all.clone(),
+            last,
+            truncated: capped,
+            replace: true,
+        })
+    } else {
+        Some(RepoMsg {
+            viewer: p.viewer,
+            rows: p.rows,
+            last,
+            truncated: capped,
+            replace: false,
+        })
+    };
+    if let Some(m) = m
+        && j.tx.send(Msg::Repos(j.seq, Ok(m))).is_err()
+    {
+        return;
+    }
+    if !last {
+        browse_step(j, next);
+    }
 }
 
 enum Msg {
@@ -238,13 +411,20 @@ enum Msg {
     /// The branch checked out in the working directory, when it is a clone of the repo.
     Branch(u64, Option<String>),
     Repos(u64, Result<RepoMsg, String>),
-    Header(u64, String),
     /// Repo facts for the header (generation of the header lookup).
     Meta(u64, gh::RepoMeta),
     /// (list generation, panel, tab id, (rows, more)) for the other tabs' counts.
     Count(u64, CountKey, Result<(usize, bool), String>),
     /// Unread notifications, for the badge (and the inbox when open).
     Inbox(u64, Result<Vec<Item>, String>),
+    /// The viewer's login (from the startup request).
+    User(u64, String),
+    /// A queued detail fetch that was dropped before it started: forget its placeholder.
+    Dropped(String, Tab, u64),
+    /// The batched startup request failed (not a rate limit): load the panels one by one instead.
+    StartupFallback(u64),
+    /// Who reacted to one comment: (item key, comment id, names or the error).
+    Reactors(String, String, u64, Result<Vec<gh::Reaction>, String>),
 }
 
 pub struct App {
@@ -259,11 +439,33 @@ pub struct App {
     pub hl: RefCell<Option<Hl>>,
     pub repo: String,
     pub header: String,
+    /// Checked-out branch of the cwd clone ("" when it isn't one) and the viewer, for `header`.
+    branch: String,
+    user: String,
     pub meta: Option<gh::RepoMeta>,
+    /// The shared quota state as of the last `poll`, and what follows from it.
+    pub rate: RateState,
+    /// Header chip: the quota is low (and when it comes back, as HH:MM).
+    pub quota_low: bool,
+    pub paused: bool,
+    pub rate_clock: Option<(u64, String)>,
+    rate_at: Option<std::time::Instant>,
+    /// The last key or mouse event, for settle delays and the lazy counts.
+    last_input: std::time::Instant,
+    /// Detail fetches the screen still wants, so queued ones for items we moved off are dropped.
+    wanted: Arc<Mutex<HashSet<(String, Tab)>>>,
+    want_now: HashSet<(String, Tab)>,
+    /// What the previous idle tick wanted (the Overview debounce).
+    want_prev: HashSet<(String, Tab)>,
+    /// Mirrors of the generations, readable from queued jobs.
+    dgen_a: Arc<AtomicU64>,
+    cgen_a: Arc<AtomicU64>,
     pub panels: Vec<Panel>,
     /// Row counts of every configured list tab, as they become known.
     pub counts: HashMap<CountKey, (usize, bool)>,
     cpending: HashSet<CountKey>,
+    /// Count lookups that failed (timeout, error): not retried until the next reload.
+    pub count_failed: HashSet<CountKey>,
     /// Bumped when the lists are reloaded, so late counts for the old ones are dropped.
     cgen: u64,
     pub inbox: Option<Inbox>,
@@ -271,6 +473,8 @@ pub struct App {
     unread: Option<Vec<String>>,
     inbox_seq: u64,
     unread_at: Option<std::time::Instant>,
+    /// Comments whose reactor names are being fetched.
+    react_pending: HashSet<String>,
     pub focus: usize,
     pub filter: String,
     pub typing: bool,
@@ -322,6 +526,7 @@ pub struct App {
     /// Bumped whenever `cache` is cleared or the repo scope changes.
     dgen: u64,
     repos_seq: u64,
+    repos_a: Arc<AtomicU64>,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
 }
@@ -486,11 +691,26 @@ impl App {
             panels,
             counts: HashMap::new(),
             cpending: HashSet::new(),
+            count_failed: HashSet::new(),
             cgen: 0,
+            cgen_a: Arc::new(AtomicU64::new(0)),
+            dgen_a: Arc::new(AtomicU64::new(0)),
+            wanted: Arc::default(),
+            want_now: HashSet::new(),
+            want_prev: HashSet::new(),
+            last_input: std::time::Instant::now(),
+            rate: RateState::default(),
+            quota_low: false,
+            paused: false,
+            rate_clock: None,
+            rate_at: None,
+            branch: String::new(),
+            user: String::new(),
             inbox: None,
             unread: None,
             inbox_seq: 0,
             unread_at: None,
+            react_pending: HashSet::new(),
             focus: 0,
             filter: String::new(),
             typing: false,
@@ -529,42 +749,216 @@ impl App {
             cache: HashMap::new(),
             dgen: 0,
             repos_seq: 0,
+            repos_a: Arc::new(AtomicU64::new(0)),
             tx,
             rx,
         };
         if load {
-            for i in 0..app.panels.len() {
-                app.load_panel(i);
+            rate::set_limits(app.cfg.api.low_quota_percent, app.cfg.api.pause_percent);
+            crate::cache::set_enabled(app.cfg.api.cache);
+            pool::init(app.cfg.api.max_concurrent);
+            gh::set_timeout(app.cfg.api.timeout_s);
+            // REST-backed panels load when first focused; the focused one (and PRs/Issues) now
+            for p in &mut app.panels {
+                p.unloaded = !matches!(p.kind, PK::Prs | PK::Issues | PK::Files);
             }
+            let f = app.focus;
+            app.panels[f].unloaded = false;
             app.spawn_header();
-            app.spawn_unread();
+            app.start_load(false);
+            app.load_unfocused_lazy_marks();
+            app.spawn_unread(Prio::Background);
+            app.spawn_rate_poll();
         }
         app
     }
 
+    /// Panels the user hasn't looked at keep their placeholder; the focused one loads now.
+    fn load_unfocused_lazy_marks(&mut self) {
+        for i in 0..self.panels.len() {
+            if !self.panels[i].unloaded {
+                // PRs/Issues came with the startup request; REST panels that are loaded load here
+                if !matches!(self.panels[i].kind, PK::Prs | PK::Issues | PK::Files) {
+                    self.load_panel(i, false);
+                }
+            }
+        }
+    }
+
+    /// Queue a job: `stale` is asked when it reaches the front, `dropped` runs instead if it is.
+    fn queue(
+        &self,
+        prio: Prio,
+        stale: impl Fn() -> bool + Send + 'static,
+        run: impl FnOnce() + Send + 'static,
+        dropped: impl FnOnce() + Send + 'static,
+    ) {
+        if self.net {
+            pool::global().submit(prio, stale, run, dropped);
+        }
+    }
+
+    /// Work the user asked for. If it can't run (queue full, the job panicked) the status line says so.
+    fn user_job(&self, run: impl FnOnce() + Send + 'static) {
+        let tx = self.tx.clone();
+        self.user_job_or(run, move || {
+            let _ = tx.send(Msg::Status(Err(
+                "a request could not be run; try again".into()
+            )));
+        });
+    }
+
+    /// Like `user_job`, with the caller's own way of hearing that the job was lost.
+    fn user_job_or(
+        &self,
+        run: impl FnOnce() + Send + 'static,
+        lost: impl FnOnce() + Send + 'static,
+    ) {
+        self.queue(Prio::User, || false, run, lost);
+    }
+
+    /// A write to GitHub (a confirmed command, a viewed mark). It never waits in the pool behind reads
+    /// or a hung `gh` and is never dropped for want of room: it gets a thread of its own. `Msg::Done` /
+    /// `Status` carry the result; a panic is reported as a failure.
+    fn mutation_job(&self, run: impl FnOnce() + Send + 'static, failed: Msg) {
+        if !self.net {
+            return;
+        }
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).is_err() {
+                let _ = tx.send(failed);
+            }
+        });
+    }
+
+    /// Local part of the header (the cwd's branch, when the directory is a clone of this repo).
     fn spawn_header(&mut self) {
         self.hgen += 1;
         let (tx, repo, g) = (self.tx.clone(), self.repo.clone(), self.hgen);
-        thread::spawn(move || {
-            // The cwd's branch only describes `repo` when cwd is a clone of it.
-            let local = gh::repo_here().is_ok_and(|h| h.eq_ignore_ascii_case(&repo));
-            let branch = Command::new("git")
-                .args(["branch", "--show-current"])
-                .output();
-            let branch = branch.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-            let branch = if local {
-                branch.unwrap_or_default()
-            } else {
-                String::new()
-            };
-            let _ = tx.send(Msg::Branch(
-                g,
-                local.then_some(branch.clone()).filter(|b| !b.is_empty()),
-            ));
-            let _ = tx.send(Msg::Header(
-                g,
-                format!(" {repo}  branch: {branch}  user: {}", gh::user()),
-            ));
+        self.user_job(move || {
+            let branch = gh::cwd_is_clone_of(&repo)
+                .then(|| {
+                    Command::new("git")
+                        .args(["branch", "--show-current"])
+                        .output()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .unwrap_or_default()
+                })
+                .filter(|b| !b.is_empty());
+            let _ = tx.send(Msg::Branch(g, branch));
+        });
+    }
+
+    fn rebuild_header(&mut self) {
+        let user = if self.user.is_empty() {
+            String::new()
+        } else {
+            format!("  user: {}", self.user)
+        };
+        self.header = format!(" {}  branch: {}{user}", self.repo, self.branch);
+    }
+
+    /// One GraphQL request for the PR and Issues lists, the viewer and the repo facts (cached for
+    /// five minutes); everything else waits for its first focus. `fresh` bypasses the cached facts.
+    fn start_load(&mut self, fresh: bool) {
+        let cov: Vec<usize> = (0..self.panels.len())
+            .filter(|&i| matches!(self.panels[i].kind, PK::Prs | PK::Issues) && !self.global)
+            .collect();
+        let mut want = gh::StartupWant {
+            meta: true,
+            ..Default::default()
+        };
+        if !fresh
+            && self.net
+            && let Some(m) = read_meta(&self.repo)
+        {
+            (self.meta, want.meta) = (Some(m), false);
+        }
+        let mut jobs = vec![];
+        for &i in &cov {
+            let p = &mut self.panels[i];
+            p.loading = true;
+            p.error = None;
+            p.seq += 1;
+            p.unloaded = false;
+            p.stamp.store(p.seq, Relaxed);
+            let tab = p.tab_id();
+            match p.kind {
+                PK::Prs => want.prs = Some(tab),
+                _ => want.issues = Some(tab),
+            }
+            jobs.push((p.kind, p.tab, p.seq, p.stamp.clone()));
+        }
+        if !self.net {
+            return;
+        }
+        if cov.is_empty() {
+            // global view or no PR/issue panel: only the facts (and the viewer) are needed
+            want.meta = want.meta || self.meta.is_none();
+        }
+        let (tx, repo, g, cg) = (self.tx.clone(), self.repo.clone(), self.hgen, self.cgen);
+        let (tx_lost, lost): (_, Vec<_>) = (
+            self.tx.clone(),
+            jobs.iter().map(|(k, t, sq, _)| (*k, *t, *sq)).collect(),
+        );
+        self.user_job_or(
+            move || match gh::startup(&repo, &want) {
+                Ok(st) => {
+                    for (kind, tab, seq, stamp) in jobs {
+                        if stamp.load(Relaxed) != seq {
+                            continue;
+                        }
+                        let items = if kind == PK::Prs { &st.prs } else { &st.issues };
+                        let _ = tx.send(Msg::List(
+                            kind,
+                            tab,
+                            seq,
+                            Ok(items.clone().unwrap_or_default()),
+                        ));
+                    }
+                    if let Some(m) = st.meta {
+                        write_meta(&repo, &m, &st.user);
+                        let _ = tx.send(Msg::Meta(g, m));
+                    }
+                    let _ = tx.send(Msg::User(g, st.user));
+                    if let Some(n) = st.open_prs {
+                        let _ = tx.send(Msg::Count(cg, (PK::Prs, 2), Ok((n, false))));
+                    }
+                }
+                Err(e) if gh::rate_limit_secs(&e).is_some() => {
+                    for (kind, tab, seq, _) in jobs {
+                        let _ = tx.send(Msg::List(kind, tab, seq, Err(e.clone())));
+                    }
+                }
+                Err(_) => {
+                    let _ = tx.send(Msg::StartupFallback(g));
+                }
+            },
+            // lost (queue full, panic): the lists must not sit on "loading..."
+            move || {
+                for (kind, tab, seq) in lost {
+                    let _ = tx_lost.send(Msg::List(
+                        kind,
+                        tab,
+                        seq,
+                        Err("could not load; try again (R)".into()),
+                    ));
+                }
+            },
+        );
+    }
+
+    /// The batched request failed: the old way, one `gh` command per panel, plus the facts.
+    fn fallback_start(&mut self) {
+        for i in 0..self.panels.len() {
+            if matches!(self.panels[i].kind, PK::Prs | PK::Issues) && self.panels[i].loading {
+                self.load_panel(i, false);
+            }
+        }
+        let (tx, repo, g) = (self.tx.clone(), self.repo.clone(), self.hgen);
+        self.user_job(move || {
+            let _ = tx.send(Msg::User(g, gh::user()));
             if let Ok(m) = gh::repo_meta(&repo) {
                 let _ = tx.send(Msg::Meta(g, m));
             }
@@ -572,16 +966,45 @@ impl App {
     }
 
     /// Unread notifications for the header badge; the badge stays hidden when the fetch fails.
-    fn spawn_unread(&mut self) {
+    fn spawn_unread(&mut self, prio: Prio) {
         if !self.net {
             return;
         }
         self.unread_at = Some(std::time::Instant::now());
         self.inbox_seq += 1;
         let (tx, seq) = (self.tx.clone(), self.inbox_seq);
-        thread::spawn(move || {
-            let _ = tx.send(Msg::Inbox(seq, gh::notifications()));
-        });
+        self.queue(
+            prio,
+            || false,
+            move || {
+                let _ = tx.send(Msg::Inbox(seq, gh::notifications()));
+            },
+            || {},
+        );
+    }
+
+    /// `gh api rate_limit` (free): refreshes the shared quota state. Runs even while paused, because
+    /// it is how the pause ends.
+    fn spawn_rate_poll(&mut self) {
+        if !self.net {
+            return;
+        }
+        self.rate_at = Some(std::time::Instant::now());
+        self.queue(
+            Prio::Probe,
+            || false,
+            || {
+                if let Ok(body) = gh::gh(["api", "rate_limit"]) {
+                    rate::apply_poll(&body);
+                }
+            },
+            || {},
+        );
+    }
+
+    /// No background fetching while the quota is low or GitHub asked us to back off.
+    fn bg_quiet(&self) -> bool {
+        self.quota_low || self.paused
     }
 
     /// Unread notifications outside hidden repos; None while unknown.
@@ -598,50 +1021,109 @@ impl App {
             h.clear();
         }
         self.dgen += 1;
+        self.dgen_a.store(self.dgen, Relaxed);
     }
 
+    /// `R`: everything again, skipping the on-disk cache.
     fn reload_all(&mut self) {
+        self.reload(true);
+    }
+
+    /// Reload every loaded panel (`fresh` skips the on-disk cache). The PR and Issues lists come from
+    /// one batched request; in the global view they are searches and load on their own.
+    fn reload(&mut self, fresh: bool) {
         self.clear_cache();
         self.counts.clear();
         self.cpending.clear();
+        self.count_failed.clear();
         self.cgen += 1;
-        (0..self.panels.len()).for_each(|i| self.load_panel(i));
-        self.spawn_unread();
+        self.cgen_a.store(self.cgen, Relaxed);
+        if !self.global {
+            self.start_load(fresh);
+        }
+        for i in 0..self.panels.len() {
+            let p = &self.panels[i];
+            let batched = !self.global && matches!(p.kind, PK::Prs | PK::Issues);
+            if !p.unloaded && !batched {
+                self.load_panel(i, fresh);
+            }
+        }
+        self.spawn_unread(Prio::User);
     }
 
-    fn load_panel(&mut self, i: usize) {
+    fn load_panel(&mut self, i: usize, fresh: bool) {
         let p = &mut self.panels[i];
         let Some((src, tab_id)) = p.source() else {
             return;
         };
         p.loading = true;
+        p.unloaded = false;
         p.error = None;
         p.seq += 1;
+        p.stamp.store(p.seq, Relaxed);
         if !self.net {
             return;
         }
-        let (seq, kind, tab) = (p.seq, p.kind, p.tab);
-        let (tx, repo, global) = (self.tx.clone(), self.repo.clone(), self.global);
-        thread::spawn(move || {
-            let _ = tx.send(Msg::List(
-                kind,
-                tab,
-                seq,
-                gh::list(&repo, global, src, tab_id),
-            ));
-        });
+        let (seq, kind, tab, stamp) = (p.seq, p.kind, p.tab, p.stamp.clone());
+        let (tx, tx2, repo, global) = (
+            self.tx.clone(),
+            self.tx.clone(),
+            self.repo.clone(),
+            self.global,
+        );
+        // a list the user already moved past (another tab, a newer load) never starts
+        self.queue(
+            Prio::User,
+            move || stamp.load(Relaxed) != seq,
+            move || {
+                let _ = tx.send(Msg::List(
+                    kind,
+                    tab,
+                    seq,
+                    gh::list(&repo, global, src, tab_id, fresh),
+                ));
+            },
+            // lost (queue full, panic): the panel must not sit on "loading..."
+            move || {
+                let _ = tx2.send(Msg::List(
+                    kind,
+                    tab,
+                    seq,
+                    Err("could not load; try again (r)".into()),
+                ));
+            },
+        );
     }
 
-    /// Counts for the tabs that aren't showing, one lookup per idle tick (at most two in flight).
+    /// Counts for tabs that aren't showing. `lazy` (default): the focused panel's other tabs once
+    /// the user has been idle for a second, never search-backed tabs, never in the global view,
+    /// never while the quota is low; `eager`: every panel at once; `off`: none.
     fn fetch_counts(&mut self) {
-        if !self.net || self.ctx.is_some() || self.cpending.len() >= 2 {
+        let mode = self.cfg.api.counts;
+        let lazy = mode == config::Counts::Lazy;
+        let idle = std::time::Duration::from_millis(if lazy { 1000 } else { 100 });
+        if !self.net
+            || self.ctx.is_some()
+            || self.global
+            || mode == config::Counts::Off
+            || self.bg_quiet()
+            || !self.cpending.is_empty()
+            || self.panels.iter().any(|p| p.loading)
+            || self.last_input.elapsed() < idle
+        {
             return;
         }
-        let todo = self.panels.iter().find_map(|p| {
+        let focus = self.focus;
+        let todo = self.panels.iter().enumerate().find_map(|(i, p)| {
+            if (lazy && i != focus) || p.tabs.len() < 2 {
+                return None;
+            }
             p.tabs.iter().find_map(|t| {
                 let key = (p.kind, t.id);
-                let known = self.counts.contains_key(&key) || self.cpending.contains(&key);
-                (p.tabs.len() > 1 && !known)
+                let known = self.counts.contains_key(&key)
+                    || self.cpending.contains(&key)
+                    || self.count_failed.contains(&key);
+                (!known && !Panel::search_backed(p.kind, t.id))
                     .then(|| source_of(p.kind, t.id).map(|src| (key, src)))
                     .flatten()
             })
@@ -650,10 +1132,23 @@ impl App {
             return;
         };
         self.cpending.insert(key);
-        let (tx, repo, global, g) = (self.tx.clone(), self.repo.clone(), self.global, self.cgen);
-        thread::spawn(move || {
-            let _ = tx.send(Msg::Count(g, key, gh::count(&repo, global, src, tab)));
-        });
+        let (tx, tx2, repo, g) = (
+            self.tx.clone(),
+            self.tx.clone(),
+            self.repo.clone(),
+            self.cgen,
+        );
+        let (gen_a, global) = (self.cgen_a.clone(), self.global);
+        self.queue(
+            Prio::Background,
+            move || gen_a.load(Relaxed) != g,
+            move || {
+                let _ = tx.send(Msg::Count(g, key, gh::count(&repo, global, src, tab)));
+            },
+            move || {
+                let _ = tx2.send(Msg::Count(g, key, Err("dropped".into())));
+            },
+        );
     }
 
     /// The panel of this kind, in the active set or the one parked while drilled in.
@@ -674,8 +1169,57 @@ impl App {
         self.panels.iter().position(|p| p.kind == k)
     }
 
+    /// Copy the shared quota state and work out what it means for the screen.
+    fn sync_rate(&mut self) {
+        let (now, st) = (rate::now(), rate::snapshot());
+        let (low, pause) = (self.cfg.api.low_quota_percent, self.cfg.api.pause_percent);
+        self.quota_low =
+            st.low(now, low) || st.search.is_some_and(|b| b.remaining < 5 && now < b.reset);
+        self.paused = st.paused(now, pause);
+        // when the quota comes back, as a clock time (computed once per distinct reset)
+        let reset = st
+            .resumes_at(now, pause)
+            .or_else(|| st.chip(now, low).map(|c| c.reset));
+        if let Some(r) = reset
+            && self.rate_clock.as_ref().is_none_or(|(e, _)| *e != r)
+        {
+            self.rate_clock = Some((r, rate::clock(r)));
+        }
+        self.rate = st;
+    }
+
+    /// The header chip, e.g. `412/5000`, when the quota is low and `rate_header` is on.
+    pub fn quota_chip(&self) -> Option<rate::Chip> {
+        let c = &self.cfg.api;
+        if !c.rate_header {
+            return None;
+        }
+        self.rate.chip(rate::now(), c.low_quota_percent)
+    }
+
+    /// What the status line says while background refreshing is paused.
+    pub fn pause_note(&self) -> Option<String> {
+        if !self.paused {
+            return None;
+        }
+        let at = self
+            .rate
+            .resumes_at(rate::now(), self.cfg.api.pause_percent)
+            .and_then(|r| self.rate_clock.as_ref().filter(|(e, _)| *e == r))
+            .map(|(_, c)| format!(", resets {c}"))
+            .unwrap_or_default();
+        Some(format!("paused background refresh (rate limit low{at})"))
+    }
+
     pub fn poll(&mut self) {
         let mut select_focus = None;
+        self.sync_rate();
+        if self.net
+            && self.status.is_empty()
+            && let Some(w) = crate::cache::take_warning()
+        {
+            self.status = w;
+        }
         self.tick = self.tick.wrapping_add(1);
         while let Ok(m) = self.rx.try_recv() {
             match m {
@@ -734,10 +1278,18 @@ impl App {
                 }
                 Msg::Count(g, key, res) => {
                     self.cpending.remove(&key);
-                    if g == self.cgen
-                        && let Ok(r) = res
-                    {
-                        self.counts.insert(key, r);
+                    if g == self.cgen {
+                        match res {
+                            Ok(r) => {
+                                self.counts.insert(key, r);
+                                self.count_failed.remove(&key);
+                            }
+                            // a lost job is retried; a real failure waits for the next reload
+                            Err(e) if e != "dropped" => {
+                                self.count_failed.insert(key);
+                            }
+                            Err(_) => {}
+                        }
                     }
                 }
                 Msg::Meta(g, m) => {
@@ -823,7 +1375,9 @@ impl App {
                 }
                 Msg::Branch(g, b) => {
                     if g == self.hgen {
+                        self.branch = b.clone().unwrap_or_default();
                         self.cwd_branch = b;
+                        self.rebuild_header();
                     }
                 }
                 Msg::FormData(seq, d) => {
@@ -864,7 +1418,10 @@ impl App {
                 Msg::Repos(g, _) if g != self.repos_seq => {}
                 Msg::Repos(_, Ok(m)) => {
                     if let Some(b) = &mut self.browser {
-                        if b.viewer.is_empty() {
+                        if m.replace {
+                            b.rows.clear();
+                        }
+                        if b.viewer.is_empty() || m.replace {
                             b.viewer = m.viewer;
                         }
                         b.rows.extend(m.rows);
@@ -876,9 +1433,41 @@ impl App {
                         (b.loading, b.error) = (false, Some(e));
                     }
                 }
-                Msg::Header(g, h) => {
+                Msg::User(g, u) => {
+                    if g == self.hgen && !u.is_empty() {
+                        self.user = u;
+                        self.rebuild_header();
+                    }
+                }
+                Msg::Dropped(key, tab, g) => {
+                    if g == self.dgen
+                        && matches!(self.cache.get(&(key.clone(), tab)), Some(Load::Loading))
+                    {
+                        self.cache.remove(&(key, tab));
+                    }
+                }
+                Msg::StartupFallback(g) => {
                     if g == self.hgen {
-                        self.header = crate::sanitize::clean(&h).into_owned();
+                        self.fallback_start();
+                    }
+                }
+                Msg::Reactors(item, id, g, res) => {
+                    self.react_pending.remove(&id);
+                    if g == self.dgen {
+                        match res {
+                            Ok(names) => {
+                                if let Some(Load::Done(Ok(Data::Comments(cd)))) =
+                                    self.cache.get_mut(&(item, Tab::Comments))
+                                {
+                                    for e in &mut cd.entries {
+                                        if e.card.set_reactors(&id, &names) {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => self.status = format!("could not load who reacted: {e}"),
+                        }
                     }
                 }
             }
@@ -974,12 +1563,33 @@ impl App {
         } else {
             it.repo.clone()
         };
-        thread::spawn(move || {
-            let pr = it.kind == Kind::Pr;
-            gh::more_pages(&repo, &it.number.to_string(), pr, pend, 1, &mut |m| {
-                tx.send(Msg::More(key.0.clone(), g, m)).is_ok()
-            });
-        });
+        // `m` is the user asking; scrolling toward the end is background work that waits for quota
+        let prio = if manual { Prio::User } else { Prio::Background };
+        let (gen_a, tx2, pend2, key2) =
+            (self.dgen_a.clone(), tx.clone(), pend.clone(), key.0.clone());
+        self.queue(
+            prio,
+            move || gen_a.load(Relaxed) != g,
+            move || {
+                let pr = it.kind == Kind::Pr;
+                gh::more_pages(&repo, &it.number.to_string(), pr, pend, 1, &mut |m| {
+                    tx.send(Msg::More(key.0.clone(), g, m)).is_ok()
+                });
+            },
+            move || {
+                let _ = tx2.send(Msg::More(key2, g, gh::More::Paused(pend2)));
+            },
+        );
+    }
+
+    /// How long the screen must sit still before this tab is fetched: the cheap Overview soon, the
+    /// expensive tabs (Comments, Diff, Commits, Checks, logs) after `settle_ms`.
+    fn settle(&self, tab: Tab) -> std::time::Duration {
+        std::time::Duration::from_millis(if tab == Tab::Overview {
+            100
+        } else {
+            self.cfg.api.settle_ms
+        })
     }
 
     fn fetch(&mut self, it: Item, tab: Tab) {
@@ -987,46 +1597,105 @@ impl App {
             return;
         }
         let key = (it.key(), tab);
-        if self.cache.contains_key(&key) {
+        // added to what queued jobs still want right away; the set is replaced (never cleared first)
+        // when the tick ends, so a job can't be judged stale in between
+        self.want_now.insert(key.clone());
+        if let Ok(mut w) = self.wanted.lock() {
+            w.insert(key.clone());
+        }
+        // trailing debounce for the Overview: only an item the cursor rested on for a whole tick
+        // (it was wanted on the previous idle tick too) is fetched, not every row scrolled past
+        if tab == Tab::Overview && !self.want_prev.contains(&key) {
+            return;
+        }
+        if self.cache.contains_key(&key)
+            || !self.net
+            || self.last_input.elapsed() < self.settle(tab)
+        {
             return;
         }
         self.cache.insert(key.clone(), Load::Loading);
-        let (tx, repo, g) = (self.tx.clone(), self.repo.clone(), self.dgen);
-        thread::spawn(move || {
-            let res = gh::detail(&repo, &it, tab);
-            // Comments arrive in pages: show the first at once, keep paging in this thread.
-            let more = match &res {
-                Ok(Data::Comments(cd)) if !cd.pend.is_empty() => Some(cd.pend.clone()),
-                _ => None,
-            };
-            let _ = tx.send(Msg::Detail(key.0.clone(), tab, g, res));
-            if let Some(pend) = more {
-                let repo = if it.repo.is_empty() {
-                    repo
-                } else {
-                    it.repo.clone()
+        let (tx, tx2, repo, g) = (
+            self.tx.clone(),
+            self.tx.clone(),
+            self.repo.clone(),
+            self.dgen,
+        );
+        let (wanted, gen_a, k2) = (self.wanted.clone(), self.dgen_a.clone(), key.clone());
+        let key3 = key.clone();
+        self.queue(
+            Prio::User,
+            // the cache was cleared, or the screen no longer asks for this item
+            move || gen_a.load(Relaxed) != g || !wanted.lock().is_ok_and(|w| w.contains(&k2)),
+            move || {
+                let res = gh::detail(&repo, &it, tab);
+                // Comments arrive in pages: the first at once, the rest as background work
+                let more = match &res {
+                    Ok(Data::Comments(cd)) if !cd.pend.is_empty() => Some(cd.pend.clone()),
+                    _ => None,
                 };
-                let pr = it.kind == Kind::Pr;
-                gh::more_pages(
-                    &repo,
-                    &it.number.to_string(),
-                    pr,
-                    pend,
-                    gh::AUTO_PAGES,
-                    &mut |m| tx.send(Msg::More(key.0.clone(), g, m)).is_ok(),
-                );
-            }
-        });
+                let _ = tx.send(Msg::Detail(key.0.clone(), tab, g, res));
+                if let Some(pend) = more {
+                    let repo = if it.repo.is_empty() {
+                        repo
+                    } else {
+                        it.repo.clone()
+                    };
+                    let (pr, n) = (it.kind == Kind::Pr, it.number.to_string());
+                    let (tx_run, tx_drop) = (tx.clone(), tx.clone());
+                    let (k_run, k_drop, pend_drop) = (key.0.clone(), key.0.clone(), pend.clone());
+                    pool::global().submit(
+                        Prio::Background,
+                        || false,
+                        move || {
+                            // quota low or backing off: leave the rest to scrolling or `m`
+                            if rate::quiet_now() {
+                                let _ = tx_run.send(Msg::More(k_run, g, gh::More::Paused(pend)));
+                                return;
+                            }
+                            gh::more_pages(&repo, &n, pr, pend, gh::AUTO_PAGES, &mut |m| {
+                                tx_run.send(Msg::More(k_run.clone(), g, m)).is_ok()
+                            });
+                        },
+                        move || {
+                            let _ = tx_drop.send(Msg::More(k_drop, g, gh::More::Paused(pend_drop)));
+                        },
+                    );
+                }
+            },
+            move || {
+                let _ = tx2.send(Msg::Dropped(key3.0, key3.1, g));
+            },
+        );
     }
 
-    /// Fetches whatever the screen needs and isn't cached yet; called when input is idle.
+    /// Fetches whatever the screen needs and isn't cached yet; called when input is idle. Detail
+    /// fetches still queued for anything this tick no longer asks for are dropped before they start.
     pub fn ensure(&mut self) {
+        self.want_now.clear();
+        self.ensure_tick();
+        self.want_prev = self.want_now.clone();
+        if let Ok(mut w) = self.wanted.lock() {
+            *w = std::mem::take(&mut self.want_now);
+        }
+    }
+
+    fn ensure_tick(&mut self) {
         self.fetch_counts();
-        if self
-            .unread_at
-            .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(120))
+        // the only polling there is: the badge every 2 minutes (background, pauses with the quota) and
+        // the free quota check every 5
+        if !self.bg_quiet()
+            && self
+                .unread_at
+                .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(120))
         {
-            self.spawn_unread();
+            self.spawn_unread(Prio::Background);
+        }
+        if self
+            .rate_at
+            .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(300))
+        {
+            self.spawn_rate_poll();
         }
         // scrolling toward the end of loaded comments pulls the next page, one at a time
         if self.comments_data().is_some_and(gh::CommentsData::paused) && self.near_comments_end() {
@@ -1098,7 +1767,11 @@ impl App {
     /// (rows, more than that) of the panel's showing tab; None while its first load is out.
     pub fn active_count(&self, i: usize) -> Option<(usize, bool)> {
         let p = &self.panels[i];
-        if p.loading && p.items.is_empty() {
+        // a failed load has no count (never "0"): only successful loads set one
+        if p.error.is_some() && p.items.is_empty() {
+            return None;
+        }
+        if (p.loading || p.unloaded) && p.items.is_empty() {
             return self.counts.get(&(p.kind, p.tab_id())).copied();
         }
         let items = self.visible(i);
@@ -1112,6 +1785,18 @@ impl App {
         Some((n, capped || more))
     }
 
+    /// The tab's list (or its count lookup) failed: the title shows a cross instead of a number.
+    pub fn tab_failed(&self, i: usize, ti: usize) -> bool {
+        let p = &self.panels[i];
+        if ti == p.tab {
+            p.error.is_some() && p.items.is_empty()
+        } else {
+            p.tabs
+                .get(ti)
+                .is_some_and(|t| self.count_failed.contains(&(p.kind, t.id)))
+        }
+    }
+
     /// Count of tab `ti` of panel `i`: live for the showing tab, as fetched for the others.
     pub fn tab_count(&self, i: usize, ti: usize) -> Option<(usize, bool)> {
         let p = &self.panels[i];
@@ -1120,6 +1805,17 @@ impl App {
         } else {
             self.counts.get(&(p.kind, p.tabs.get(ti)?.id)).copied()
         }
+    }
+
+    /// Will the count of tab `ti` of panel `i` be fetched by itself? (`?` is shown when not.)
+    pub fn count_wanted(&self, i: usize, ti: usize) -> bool {
+        let p = &self.panels[i];
+        let Some(t) = p.tabs.get(ti) else {
+            return false;
+        };
+        self.cfg.api.counts != config::Counts::Off
+            && !self.global
+            && !Panel::search_backed(p.kind, t.id)
     }
 
     /// Open PRs of the repo, when the PR list's "All" tab has been counted.
@@ -1332,6 +2028,7 @@ impl App {
     }
 
     pub fn on_mouse(&mut self, m: MouseEvent) {
+        self.last_input = std::time::Instant::now();
         if self.modal.is_some() || self.help {
             return;
         }
@@ -1417,6 +2114,9 @@ impl App {
     fn set_focus(&mut self, i: usize) {
         self.focus = i % self.panels.len();
         self.detail_focus = false;
+        if self.panels[self.focus].unloaded && self.ctx.is_none() {
+            self.load_panel(self.focus, false);
+        }
         self.reset_view();
         // Focusing Files shows the diff; `[` `]` can then move on to the PR's other tabs.
         if self.panels[self.focus].kind == PK::Files
@@ -1460,7 +2160,7 @@ impl App {
         (p.tab, p.cursor) = (to, 0);
         p.items.clear();
         self.reset_view();
-        self.load_panel(i);
+        self.load_panel(i, false);
     }
 
     /// Returns true to quit.
@@ -1494,6 +2194,7 @@ impl App {
         if ctrl && k.code == KeyCode::Char('c') {
             return true;
         }
+        self.last_input = std::time::Instant::now();
         self.status.clear();
         if let Some(m) = self.modal.take() {
             self.modal = self.modal_key(m, k, ctrl);
@@ -1692,12 +2393,10 @@ impl App {
             FormKind::Dispatch(id, name, path) => {
                 self.form_seq += 1;
                 let (tx, seq, repo2) = (self.tx.clone(), self.form_seq, repo.clone());
-                if self.net {
-                    thread::spawn(move || {
-                        let d = gh::form_data(&repo2, None, Some(&path));
-                        let _ = tx.send(Msg::FormData(seq, Box::new(d)));
-                    });
-                }
+                self.user_job(move || {
+                    let d = gh::form_data(&repo2, None, Some(&path));
+                    let _ = tx.send(Msg::FormData(seq, Box::new(d)));
+                });
                 return Some(Modal::Form(Box::new(Form::dispatch(&repo, &id, &name))));
             }
             FormKind::Pr(h) => Some(h),
@@ -1717,12 +2416,10 @@ impl App {
         };
         self.form_seq += 1;
         let (tx, seq) = (self.tx.clone(), self.form_seq);
-        if self.net {
-            thread::spawn(move || {
-                let d = gh::form_data(&repo, head.as_deref(), None);
-                let _ = tx.send(Msg::FormData(seq, Box::new(d)));
-            });
-        }
+        self.user_job(move || {
+            let d = gh::form_data(&repo, head.as_deref(), None);
+            let _ = tx.send(Msg::FormData(seq, Box::new(d)));
+        });
         Some(Modal::Form(Box::new(form)))
     }
 
@@ -1732,10 +2429,7 @@ impl App {
             Act::Help => self.help = true,
             Act::Filter if !self.detail_focus => self.typing = true,
             Act::Filter => {}
-            Act::Refresh => {
-                self.clear_cache();
-                self.load_panel(self.focus);
-            }
+            Act::Refresh => self.refresh_selected(),
             Act::RefreshAll => self.reload_all(),
             Act::Actions => self.open_menu(None),
             Act::Approve => self.open_menu(Some("Approve")),
@@ -1748,7 +2442,7 @@ impl App {
             Act::CopyUrl => self.copy(),
             Act::Checkout => self.checkout(),
             Act::Zoom => self.zoom = !self.zoom,
-            Act::Browser => self.open_browser(),
+            Act::Browser => self.open_browser(false),
             Act::Inbox => self.open_inbox(),
             Act::Global => {
                 if !self.detail_focus
@@ -1757,7 +2451,7 @@ impl App {
                     && self.dk().is_none()
                 {
                     self.global = !self.global;
-                    self.reload_all();
+                    self.reload(false);
                 } else if k.code == KeyCode::Char('G') {
                     // Derived panels and drill-in: G is "last row" like End; say why it isn't the toggle.
                     self.nav(isize::MAX);
@@ -1773,36 +2467,33 @@ impl App {
     }
 
     /// Open the full-screen repo browser and page through every repo the user can access.
-    fn open_browser(&mut self) {
+    fn open_browser(&mut self, fresh: bool) {
         self.repos_seq += 1;
-        let (tx, seq) = (self.tx.clone(), self.repos_seq);
-        self.browser = Some(Browser::new());
-        thread::spawn(move || {
-            let (mut after, mut total) = (None::<String>, 0usize);
-            loop {
-                match browse::fetch_page(after.as_deref()) {
-                    Err(e) => {
-                        let _ = tx.send(Msg::Repos(seq, Err(e)));
-                        return;
-                    }
-                    Ok(p) => {
-                        total += p.rows.len();
-                        let capped = p.next.is_some() && total >= browse::MAX_REPOS;
-                        let last = p.next.is_none() || capped;
-                        after = p.next;
-                        let m = RepoMsg {
-                            viewer: p.viewer,
-                            rows: p.rows,
-                            last,
-                            truncated: capped,
-                        };
-                        if tx.send(Msg::Repos(seq, Ok(m))).is_err() || last {
-                            return;
-                        }
-                    }
-                }
+        self.repos_a.store(self.repos_seq, Relaxed);
+        let mut b = Browser::new();
+        let mut cached = false;
+        // stale-while-revalidate: cached rows appear at once; older than the TTL they are then
+        // replaced by a fresh listing (`r` in the browser skips the cache)
+        let mut stale = true;
+        if !fresh && let Some((c, age)) = read_repos() {
+            (b.viewer, b.rows, b.truncated) = (c.viewer, c.rows, c.truncated);
+            stale = age > REPOS_TTL;
+            (b.loading, cached) = (stale, true);
+        }
+        self.browser = Some(b);
+        if stale {
+            let j = BrowseJob {
+                tx: self.tx.clone(),
+                seq: self.repos_seq,
+                seq_a: self.repos_a.clone(),
+                cached,
+                all: vec![],
+                total: 0,
+            };
+            if self.net {
+                browse_step(j, None);
             }
-        });
+        }
     }
 
     fn open_inbox(&mut self) {
@@ -1812,7 +2503,7 @@ impl App {
             loading: true,
             error: None,
         });
-        self.spawn_unread();
+        self.spawn_unread(Prio::User);
     }
 
     #[cfg(test)]
@@ -1849,7 +2540,7 @@ impl App {
             KeyCode::Char('G') | KeyCode::End => ib.cursor = last,
             KeyCode::Char('r') => {
                 ib.loading = true;
-                self.spawn_unread();
+                self.spawn_unread(Prio::User);
             }
             KeyCode::Char('o') => {
                 if let Some(url) = ib.items.get(ib.cursor).map(|i| i.url.clone()) {
@@ -1900,7 +2591,7 @@ impl App {
         let p = &mut self.panels[idx];
         p.set_tab_id(2);
         p.cursor = 0;
-        self.load_panel(idx);
+        self.load_panel(idx, false);
     }
 
     fn browser_key(&mut self, k: KeyEvent) {
@@ -1918,7 +2609,7 @@ impl App {
         match b.key(k, &self.cfg.repos) {
             Out::None => {}
             Out::Close => self.browser = None,
-            Out::Reload => self.open_browser(),
+            Out::Reload => self.open_browser(true),
             Out::Switch(r) => self.switch_repo(r),
             Out::Fav(r) => {
                 let on = self.cfg.repos.toggle_fav(&r);
@@ -1947,11 +2638,33 @@ impl App {
         self.exit_ctx();
         self.repo = repo;
         (self.cwd_branch, self.pending_select) = (None, None);
-        (self.global, self.header) = (false, format!(" {}", self.repo));
-        self.panels.iter_mut().for_each(|p| p.cursor = 0);
+        self.global = false;
+        (self.branch, self.meta) = (String::new(), None);
+        self.rebuild_header();
+        let focus = self.focus;
+        for (i, p) in self.panels.iter_mut().enumerate() {
+            p.cursor = 0;
+            // REST-backed panels are looked at again before they are fetched again
+            p.unloaded = i != focus && !matches!(p.kind, PK::Prs | PK::Issues | PK::Files);
+        }
         self.reset_view();
-        self.reload_all();
         self.spawn_header();
+        self.reload(false);
+    }
+
+    /// `r`: just the selected item (its cached details) and the list tab it sits in.
+    fn refresh_selected(&mut self) {
+        let key = self.selected().map(Item::key);
+        if let Some(k) = &key {
+            self.cache.retain(|(ik, _), _| ik != k);
+        }
+        if self.ctx.is_none() && self.panels[self.focus].source().is_some() {
+            self.load_panel(self.focus, true);
+        }
+        self.status = match key {
+            Some(_) => "refreshing the selected item".into(),
+            None => "refreshing the list".into(),
+        };
     }
 
     /// False when the save was refused or failed; the status line then says why.
@@ -2060,14 +2773,17 @@ impl App {
                 KeyCode::Char('y') => {
                     self.status = format!("running: {}", gh::shell(&c.cmd));
                     let tx = self.tx.clone();
-                    thread::spawn(move || {
-                        let r = match &c.local_of {
-                            Some(repo) => gh::require_clone(repo)
-                                .and_then(|()| gh::run_with(&c.cmd, c.stdin.as_deref())),
-                            None => gh::run_with(&c.cmd, c.stdin.as_deref()),
-                        };
-                        let _ = tx.send(Msg::Done(r, c.then));
-                    });
+                    self.mutation_job(
+                        move || {
+                            let r = match &c.local_of {
+                                Some(repo) => gh::require_clone(repo)
+                                    .and_then(|()| gh::run_with(&c.cmd, c.stdin.as_deref())),
+                                None => gh::run_with(&c.cmd, c.stdin.as_deref()),
+                            };
+                            let _ = tx.send(Msg::Done(r, c.then));
+                        },
+                        Msg::Done(Err("the command failed unexpectedly".into()), Then::None),
+                    );
                     None
                 }
                 KeyCode::Char('n') | KeyCode::Esc => c.back.map(Modal::Form),
@@ -2143,17 +2859,22 @@ impl App {
                     self.tx.clone(),
                     gh::viewed_mutation(&pr_id, &raw_path, now_on),
                 );
-                thread::spawn(move || {
-                    let r = gh::run_with(&cmd, None)
-                        .map(|_| {
-                            format!(
-                                "{} on GitHub",
-                                if now_on { "marked viewed" } else { "unmarked" }
-                            )
-                        })
-                        .map_err(|e| format!("GitHub viewed sync failed (local mark kept): {e}"));
-                    let _ = tx.send(Msg::Status(r));
-                });
+                self.mutation_job(
+                    move || {
+                        let r = gh::run_with(&cmd, None)
+                            .map(|_| {
+                                format!(
+                                    "{} on GitHub",
+                                    if now_on { "marked viewed" } else { "unmarked" }
+                                )
+                            })
+                            .map_err(|e| {
+                                format!("GitHub viewed sync failed (local mark kept): {e}")
+                            });
+                        let _ = tx.send(Msg::Status(r));
+                    },
+                    Msg::Status(Err("GitHub viewed sync failed (local mark kept)".into())),
+                );
             }
             Ok(_) => {}
         }
@@ -2201,8 +2922,42 @@ impl App {
         } else {
             &mut self.expanded
         };
-        if !set.remove(&key) {
+        let opened = !set.remove(&key);
+        if opened {
             set.insert(key);
+        }
+        if reactions && opened {
+            self.fetch_reactors();
+        }
+    }
+
+    /// `e` opened the reaction names of the selected comment: the first page only has counts, so ask
+    /// for the names (one small call per comment that lacks them).
+    fn fetch_reactors(&mut self) {
+        let Some(item) = self.selected().map(Item::key) else {
+            return;
+        };
+        let ids = self
+            .comments_data()
+            .and_then(|cd| cd.get(self.lrow()))
+            .map(|e| e.card.nameless_ids())
+            .unwrap_or_default();
+        for id in ids {
+            if !self.react_pending.insert(id.clone()) {
+                continue;
+            }
+            let (tx, g, item) = (self.tx.clone(), self.dgen, item.clone());
+            let (tx2, id2, item2) = (tx.clone(), id.clone(), item.clone());
+            self.user_job_or(
+                move || {
+                    let r = gh::reactors(&id);
+                    let _ = tx.send(Msg::Reactors(item, id, g, r));
+                },
+                // lost: clear the "in flight" mark so `e` can ask again
+                move || {
+                    let _ = tx2.send(Msg::Reactors(item2, id2, g, Err("request lost".into())));
+                },
+            );
         }
     }
 
@@ -2268,7 +3023,7 @@ impl App {
             (it.repo.clone(), ch.link.clone(), ch.name.clone(), it.key());
         self.status = "loading log...".into();
         let (tx, g) = (self.tx.clone(), self.dgen);
-        thread::spawn(move || {
+        self.user_job(move || {
             let _ = tx.send(Msg::Log(title, key, g, gh::failed_log(&repo, &link)));
         });
     }
@@ -2461,9 +3216,9 @@ mod tests {
         assert!(a.cwd_branch.is_none() && a.pending_select.is_none());
         let stale = a.hgen - 1;
         a.tx.send(Msg::Branch(stale, Some("old".into()))).unwrap();
-        a.tx.send(Msg::Header(stale, "old header".into())).unwrap();
+        a.tx.send(Msg::User(stale, "mallory".into())).unwrap();
         a.poll();
-        assert!(a.cwd_branch.is_none() && !a.header.contains("old header"));
+        assert!(a.cwd_branch.is_none() && !a.header.contains("mallory"));
         a.tx.send(Msg::Branch(a.hgen, Some("new".into()))).unwrap();
         a.poll();
         assert_eq!(a.cwd_branch.as_deref(), Some("new"));
@@ -2589,5 +3344,900 @@ mod tests {
         a.poll();
         assert_eq!(a.counts.get(&(PK::Repo, 1)), None);
         assert_eq!(a.counts.get(&(PK::Repo, 2)), Some(&(9, true)));
+    }
+
+    /// An app that really runs `gh` (the shim) and has been idle for a long time.
+    fn live(toml: &str) -> App {
+        let cfg = config::parse(toml, "t").unwrap();
+        let mut a = App::build(
+            "o/r".into(),
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+            cfg,
+        );
+        a.net = true;
+        a.last_input = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        a
+    }
+
+    fn wait(a: &mut App, what: &str, ok: impl Fn(&App) -> bool) {
+        // a generous deadline (30 s): it only matters when something is really wrong
+        for _ in 0..3000 {
+            a.poll();
+            if ok(a) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    fn list_calls(shim: &crate::testshim::Shim) -> Vec<String> {
+        shim.calls()
+            .into_iter()
+            .filter(|c| {
+                c.contains(" list") || c.starts_with("api repos") || c.contains("api --cache")
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn low_quota_shows_the_chip_then_pauses_background_work_and_recovers() {
+        let shim = crate::testshim::Shim::new();
+        let later = rate::now() + 3600;
+        shim.set("rate.out", &crate::testshim::rate_doc(900, later));
+        let mut a = live("[api]\ncounts = \"eager\"\n");
+        a.spawn_rate_poll();
+        wait(&mut a, "the quota poll", |a| a.rate.graphql.is_some());
+        // 18%: low (chip) but not paused
+        let chip = a.quota_chip().expect("chip under 20%");
+        assert_eq!((chip.remaining, chip.limit), (900, 5000));
+        assert!(a.quota_low && !a.paused && a.pause_note().is_none());
+        a.ensure();
+        assert!(a.cpending.is_empty(), "low quota: no background counts");
+        // 6%: paused, with the note and when it ends
+        shim.set("rate.out", &crate::testshim::rate_doc(300, later));
+        a.spawn_rate_poll();
+        wait(&mut a, "pause", |a| a.paused);
+        let note = a.pause_note().unwrap();
+        assert!(
+            note.starts_with("paused background refresh (rate limit low, resets "),
+            "{note}"
+        );
+        a.ensure();
+        assert!(a.cpending.is_empty());
+        assert!(
+            list_calls(&shim).is_empty(),
+            "nothing fetched in the background: {:?}",
+            shim.calls()
+        );
+        // user work still runs while paused
+        a.load_panel(2, false);
+        wait(&mut a, "a user-initiated list", |a| !a.panels[2].loading);
+        assert!(!list_calls(&shim).is_empty());
+        // the quota is back: the pause ends and counts resume
+        shim.set("rate.out", &crate::testshim::rate_doc(5000, later));
+        a.spawn_rate_poll();
+        wait(&mut a, "recovery", |a| !a.paused && !a.quota_low);
+        assert!(a.pause_note().is_none() && a.quota_chip().is_none());
+        a.ensure();
+        wait(&mut a, "a count", |a| !a.counts.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_secondary_limit_backs_background_work_off_for_the_time_it_names() {
+        let shim = crate::testshim::Shim::new();
+        shim.set(
+            "graphql.err",
+            "You have exceeded a secondary rate limit. Please wait a few minutes. Retry-After: 30",
+        );
+        let err = gh::graphql(vec!["api".into(), "graphql".into()]).unwrap_err();
+        assert!(err.contains("secondary rate limit"), "{err}");
+        let until = rate::snapshot().backoff_until;
+        let now = rate::now();
+        assert!(
+            (now + 25..=now + 31).contains(&until),
+            "backs off for the 30s it was told: {until} vs {now}"
+        );
+        let mut a = live("[api]\ncounts = \"eager\"\n");
+        a.poll();
+        assert!(
+            a.paused && !a.quota_low,
+            "backing off pauses without a chip"
+        );
+        a.ensure();
+        assert!(a.cpending.is_empty());
+        let work = |s: &crate::testshim::Shim| {
+            s.calls()
+                .iter()
+                .filter(|c| !c.contains("rate_limit"))
+                .count()
+        };
+        let before = work(&shim);
+        for _ in 0..5 {
+            a.ensure();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(work(&shim), before, "no retry loop while backing off");
+        // once the time has passed everything resumes
+        rate::reset_for_test();
+        a.poll();
+        assert!(!a.paused);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tab_counts_are_lazy_and_never_touch_search_backed_tabs() {
+        let shim = crate::testshim::Shim::new();
+        shim.set("prlist.out", "[]");
+        shim.set("issuelist.out", "[]");
+        let mut a = live("");
+        // PRs focused: Mine and Review are search-backed (`?`), All and Merged are plain lists
+        a.ensure();
+        wait(&mut a, "first count", |a| !a.counts.is_empty());
+        for _ in 0..3 {
+            a.ensure();
+            wait(&mut a, "no pending", |a| a.cpending.is_empty());
+        }
+        let keys: std::collections::HashSet<_> = a.counts.keys().copied().collect();
+        assert_eq!(keys, [(PK::Prs, 2), (PK::Prs, 3)].into(), "{keys:?}");
+        let c = shim.calls();
+        assert!(
+            c.iter()
+                .all(|c| !c.contains("--author") && !c.contains("--search")),
+            "{c:?}"
+        );
+        assert!(a.count_wanted(0, 2) && !a.count_wanted(0, 0) && !a.count_wanted(0, 1));
+        // other panels wait until focused
+        assert!(!a.counts.keys().any(|k| k.0 != PK::Prs));
+        // not for a second after typing
+        a.last_input = std::time::Instant::now();
+        a.set_focus(2);
+        a.ensure();
+        assert!(
+            a.cpending.is_empty(),
+            "lazy counts wait for a second of idling"
+        );
+        // global view and "off" fetch nothing
+        a.last_input = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        a.global = true;
+        a.ensure();
+        assert!(a.cpending.is_empty());
+        a.global = false;
+        let mut off = live("[api]\ncounts = \"off\"\n");
+        off.ensure();
+        assert!(off.cpending.is_empty() && !off.count_wanted(0, 2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eager_counts_cover_every_panel() {
+        let shim = crate::testshim::Shim::new();
+        shim.set("prlist.out", "[]");
+        shim.set("issuelist.out", "[]");
+        let mut a = live("[api]\ncounts = \"eager\"\n");
+        for _ in 0..400 {
+            a.ensure();
+            a.poll();
+            if a.counts.contains_key(&(PK::Issues, 2)) && a.counts.contains_key(&(PK::Repo, 2)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(a.counts.contains_key(&(PK::Issues, 2)) && a.counts.contains_key(&(PK::Repo, 2)));
+        assert!(
+            !a.counts.contains_key(&(PK::Prs, 0)),
+            "search-backed tabs stay `?`"
+        );
+        let _ = shim;
+    }
+
+    #[test]
+    fn expensive_tabs_wait_longer_than_the_overview() {
+        let mut a = plain();
+        assert_eq!(a.settle(Tab::Overview).as_millis(), 100);
+        for t in [Tab::Comments, Tab::Diff, Tab::Commits, Tab::Checks] {
+            assert_eq!(a.settle(t).as_millis(), 250, "{t:?}");
+        }
+        a.cfg.api.settle_ms = 400;
+        assert_eq!(a.settle(Tab::Diff).as_millis(), 400);
+        assert_eq!(a.settle(Tab::Overview).as_millis(), 100);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_detail_fetch_starts_only_after_its_settle_delay() {
+        let shim = crate::testshim::Shim::new();
+        let mut a = live("");
+        a.panels[0].items = vec![pr(7)];
+        let it = pr(7);
+        // a settle delay no test run can outlast, so "not yet" is exact; the Overview's is fixed (100 ms)
+        a.cfg.api.settle_ms = 3_600_000;
+        a.last_input = std::time::Instant::now() - std::time::Duration::from_secs(5);
+        a.fetch(it.clone(), Tab::Diff);
+        assert!(
+            a.cache.is_empty(),
+            "long enough for an Overview, not for a diff"
+        );
+        a.fetch(it.clone(), Tab::Overview);
+        assert!(
+            a.cache.is_empty(),
+            "the Overview waits for the item to rest a whole tick"
+        );
+        a.want_prev = a.want_now.clone();
+        a.fetch(it.clone(), Tab::Overview);
+        assert_eq!(a.cache.len(), 1);
+        a.cfg.api.settle_ms = 0;
+        a.fetch(it, Tab::Diff);
+        assert_eq!(a.cache.len(), 2);
+        wait(&mut a, "details", |a| {
+            a.cache.values().all(|l| matches!(l, Load::Done(_)))
+        });
+        let _ = shim;
+    }
+
+    #[test]
+    fn a_dropped_detail_fetch_forgets_its_placeholder() {
+        let mut a = plain();
+        let it = pr(7);
+        let key = (it.key(), Tab::Diff);
+        a.cache.insert(key.clone(), Load::Loading);
+        a.tx.send(Msg::Dropped(it.key(), Tab::Diff, a.dgen + 1))
+            .unwrap();
+        a.poll();
+        assert!(
+            a.cache.contains_key(&key),
+            "a drop from an older generation is ignored"
+        );
+        a.tx.send(Msg::Dropped(it.key(), Tab::Diff, a.dgen))
+            .unwrap();
+        a.poll();
+        assert!(!a.cache.contains_key(&key), "so it is asked for again");
+    }
+
+    #[test]
+    fn r_refreshes_the_selected_item_only_and_capital_r_everything() {
+        let mut a = plain();
+        a.panels[0].items = vec![pr(7), pr(8)];
+        for n in [7, 8] {
+            for t in [Tab::Overview, Tab::Comments] {
+                a.cache
+                    .insert((pr(n).key(), t), Load::Done(Ok(Data::Text(vec![]))));
+            }
+        }
+        let g = a.dgen;
+        a.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(a.cache.len(), 2, "only #7's entries went");
+        assert!(a.cache.keys().all(|(k, _)| *k == pr(8).key()));
+        assert_eq!(a.dgen, g, "no global invalidation");
+        assert!(a.panels[0].loading, "its list tab reloads");
+        a.on_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE));
+        assert!(a.cache.is_empty() && a.dgen > g, "R reloads everything");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_is_one_graphql_call_and_the_facts_are_cached() {
+        let shim = crate::testshim::Shim::new();
+        shim.set("graphql.out", include_str!("../tests/startup.json"));
+        let mut a = live("");
+        a.start_load(false);
+        wait(&mut a, "the lists", |a| {
+            !a.panels[0].loading && !a.panels[2].loading
+        });
+        wait(&mut a, "the facts", |a| {
+            a.meta.is_some() && !a.user.is_empty()
+        });
+        assert_eq!(shim.calls().len(), 1, "{:?}", shim.calls());
+        assert_eq!(a.panels[0].items.len(), 2);
+        assert_eq!(a.panels[2].items[0].number, 3);
+        assert_eq!(a.counts.get(&(PK::Prs, 2)), Some(&(74, false)));
+        assert_eq!(a.counts.get(&(PK::Prs, 0)), Some(&(2, false)));
+        assert!(a.header.contains("user: octocat"));
+        // a second start within five minutes skips the facts; r/R do not
+        let mut b = live("");
+        b.start_load(false);
+        wait(&mut b, "lists", |a| !a.panels[0].loading);
+        assert!(
+            shim.calls()[1].contains("-F meta=false"),
+            "{:?}",
+            shim.calls()
+        );
+        assert!(b.meta.is_some(), "the cached facts show at once");
+        b.start_load(true);
+        wait(&mut b, "lists", |a| !a.panels[0].loading);
+        assert!(shim.calls()[2].contains("-F meta=true"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_batch_falls_back_but_a_rate_limit_does_not() {
+        let shim = crate::testshim::Shim::new();
+        shim.set("graphql.err", "boom: schema changed");
+        let mut a = live("");
+        a.start_load(false);
+        wait(&mut a, "fallback", |_| {
+            let c = shim.calls();
+            c.iter().any(|c| c.contains("pr list")) && c.iter().any(|c| c.contains("issue list"))
+        });
+        wait(&mut a, "done", |a| {
+            !a.panels[0].loading && !a.panels[2].loading
+        });
+        shim.clear("graphql.err");
+        // rate limit: show it, do not ask again the old way
+        shim.set(
+            "graphql.err",
+            "API rate limit exceeded for user ID 1. Retry-After: 45",
+        );
+        let before = shim.calls().len();
+        let mut b = live("");
+        b.start_load(true);
+        wait(&mut b, "error", |a| a.panels[0].error.is_some());
+        assert!(b.panels[0].error.as_deref().unwrap().contains("rate limit"));
+        assert!(
+            shim.calls()[before..].iter().all(|c| !c.contains("list")),
+            "{:?}",
+            shim.calls()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_repo_browser_shows_cached_rows_at_once_then_refreshes_stale_ones() {
+        let shim = crate::testshim::Shim::new();
+        let row = |n: &str| RepoRow {
+            name: format!("o/{n}"),
+            owner: "o".into(),
+            ..Default::default()
+        };
+        let store = crate::cache::Store::default_if_enabled().unwrap();
+        let key = repos_key("github.com", "octocat");
+        let put = |who: &str, rows: Vec<RepoRow>, at: u64| {
+            let c = CachedRepos {
+                host: "github.com".into(),
+                viewer: who.into(),
+                rows,
+                truncated: false,
+            };
+            store.write(&key, &c, at).unwrap();
+        };
+        let page = |n: &str| {
+            format!(
+                r#"{{"data":{{"viewer":{{"login":"octocat","repositories":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[{{"nameWithOwner":"o/{n}","isPrivate":false,"isFork":false,"isArchived":false,"stargazerCount":1,"pushedAt":"2026-01-01T00:00:00Z","primaryLanguage":null,"owner":{{"__typename":"User","login":"o"}},"issues":{{"totalCount":0}},"pullRequests":{{"totalCount":0}}}}]}}}}}}}}"#
+            )
+        };
+        shim.set("graphql.out", &page("fresh"));
+        // fresh cache: shown, no call at all
+        put("octocat", vec![row("cached")], rate::now());
+        let mut a = live("");
+        a.open_browser(false);
+        assert_eq!(
+            a.browser.as_ref().unwrap().rows[0].name,
+            "o/cached",
+            "on screen at once"
+        );
+        wait(&mut a, "loading to end", |a| {
+            !a.browser.as_ref().unwrap().loading
+        });
+        assert!(
+            shim.calls().is_empty(),
+            "within the TTL nothing is fetched: {:?}",
+            shim.calls()
+        );
+        // stale cache: shown at once, then replaced
+        put("octocat", vec![row("cached")], rate::now() - REPOS_TTL - 5);
+        a.open_browser(false);
+        assert_eq!(a.browser.as_ref().unwrap().rows[0].name, "o/cached");
+        wait(&mut a, "refreshed", |a| {
+            a.browser
+                .as_ref()
+                .is_some_and(|b| !b.loading && b.rows[0].name == "o/fresh")
+        });
+        assert_eq!(
+            a.browser.as_ref().unwrap().rows.len(),
+            1,
+            "replaced, not appended"
+        );
+        let (c, _) = store.read::<CachedRepos>(&key, rate::now()).unwrap();
+        assert_eq!(c.rows[0].name, "o/fresh", "the new listing is cached");
+        // r in the browser bypasses the cache
+        let n = shim.calls().len();
+        a.open_browser(true);
+        assert!(
+            a.browser.as_ref().unwrap().rows.is_empty(),
+            "no cached rows on a bypass"
+        );
+        wait(&mut a, "bypass", |a| {
+            a.browser
+                .as_ref()
+                .is_some_and(|b| !b.loading && !b.rows.is_empty())
+        });
+        assert!(shim.calls().len() > n);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn another_account_or_host_never_sees_cached_data() {
+        let shim = crate::testshim::Shim::new();
+        shim.set("graphql.out", include_str!("../tests/startup.json"));
+        let store = crate::cache::Store::default_if_enabled().unwrap();
+        // alice (the shim's viewer is octocat): her facts and repo list are cached
+        let mut a = live("");
+        a.start_load(false);
+        wait(&mut a, "alice's facts", |a| a.meta.is_some());
+        let at = rate::now();
+        let c = CachedRepos {
+            host: "github.com".into(),
+            viewer: "octocat".into(),
+            rows: vec![RepoRow {
+                name: "o/private-one".into(),
+                ..Default::default()
+            }],
+            truncated: false,
+        };
+        store
+            .write(&repos_key("github.com", "octocat"), &c, at)
+            .unwrap();
+        // the account switches to bob: nothing of alice's is used, nothing is written under bob
+        gh::set_identity(Some(("github.com".into(), "bob".into())));
+        let calls = shim.calls().len();
+        let mut b = live("");
+        b.start_load(false);
+        wait(&mut b, "bob's startup", |b| !b.panels[0].loading);
+        assert!(
+            shim.calls()[calls].contains("-F meta=true"),
+            "alice's facts were discarded: {:?}",
+            shim.calls()
+        );
+        assert!(b.meta.as_ref().is_some_and(|_| true));
+        b.open_browser(false);
+        assert!(
+            b.browser.as_ref().unwrap().rows.is_empty(),
+            "alice's repo list stays hidden"
+        );
+        wait(&mut b, "listing", |b| {
+            b.browser.as_ref().is_some_and(|x| !x.loading)
+        });
+        assert!(
+            store
+                .read::<CachedRepos>(&repos_key("github.com", "bob"), rate::now())
+                .is_none(),
+            "an answer for someone else is not stored under bob"
+        );
+        // another host: its own keys, so alice's entries do not apply
+        gh::set_identity(Some(("ghe.example.com".into(), "octocat".into())));
+        assert!(read_repos().is_none() && read_meta("o/r").is_none());
+        // back as alice everything is still there
+        gh::set_identity(Some(("github.com".into(), "octocat".into())));
+        assert_eq!(read_repos().unwrap().0.rows[0].name, "o/private-one");
+        assert!(read_meta("o/r").is_some());
+        // an entry whose stored identity does not match its key is refused (tampering)
+        let forged = CachedRepos {
+            viewer: "mallory".into(),
+            ..read_repos().unwrap().0
+        };
+        store
+            .write(&repos_key("github.com", "octocat"), &forged, rate::now())
+            .unwrap();
+        assert!(read_repos().is_none());
+        // no known login (a token from the environment): nothing user-specific is cached
+        gh::set_identity(None);
+        assert!(read_repos().is_none() && read_meta("o/r").is_none());
+    }
+
+    #[test]
+    fn text_read_back_from_disk_is_neutralized_again() {
+        let _shim = crate::testshim::Shim::new();
+        let store = crate::cache::Store::default_if_enabled().unwrap();
+        let c = CachedRepos {
+            host: "github.com".into(),
+            viewer: "octocat".into(),
+            rows: vec![RepoRow {
+                name: "o/we\u{202e}ird".into(),
+                owner: "o\u{1b}[2J".into(),
+                ..Default::default()
+            }],
+            truncated: false,
+        };
+        store
+            .write(&repos_key("github.com", "octocat"), &c, rate::now())
+            .unwrap();
+        let r = &read_repos().unwrap().0.rows[0];
+        assert_eq!(
+            (r.name.as_str(), r.owner.as_str()),
+            ("o/we<U+202E>ird", "o<U+001B>[2J")
+        );
+        let m = gh::RepoMeta {
+            description: "d\u{202e}x".into(),
+            topics: vec!["t\u{200b}".into()],
+            ..Default::default()
+        };
+        write_meta("o/r", &m, "octocat");
+        let got = read_meta("o/r").unwrap();
+        assert_eq!(
+            (got.description.as_str(), got.topics[0].as_str()),
+            ("d<U+202E>x", "t<U+200B>")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reactor_names_are_fetched_on_demand_with_one_call_per_comment() {
+        let shim = crate::testshim::Shim::new();
+        let mut a = live("");
+        a.panels[0].items = vec![pr(7)];
+        let mut card = gh::Card {
+            id: "C1".into(),
+            ..Default::default()
+        };
+        card.reactions = vec![gh::Reaction {
+            content: "THUMBS_UP".into(),
+            count: 2,
+            users: vec![],
+        }];
+        let cd: gh::CommentsData = vec![gh::Entry {
+            head: "h".into(),
+            body: "b".into(),
+            resolved: false,
+            thread: None,
+            card,
+        }]
+        .into();
+        a.cache.insert(
+            (pr(7).key(), Tab::Comments),
+            Load::Done(Ok(Data::Comments(cd))),
+        );
+        a.dtab = 2; // Comments
+        shim.set(
+            "graphql.out",
+            r#"{"data":{"node":{"reactionGroups":[{"content":"THUMBS_UP","users":{"totalCount":2,"nodes":[{"login":"hubot"},{"login":"monalisa"}]}}]},"rateLimit":{"cost":1,"remaining":4000,"resetAt":"2030-01-01T00:00:00Z","limit":5000}}}"#,
+        );
+        a.detail_focus = true;
+        a.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        wait(&mut a, "names", |a| {
+            matches!(a.cache.get(&(pr(7).key(), Tab::Comments)),
+                Some(Load::Done(Ok(Data::Comments(cd)))) if !cd[0].card.reactions[0].users.is_empty())
+        });
+        assert_eq!(
+            shim.calls()
+                .iter()
+                .filter(|c| c.contains("api graphql"))
+                .count(),
+            1
+        );
+        // closing and reopening does not ask again: the names are known
+        a.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        a.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            shim.calls()
+                .iter()
+                .filter(|c| c.contains("api graphql"))
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_confirmed_write_does_not_wait_behind_reads_or_hung_calls() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        let shim = crate::testshim::Shim::new();
+        // every pool worker busy (and more waiting) with reads that hang until the test lets go
+        let (done, release) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        for _ in 0..8 {
+            let (d, r) = (done.clone(), release.clone());
+            pool::global().submit(
+                Prio::User,
+                || false,
+                move || {
+                    while !r.load(Relaxed) {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    d.fetch_add(1, Relaxed);
+                },
+                || {},
+            );
+        }
+        let mut a = live("");
+        a.modal = Some(Modal::Confirm(Confirm::new(
+            ["gh", "api", "-X", "PATCH", "notifications/threads/9"]
+                .map(String::from)
+                .to_vec(),
+            None,
+        )));
+        a.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        wait(&mut a, "the write", |_| {
+            shim.calls().iter().any(|c| c.contains("PATCH"))
+        });
+        // structural, not timed: the write has run while every read is still stuck
+        assert_eq!(
+            done.load(Relaxed),
+            0,
+            "the write did not wait for the reads"
+        );
+        release.store(true, Relaxed);
+        while done.load(Relaxed) < 8 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        wait(&mut a, "the result", |a| !a.status.starts_with("running"));
+        assert_eq!(
+            shim.calls().iter().filter(|c| c.contains("PATCH")).count(),
+            1,
+            "exactly once"
+        );
+    }
+
+    #[test]
+    fn jobs_the_pool_loses_are_reported_not_forgotten() {
+        let mut a = plain();
+        // what the lost-job paths send: a list error, a status, a cleared "in flight" mark
+        a.panels[2].loading = true;
+        a.panels[2].seq = 5;
+        a.tx.send(Msg::List(
+            PK::Issues,
+            0,
+            5,
+            Err("could not load; try again (r)".into()),
+        ))
+        .unwrap();
+        a.react_pending.insert("C1".into());
+        a.tx.send(Msg::Reactors(
+            "k".into(),
+            "C1".into(),
+            a.dgen,
+            Err("request lost".into()),
+        ))
+        .unwrap();
+        a.poll();
+        assert!(
+            !a.panels[2].loading && a.panels[2].error.is_some(),
+            "not stuck on loading"
+        );
+        assert!(a.react_pending.is_empty() && a.status.contains("could not load who reacted"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_long_repo_list_arrives_a_page_per_job_and_is_cached_once() {
+        let shim = crate::testshim::Shim::new();
+        let page = |n: &str, next: bool| {
+            format!(
+                r#"{{"data":{{"viewer":{{"login":"octocat","repositories":{{"pageInfo":{{"hasNextPage":{next},"endCursor":"c"}},"nodes":[{{"nameWithOwner":"o/{n}","isPrivate":false,"isFork":false,"isArchived":false,"stargazerCount":1,"pushedAt":"2026-01-01T00:00:00Z","primaryLanguage":null,"owner":{{"__typename":"User","login":"o"}},"issues":{{"totalCount":0}},"pullRequests":{{"totalCount":0}}}}]}}}}}}}}"#
+            )
+        };
+        shim.set("graphql.1.out", &page("one", true));
+        shim.set("graphql.2.out", &page("two", true));
+        shim.set("graphql.3.out", &page("three", false));
+        let mut a = live("");
+        a.open_browser(true);
+        wait(&mut a, "all pages", |a| {
+            a.browser.as_ref().is_some_and(|b| !b.loading)
+        });
+        let names: Vec<_> = a
+            .browser
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+        assert_eq!(names, ["o/one", "o/two", "o/three"]);
+        assert!(
+            shim.calls()[1].contains("after=c"),
+            "pages follow the cursor: {:?}",
+            shim.calls()
+        );
+        let (c, _) = crate::cache::Store::default_if_enabled()
+            .unwrap()
+            .read::<CachedRepos>(&repos_key("github.com", "octocat"), rate::now())
+            .unwrap();
+        assert_eq!(
+            c.rows.len(),
+            3,
+            "the whole list is cached, once, at the end"
+        );
+        // closing and reopening drops the old listing's remaining pages (its jobs are stale)
+        a.open_browser(true);
+        a.open_browser(true);
+        assert_eq!(a.repos_a.load(Relaxed), a.repos_seq);
+    }
+
+    fn key(a: &mut App, c: char) {
+        a.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+
+    /// Overview requests (`pr view` with the overview fields; the headRefOid lookups belong to the diff).
+    fn views(shim: &crate::testshim::Shim) -> usize {
+        shim.calls()
+            .iter()
+            .filter(|c| c.contains("pr view") && c.contains("isDraft"))
+            .count()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scrolling_through_a_list_fetches_only_the_item_you_rest_on() {
+        let shim = crate::testshim::Shim::new();
+        let mut a = live("");
+        a.panels[0].items = (1..=12).map(pr).collect();
+        a.ensure(); // a tick before scrolling starts
+        // ten presses with the gap a real terminal user (or a slow redraw) leaves: after each
+        // press the loop idles 100ms and runs a tick, then the next key arrives
+        for _ in 0..10 {
+            key(&mut a, 'j');
+            std::thread::sleep(std::time::Duration::from_millis(110));
+            a.ensure();
+            a.last_input = std::time::Instant::now() - std::time::Duration::from_millis(120);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            views(&shim),
+            0,
+            "nothing was fetched while the cursor kept moving: {:?}",
+            shim.calls()
+        );
+        // the cursor rests: one tick registers the item, the next fetches it, and only it
+        a.last_input = std::time::Instant::now() - std::time::Duration::from_millis(150);
+        a.ensure();
+        a.ensure();
+        wait(&mut a, "the overview", |_| views(&shim) >= 1);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(views(&shim), 1, "{:?}", shim.calls());
+        assert!(
+            shim.calls()
+                .iter()
+                .any(|c| c.contains("pr view 11") && c.contains("isDraft")),
+            "{:?}",
+            shim.calls()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn comments_are_fetched_once_and_only_when_asked_for() {
+        let shim = crate::testshim::Shim::new();
+        let comments = |c: &crate::testshim::Shim| {
+            c.calls()
+                .iter()
+                .filter(|x| x.contains("comments(first"))
+                .count()
+        };
+        let empty = r#"{"data":{"repository":{"pullRequest":{"comments":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},"reviews":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]},"reviewThreads":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}},"rateLimit":{"cost":1,"remaining":4000,"resetAt":"2030-01-01T00:00:00Z","limit":5000}}}"#;
+        shim.set("graphql.out", empty);
+        let mut a = live("");
+        a.panels[0].items = vec![pr(1), pr(2)];
+        // selecting a PR on its Overview, Checks and Diff tabs, however many ticks pass: no comments request
+        for _ in 0..4 {
+            a.ensure();
+            std::thread::sleep(std::time::Duration::from_millis(130));
+        }
+        key(&mut a, ']'); // Checks
+        a.last_input = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        for _ in 0..3 {
+            a.ensure();
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            shim.calls()
+                .iter()
+                .filter(|c| c.contains("reviewThreads"))
+                .all(|c| !c.contains("body") && !c.contains("reactionGroups")),
+            "the Files badges ask for thread paths only: {:?}",
+            shim.calls()
+        );
+        assert_eq!(comments(&shim), 0, "{:?}", shim.calls());
+        // the Comments tab: one request, however often the tick repeats and the key is pressed
+        while a.cur_tab() != Tab::Comments {
+            key(&mut a, ']');
+        }
+        a.last_input = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        for _ in 0..6 {
+            a.ensure();
+            a.last_input = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        }
+        wait(&mut a, "comments", |_| comments(&shim) >= 1);
+        for _ in 0..6 {
+            a.ensure();
+            a.poll();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        assert_eq!(
+            comments(&shim),
+            1,
+            "in-flight and finished jobs are not queued again: {:?}",
+            shim.calls()
+        );
+        // the drill-in asks for it once too (plus the other three tabs)
+        let before = comments(&shim);
+        key(&mut a, '\u{0}');
+        a.enter_ctx();
+        for _ in 0..6 {
+            a.last_input = std::time::Instant::now() - std::time::Duration::from_secs(1);
+            a.ensure();
+            a.poll();
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        assert_eq!(comments(&shim), before, "already cached: not fetched again");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identical_requests_are_not_queued_twice() {
+        let shim = crate::testshim::Shim::new();
+        let mut a = live("");
+        a.panels[0].items = vec![pr(3)];
+        for _ in 0..5 {
+            a.fetch(pr(3), Tab::Checks);
+        }
+        wait(&mut a, "checks", |_| {
+            shim.calls().iter().any(|c| c.contains("pr checks"))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        a.fetch(pr(3), Tab::Checks);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let n = shim
+            .calls()
+            .iter()
+            .filter(|c| c.contains("pr checks"))
+            .count();
+        assert_eq!(n, 1, "{:?}", shim.calls());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_list_or_count_is_unknown_not_zero_and_is_not_retried() {
+        let shim = crate::testshim::Shim::new();
+        let mut a = live("");
+        // the list failed (timeout, error): the title says so, never "0"
+        a.panels[0].error = Some("gh timed out after 60s".into());
+        assert_eq!(a.active_count(0), None);
+        assert!(a.tab_failed(0, 0) && !a.tab_failed(0, 1));
+        a.panels[0].error = None;
+        assert_eq!(
+            a.active_count(0),
+            Some((0, false)),
+            "an empty successful list is a real 0"
+        );
+        // a count lookup that fails stays unknown, shows the cross, and is asked for once
+        shim.set("prlist.err", "boom");
+        a.ensure();
+        wait(&mut a, "the failed count", |a| {
+            a.count_failed.contains(&(PK::Prs, 2))
+        });
+        assert!(!a.counts.contains_key(&(PK::Prs, 2)) && a.tab_failed(0, 2));
+        let asked = shim
+            .calls()
+            .iter()
+            .filter(|c| c.contains("pr list"))
+            .count();
+        for _ in 0..4 {
+            a.last_input = std::time::Instant::now() - std::time::Duration::from_secs(5);
+            a.ensure();
+            a.poll();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        // (the Merged tab may be asked once; the failed All tab is not asked again)
+        let all = |s: &crate::testshim::Shim| {
+            s.calls()
+                .iter()
+                .filter(|c| c.contains("pr list") && !c.contains("--state=merged"))
+                .count()
+        };
+        assert_eq!(
+            all(&shim),
+            1,
+            "no retry loop: {asked} asked, {:?}",
+            shim.calls()
+        );
+        // a reload forgets the failure
+        a.reload(false);
+        assert!(a.count_failed.is_empty());
     }
 }

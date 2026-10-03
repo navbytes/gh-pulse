@@ -1,9 +1,30 @@
 use crate::diff;
 use serde::Deserialize;
 use serde_json::Value;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::process::Command;
 use std::sync::Mutex;
+
+/// Which program runs as `gh` (tests point this at a shim script).
+static PROGRAM: Mutex<Option<OsString>> = Mutex::new(None);
+
+#[cfg(test)]
+pub fn set_program(p: Option<OsString>) {
+    if let Ok(mut g) = PROGRAM.lock() {
+        *g = p;
+    }
+}
+
+fn program() -> OsString {
+    let set = PROGRAM.lock().ok().and_then(|g| g.clone());
+    // unit tests never reach the real GitHub by accident (a job outliving its shim would): the
+    // `--ignored` live tests opt in with GH_PULSE_LIVE=1
+    #[cfg(test)]
+    if set.is_none() && std::env::var_os("GH_PULSE_LIVE").is_none() {
+        return "false".into();
+    }
+    set.unwrap_or_else(|| "gh".into())
+}
 
 static LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
@@ -15,6 +36,11 @@ fn log_cmd(prog: &str, args: &[String]) {
     let mut v = vec![prog.to_string()];
     v.extend_from_slice(args);
     push_log(shell(&v));
+}
+
+/// An annotation under the command it belongs to in the `L` log.
+pub fn log_note(line: &str) {
+    push_log(format!("  {line}"));
 }
 
 fn push_log(line: String) {
@@ -53,7 +79,7 @@ fn sync_viewed() -> bool {
     SYNC_VIEWED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-const VIEWED_Q: &str = "query($o:String!,$n:String!,$p:Int!,$a:String){repository(owner:$o,name:$n){pullRequest(number:$p){id files(first:100,after:$a){pageInfo{hasNextPage endCursor} nodes{path viewerViewedState}}}}}";
+const VIEWED_Q: &str = "query($o:String!,$n:String!,$p:Int!,$a:String){repository(owner:$o,name:$n){pullRequest(number:$p){id files(first:100,after:$a){pageInfo{hasNextPage endCursor} nodes{path viewerViewedState}}}} rateLimit{cost remaining resetAt limit}}";
 const MARK_Q: &str = "mutation($id:ID!,$path:String!){markFileAsViewed(input:{pullRequestId:$id,path:$path}){clientMutationId}}";
 const UNMARK_Q: &str = "mutation($id:ID!,$path:String!){unmarkFileAsViewed(input:{pullRequestId:$id,path:$path}){clientMutationId}}";
 
@@ -98,7 +124,7 @@ fn fetch_viewed(repo: &str, n: &str) -> Result<(String, Vec<String>), String> {
         if let Some(c) = &after {
             a.extend(["-f".to_string(), format!("a={c}")]);
         }
-        let (pid, viewed, next) = parse_viewed_page(&gh(a)?)?;
+        let (pid, viewed, next) = parse_viewed_page(&graphql(a)?)?;
         (id, all) = (pid, [all, viewed].concat());
         match next {
             Some(c) => after = Some(c),
@@ -251,28 +277,201 @@ pub struct Label {
     pub name: String,
 }
 
+static TIMEOUT_S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(60);
+
+/// `[api] timeout_s`: how long a read may take (pagination gets double).
+pub fn set_timeout(secs: u64) {
+    TIMEOUT_S.store(secs.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(TIMEOUT_S.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Processes we started and are still waiting for, so quitting can end them.
+static CHILDREN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Kills every `gh`/`git` child still running (called on the way out: no orphans).
+pub fn kill_children() {
+    let pids: Vec<String> = CHILDREN
+        .lock()
+        .map(|mut c| c.drain(..).map(|p| p.to_string()).collect())
+        .unwrap_or_default();
+    if !pids.is_empty() {
+        let _ = Command::new("kill").arg("-KILL").args(&pids).output();
+    }
+}
+
+/// Reads get `timeout_s`; paging through everything gets double.
+fn limit_for(args: &[OsString]) -> std::time::Duration {
+    if args.iter().any(|a| a == "--paginate") {
+        timeout().saturating_mul(2)
+    } else {
+        timeout()
+    }
+}
+
+/// Runs a command to completion within `limit`, collecting its output; on expiry the child is killed
+/// and the error says so. `stdin` is piped in from a helper thread (large bodies).
+fn run_child(
+    mut c: Command,
+    stdin: Option<&str>,
+    limit: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    let prog = std::path::Path::new(c.get_program())
+        .file_name()
+        .map_or_else(|| "gh".into(), |n| n.to_string_lossy().into_owned());
+    c.stdin(if stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    let mut child = c.spawn().map_err(|e| format!("cannot run {prog}: {e}"))?;
+    let pid = child.id();
+    if let Ok(mut l) = CHILDREN.lock() {
+        l.push(pid);
+    }
+    if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        let text = text.to_string();
+        // the child reads it all before answering; a broken pipe just means it failed early
+        std::thread::spawn(move || {
+            let _ = pipe.write_all(text.as_bytes());
+        });
+    }
+    let reader = |p: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut v = vec![];
+            if let Some(mut p) = p {
+                let _ = p.read_to_end(&mut v);
+            }
+            v
+        })
+    };
+    let out = reader(
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let err = reader(
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Ok(st),
+            Ok(None) if start.elapsed() >= limit => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!("{prog} timed out after {}s", limit.as_secs()));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            Err(e) => break Err(format!("cannot run {prog}: {e}")),
+        }
+    };
+    if let Ok(mut l) = CHILDREN.lock() {
+        l.retain(|p| *p != pid);
+    }
+    // after a kill the pipes may still be held by grandchildren: do not wait for the readers then
+    let status = status?;
+    Ok(std::process::Output {
+        status,
+        stdout: out.join().unwrap_or_default(),
+        stderr: err.join().unwrap_or_default(),
+    })
+}
+
 pub fn gh<I, S>(args: I) -> Result<String, String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let args: Vec<_> = args.into_iter().collect();
+    run_gh(
+        args.into_iter()
+            .map(|a| a.as_ref().to_os_string())
+            .collect(),
+        &[],
+    )
+}
+
+/// Every `gh` the app runs for itself goes through here: logged, rate-limit errors noted.
+fn run_gh(args: Vec<OsString>, env: &[(&str, OsString)]) -> Result<String, String> {
     log_cmd(
         "gh",
         &args
             .iter()
-            .map(|a| a.as_ref().to_string_lossy().into_owned())
+            .map(|a| a.to_string_lossy().into_owned())
             .collect::<Vec<_>>(),
     );
-    let o = Command::new("gh")
-        .args(args)
-        .output()
-        .map_err(|e| format!("cannot run gh: {e}"))?;
+    let limit = limit_for(&args);
+    let mut c = Command::new(program());
+    c.args(args);
+    c.envs(env.iter().map(|(k, v)| (k, v)));
+    let o = run_child(c, None, limit).inspect_err(|e| push_log(format!("  error: {e}")))?;
     if o.status.success() {
         Ok(String::from_utf8_lossy(&o.stdout).into_owned())
     } else {
-        Err(crate::sanitize::clean(String::from_utf8_lossy(&o.stderr).trim()).into_owned())
+        Err(throttle_note(
+            crate::sanitize::clean(String::from_utf8_lossy(&o.stderr).trim()).into_owned(),
+        ))
     }
+}
+
+/// A rate-limit error backs background work off, and says when the quota comes back.
+fn throttle_note(e: String) -> String {
+    if rate_limit_secs(&e).is_none() {
+        return e;
+    }
+    crate::rate::note_error(&e);
+    let st = crate::rate::snapshot();
+    let now = crate::rate::now();
+    let reset = [st.graphql, st.core]
+        .into_iter()
+        .flatten()
+        .map(|b| b.reset)
+        .filter(|r| *r > now)
+        .min();
+    match reset {
+        Some(r) if !e.contains("resets") => format!("{e} (resets {})", crate::rate::clock(r)),
+        _ => e,
+    }
+}
+
+/// `gh api --cache <ttl>` for a slow-changing GET or query; `fresh` (the user pressed r/R) or
+/// `[api] cache = false` runs it uncached. The cache files are gh's own (0600, no tokens), kept in
+/// gh-pulse's cache directory so `--clear-cache` can remove exactly them.
+pub fn gh_cached(args: Vec<String>, ttl: &str, fresh: bool) -> Result<String, String> {
+    let (args, env) = cached_call(args, ttl, fresh);
+    run_gh(args.into_iter().map(OsString::from).collect(), &env)
+}
+
+fn cached_call(
+    mut args: Vec<String>,
+    ttl: &str,
+    fresh: bool,
+) -> (Vec<String>, Vec<(&'static str, OsString)>) {
+    let home = crate::cache::gh_home().filter(|_| crate::cache::enabled() && !fresh);
+    match home {
+        Some(h) if !args.is_empty() => {
+            args.splice(1..1, ["--cache".to_string(), ttl.to_string()]);
+            (args, vec![("XDG_CACHE_HOME", h.into_os_string())])
+        }
+        _ => (args, vec![]),
+    }
+}
+
+/// Our own GraphQL calls: the `rateLimit` footer in the answer updates the shared quota state.
+pub fn graphql(args: Vec<String>) -> Result<String, String> {
+    let out = gh(args)?;
+    crate::rate::note_graphql_response(&out);
+    Ok(out)
 }
 
 fn json<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, String> {
@@ -484,11 +683,14 @@ fn tag_rows(v: &Value, repo: &str) -> Vec<Item> {
         .collect()
 }
 
-fn tags(repo: &str) -> Result<Vec<Item>, String> {
+fn tags(repo: &str, fresh: bool) -> Result<Vec<Item>, String> {
     let mut out = vec![];
     for page in 1..=TAG_PAGES {
         let path = format!("repos/{repo}/tags?per_page={LIMIT}&page={page}");
-        let rows = tag_rows(&json(&gh(["api", &path])?)?, repo);
+        let rows = tag_rows(
+            &json(&gh_cached(vec!["api".into(), path], "10m", fresh)?)?,
+            repo,
+        );
         let full = rows.len() >= LIMIT;
         out.extend(rows);
         if !full {
@@ -506,7 +708,7 @@ pub fn notifications() -> Result<Vec<Item>, String> {
 }
 
 /// What the header and the empty detail pane say about the repo (text already neutralized).
-#[derive(Default)]
+#[derive(Default, Clone, serde::Serialize, Deserialize)]
 pub struct RepoMeta {
     pub stars: u64,
     pub forks: u64,
@@ -520,46 +722,315 @@ pub struct RepoMeta {
     pub pushed: String,
 }
 
-pub fn repo_meta(repo: &str) -> Result<RepoMeta, String> {
-    let f = "stargazerCount,forkCount,issues,isPrivate,defaultBranchRef,description,licenseInfo,repositoryTopics,pushedAt";
-    let v: Value = json(&gh(["repo", "view", repo, "--json", f])?)?;
+impl RepoMeta {
+    /// Neutralize text read back from disk, as everything from GitHub is on the way in.
+    pub fn clean(&mut self) {
+        use crate::sanitize::clean_in_place as c;
+        c(&mut self.branch);
+        c(&mut self.description);
+        c(&mut self.license);
+        c(&mut self.pushed);
+        self.topics.iter_mut().for_each(c);
+    }
+}
+
+/// `gh repo view`-shaped or GraphQL `repository` JSON -> the facts the header and overview show.
+fn meta_from(v: &Value, topics: Vec<String>) -> RepoMeta {
     let s = |p: &str| {
         crate::sanitize::clean(v.pointer(p).and_then(Value::as_str).unwrap_or("")).into_owned()
     };
-    Ok(RepoMeta {
+    RepoMeta {
         stars: v["stargazerCount"].as_u64().unwrap_or(0),
         forks: v["forkCount"].as_u64().unwrap_or(0),
-        issues: v["issues"]["totalCount"].as_u64().unwrap_or(0),
+        issues: v["openIssues"]["totalCount"]
+            .as_u64()
+            .or_else(|| v["issues"]["totalCount"].as_u64())
+            .unwrap_or(0),
         private: v["isPrivate"] == true,
         branch: s("/defaultBranchRef/name"),
         description: s("/description"),
         license: s("/licenseInfo/name"),
-        topics: v["repositoryTopics"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|t| t["name"].as_str())
-            .map(|t| crate::sanitize::clean(t).into_owned())
-            .collect(),
+        topics,
         pushed: day(&s("/pushedAt")).to_string(),
+    }
+}
+
+/// What the first screen needs, asked for in one GraphQL request: the active tab of the PR and
+/// Issues lists, the viewer, the repo's header facts and the quota. Values travel as variables.
+const STARTUP_Q: &str = "\
+query($o:String!,$n:String!,$qpr:String!,$qis:String!,$prSearch:Boolean!,$prOpen:Boolean!,$prMerged:Boolean!,$isSearch:Boolean!,$isOpen:Boolean!,$meta:Boolean!){\
+ viewer{login}\
+ rateLimit{cost remaining resetAt limit}\
+ repository(owner:$o,name:$n){\
+  openPrs:pullRequests(states:OPEN){totalCount}\
+  ... on Repository @include(if:$meta){stargazerCount forkCount isPrivate description pushedAt licenseInfo{name} defaultBranchRef{name} openIssues:issues(states:OPEN){totalCount} repositoryTopics(first:20){nodes{topic{name}}}}\
+  prOpen:pullRequests(states:OPEN,first:100,orderBy:{field:CREATED_AT,direction:DESC}) @include(if:$prOpen){nodes{...PRF}}\
+  prMerged:pullRequests(states:MERGED,first:100,orderBy:{field:CREATED_AT,direction:DESC}) @include(if:$prMerged){nodes{...PRF}}\
+  isOpen:issues(states:OPEN,first:100,orderBy:{field:CREATED_AT,direction:DESC}) @include(if:$isOpen){nodes{...ISF}}\
+ }\
+ prSearch:search(query:$qpr,type:ISSUE,first:100) @include(if:$prSearch){nodes{...PRF}}\
+ isSearch:search(query:$qis,type:ISSUE,first:100) @include(if:$isSearch){nodes{...ISF}}\
+}\
+fragment PRF on PullRequest{number title url state isDraft body author{login} labels(first:20){nodes{name}}}\
+fragment ISF on Issue{number title url state body author{login} labels(first:20){nodes{name}}}";
+
+/// Which first-screen parts to fetch: the PR and issue tab ids (`gh::list` ids) to open with, and
+/// whether the repo facts are needed (not when a fresh copy is cached).
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct StartupWant {
+    pub prs: Option<usize>,
+    pub issues: Option<usize>,
+    pub meta: bool,
+}
+
+pub struct Startup {
+    pub prs: Option<Vec<Item>>,
+    pub issues: Option<Vec<Item>>,
+    pub meta: Option<RepoMeta>,
+    pub user: String,
+    pub open_prs: Option<usize>,
+}
+
+/// The variables of the startup request (all strings; booleans go as `-F`).
+fn startup_vars(repo: &str, want: &StartupWant) -> Result<Vec<(String, String, bool)>, String> {
+    let (o, n) = repo.split_once('/').ok_or("bad repo")?;
+    let search =
+        |kind: &str, qual: &str| format!("repo:{repo} is:{kind} is:open {qual} sort:created-desc");
+    let qpr = match want.prs {
+        Some(0) => search("pr", "author:@me"),
+        Some(1) => search("pr", "review-requested:@me"),
+        _ => String::new(),
+    };
+    let qis = match want.issues {
+        Some(0) => search("issue", "assignee:@me"),
+        Some(1) => search("issue", "author:@me"),
+        _ => String::new(),
+    };
+    let b = |on: bool| (on.to_string(), true);
+    let v = [
+        ("o", (o.to_string(), false)),
+        ("n", (n.to_string(), false)),
+        ("qpr", (qpr, false)),
+        ("qis", (qis, false)),
+        ("prSearch", b(matches!(want.prs, Some(0 | 1)))),
+        ("prOpen", b(want.prs == Some(2))),
+        ("prMerged", b(want.prs == Some(3))),
+        ("isSearch", b(matches!(want.issues, Some(0 | 1)))),
+        ("isOpen", b(want.issues == Some(2))),
+        ("meta", b(want.meta)),
+    ];
+    Ok(v.into_iter()
+        .map(|(k, (v, raw))| (k.to_string(), v, raw))
+        .collect())
+}
+
+/// One GraphQL call for the first screen.
+pub fn startup(repo: &str, want: &StartupWant) -> Result<Startup, String> {
+    let mut a: Vec<String> = ["api", "graphql", "-f"].map(String::from).to_vec();
+    a.push(format!("query={STARTUP_Q}"));
+    for (k, v, raw) in startup_vars(repo, want)? {
+        a.extend([
+            if raw { "-F" } else { "-f" }.to_string(),
+            format!("{k}={v}"),
+        ]);
+    }
+    parse_startup(&graphql(a)?, repo, want)
+}
+
+/// GraphQL nodes -> the `Item`s `gh pr list` / `gh issue list` would have produced.
+fn graphql_items(nodes: &Value, kind: Kind, repo: &str) -> Vec<Item> {
+    nodes
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|n| n["number"].is_u64())
+        .filter_map(|n| {
+            let mut n = n.clone();
+            let labels: Vec<Value> = n["labels"]["nodes"].as_array().cloned().unwrap_or_default();
+            n["labels"] = Value::Array(labels);
+            if n["author"].is_null() {
+                n.as_object_mut()?.remove("author");
+            }
+            let mut i: Item = serde_json::from_value(n).ok()?;
+            (i.kind, i.repo) = (kind, repo.to_string());
+            clean_item(&mut i);
+            Some(i)
+        })
+        .collect()
+}
+
+pub fn parse_startup(body: &str, repo: &str, want: &StartupWant) -> Result<Startup, String> {
+    let v: Value = json(body)?;
+    if let Some(e) = v["errors"][0]["message"].as_str() {
+        return Err(e.to_string());
+    }
+    let d = &v["data"];
+    let r = &d["repository"];
+    let pick = |a: &str, b: &str| {
+        let n = if r[a].is_object() { &r[a] } else { &d[b] };
+        n["nodes"].clone()
+    };
+    let prs = want.prs.map(|t| {
+        let nodes = match t {
+            0 | 1 => pick("none", "prSearch"),
+            2 => pick("prOpen", "none"),
+            _ => pick("prMerged", "none"),
+        };
+        graphql_items(&nodes, Kind::Pr, repo)
+    });
+    let issues = want.issues.map(|t| {
+        let nodes = match t {
+            0 | 1 => pick("none", "isSearch"),
+            _ => pick("isOpen", "none"),
+        };
+        graphql_items(&nodes, Kind::Issue, repo)
+    });
+    let topics = r["repositoryTopics"]["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t["topic"]["name"].as_str())
+        .map(|t| crate::sanitize::clean(t).into_owned())
+        .collect();
+    Ok(Startup {
+        prs,
+        issues,
+        meta: want.meta.then(|| meta_from(r, topics)),
+        user: crate::sanitize::clean(d["viewer"]["login"].as_str().unwrap_or("")).into_owned(),
+        open_prs: r["openPrs"]["totalCount"].as_u64().map(|n| n as usize),
+    })
+}
+
+/// The GitHub host `gh` talks to by default.
+pub fn host() -> String {
+    std::env::var("GH_HOST")
+        .ok()
+        .filter(|h| {
+            !h.is_empty()
+                && h.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-._:".contains(c))
+        })
+        .unwrap_or_else(|| "github.com".into())
+}
+
+/// The active login for `host` as gh's own `hosts.yml` records it: a local read, no API call, and
+/// never the token. None when it isn't recorded (a token from the environment, say).
+pub fn login_in(hosts_yml: &str, host: &str) -> Option<String> {
+    let mut in_host = false;
+    for l in hosts_yml.lines() {
+        if !l.starts_with([' ', '\t']) {
+            in_host = l.trim_end().strip_suffix(':') == Some(host);
+        } else if in_host && let Some(u) = l.trim().strip_prefix("user:") {
+            let u = u.trim().trim_matches(['"', '\'']);
+            let ok = !u.is_empty()
+                && u.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+            return ok.then(|| u.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+static IDENTITY: Mutex<Option<Option<(String, String)>>> = Mutex::new(None);
+
+#[cfg(test)]
+pub fn clear_identity() {
+    *IDENTITY.lock().unwrap() = None;
+}
+
+#[cfg(test)]
+pub fn set_identity(id: Option<(String, String)>) {
+    *IDENTITY.lock().unwrap() = Some(id);
+}
+
+/// (host, login) that on-disk caches are keyed by; None means nothing user-specific is cached.
+pub fn identity() -> Option<(String, String)> {
+    #[cfg(test)]
+    if let Some(id) = IDENTITY.lock().unwrap().clone() {
+        return id;
+    }
+    static ID: std::sync::OnceLock<Option<(String, String)>> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let dir = std::env::var_os("GH_CONFIG_DIR")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("XDG_CONFIG_HOME")
+                    .filter(|v| !v.is_empty())
+                    .map(|x| std::path::Path::new(&x).join("gh"))
+            })
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".config/gh"))
+            })?;
+        let host = host();
+        let login = login_in(&std::fs::read_to_string(dir.join("hosts.yml")).ok()?, &host)?;
+        Some((host, login))
+    })
+    .clone()
+}
+
+/// Repo facts alone (the fallback when the batched request failed).
+pub fn repo_meta(repo: &str) -> Result<RepoMeta, String> {
+    let f = "stargazerCount,forkCount,issues,isPrivate,defaultBranchRef,description,licenseInfo,repositoryTopics,pushedAt";
+    let v: Value = json(&gh(["repo", "view", repo, "--json", f])?)?;
+    let topics = v["repositoryTopics"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t["name"].as_str())
+        .map(|t| crate::sanitize::clean(t).into_owned())
+        .collect();
+    Ok(meta_from(&v, topics))
+}
+
+/// Whether the working directory is a clone of `repo`, judged from its git remotes (no API call).
+pub fn cwd_is_clone_of(repo: &str) -> bool {
+    Command::new("git")
+        .args(["remote", "-v"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .is_some_and(|o| remotes_include(&String::from_utf8_lossy(&o.stdout), repo))
+}
+
+fn remotes_include(remotes: &str, repo: &str) -> bool {
+    let want = repo.to_lowercase();
+    remotes.lines().any(|l| {
+        let url = l.split_whitespace().nth(1).unwrap_or("").to_lowercase();
+        let url = url.trim_end_matches(".git");
+        url.ends_with(&format!("github.com/{want}")) || url.ends_with(&format!("github.com:{want}"))
     })
 }
 
 /// (rows, more than that) of one list tab, for the panel titles.
 pub fn count(repo: &str, global: bool, panel: usize, tab: usize) -> Result<(usize, bool), String> {
-    let n = list(repo, global, panel, tab)?.len();
+    let n = list(repo, global, panel, tab, false)?.len();
     Ok((n, n >= cap(panel)))
 }
 
 /// Panels: 0 Status, 1 Pull requests, 2 Issues, 3 Actions, 4 Branches, 5 Releases, 6 Notifications, 7 Tags.
 /// In the global view panels 1-2 search across all repos and the repo-only ones are empty.
-pub fn list(repo: &str, global: bool, panel: usize, tab: usize) -> Result<Vec<Item>, String> {
-    let mut v = list_raw(repo, global, panel, tab)?;
+/// `fresh` skips the on-disk cache (the user asked for a refresh).
+pub fn list(
+    repo: &str,
+    global: bool,
+    panel: usize,
+    tab: usize,
+    fresh: bool,
+) -> Result<Vec<Item>, String> {
+    let mut v = list_raw(repo, global, panel, tab, fresh)?;
     v.iter_mut().for_each(clean_item);
     Ok(v)
 }
 
-fn list_raw(repo: &str, global: bool, panel: usize, tab: usize) -> Result<Vec<Item>, String> {
+fn list_raw(
+    repo: &str,
+    global: bool,
+    panel: usize,
+    tab: usize,
+    fresh: bool,
+) -> Result<Vec<Item>, String> {
     let limit = format!("--limit={LIMIT}");
     if panel == 6 {
         let all = parse_notifications(&gh(["api", "notifications"])?)?;
@@ -653,7 +1124,7 @@ fn list_raw(repo: &str, global: bool, panel: usize, tab: usize) -> Result<Vec<It
                 .collect())
         }
         4 => branches(repo),
-        7 => tags(repo),
+        7 => tags(repo, fresh),
         _ => releases(repo),
     }
 }
@@ -748,6 +1219,8 @@ pub struct Reaction {
 /// One comment as shown in the Comments tab: author, standing, age, edits, reactions, replies.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Card {
+    /// GraphQL node id, to ask for who reacted.
+    pub id: String,
     pub author: String,
     /// authorAssociation: OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR, NONE, ...
     pub role: String,
@@ -817,9 +1290,9 @@ pub fn parse_threads(graphql: &str) -> Result<Vec<Thread>, String> {
     serde_json::from_value(nodes.cloned().unwrap_or_default()).map_err(|e| e.to_string())
 }
 
-fn card_from(n: &Value) -> Card {
-    let s = |k: &str| n[k].as_str().unwrap_or("").to_string();
-    let reactions = n["reactionGroups"]
+/// `reactionGroups` of a comment: counts always, names only when the query asked for them.
+fn parse_reactions(groups: &Value) -> Vec<Reaction> {
+    groups
         .as_array()
         .into_iter()
         .flatten()
@@ -836,8 +1309,71 @@ fn card_from(n: &Value) -> Card {
                     .collect(),
             })
         })
-        .collect();
+        .collect()
+}
+
+const REACTORS_Q: &str = "query($id:ID!){node(id:$id){... on Reactable{reactionGroups{content users(first:25){totalCount nodes{login}}}}} rateLimit{cost remaining resetAt limit}}";
+
+/// Who reacted to one comment (the on-demand call behind `e`; the first page only has counts).
+pub fn reactors(id: &str) -> Result<Vec<Reaction>, String> {
+    let out = graphql(vec![
+        "api".to_string(),
+        "graphql".into(),
+        "-f".into(),
+        format!("query={REACTORS_Q}"),
+        "-f".into(),
+        format!("id={id}"),
+    ])?;
+    parse_reactors(&out)
+}
+
+pub fn parse_reactors(body: &str) -> Result<Vec<Reaction>, String> {
+    let v: Value = json(body)?;
+    if let Some(e) = v["errors"][0]["message"].as_str() {
+        return Err(e.to_string());
+    }
+    let mut r = parse_reactions(&v["data"]["node"]["reactionGroups"]);
+    r.iter_mut()
+        .for_each(|x| x.users.iter_mut().for_each(crate::sanitize::clean_in_place));
+    Ok(r)
+}
+
+impl Card {
+    /// Needs a names lookup: some reaction has a count but no names yet.
+    pub fn missing_names(&self) -> bool {
+        !self.id.is_empty() && self.reactions.iter().any(|r| r.users.is_empty())
+    }
+
+    /// Ids of this card and its replies that still need their names.
+    pub fn nameless_ids(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .missing_names()
+            .then(|| self.id.clone())
+            .into_iter()
+            .collect();
+        v.extend(self.replies.iter().flat_map(Card::nameless_ids));
+        v
+    }
+
+    /// Fills in names for the card (or reply) with this id; false when none matches.
+    pub fn set_reactors(&mut self, id: &str, names: &[Reaction]) -> bool {
+        if self.id == id {
+            for r in &mut self.reactions {
+                if let Some(n) = names.iter().find(|n| n.content == r.content) {
+                    r.users = n.users.clone();
+                }
+            }
+            return true;
+        }
+        self.replies.iter_mut().any(|c| c.set_reactors(id, names))
+    }
+}
+
+fn card_from(n: &Value) -> Card {
+    let s = |k: &str| n[k].as_str().unwrap_or("").to_string();
+    let reactions = parse_reactions(&n["reactionGroups"]);
     Card {
+        id: s("id"),
         author: n["author"]["login"].as_str().unwrap_or("ghost").to_string(),
         role: s("authorAssociation"),
         when: if n["createdAt"].is_string() {
@@ -1112,7 +1648,8 @@ pub fn parse_comments(graphql: &str, pr: bool) -> Result<CommentsData, String> {
     Ok(cd)
 }
 
-const CARD_FIELDS: &str = "author{login} authorAssociation lastEditedAt body reactionGroups{content users(first:25){totalCount nodes{login}}}";
+// Reactions come as counts only (names are one call away, on `e`); `id` is for that call.
+const CARD_FIELDS: &str = "id author{login} authorAssociation lastEditedAt body reactionGroups{content users{totalCount}}";
 
 const PAGE: &str = "totalCount pageInfo{hasNextPage endCursor}";
 
@@ -1120,14 +1657,21 @@ const PAGE: &str = "totalCount pageInfo{hasNextPage endCursor}";
 fn conn_query(name: &str, after: bool) -> String {
     let c = CARD_FIELDS;
     let a = if after { ",after:$a" } else { "" };
+    // the first request is the one that must be quick and cheap: 50 per connection, 20 replies a thread
+    let n = if after { 100 } else { FIRST_PAGE };
     match name {
-        "comments" => format!("comments(first:100{a}){{{PAGE} nodes{{createdAt {c}}}}}"),
-        "reviews" => format!("reviews(first:100{a}){{{PAGE} nodes{{state submittedAt {c}}}}}"),
+        "comments" => format!("comments(first:{n}{a}){{{PAGE} nodes{{createdAt {c}}}}}"),
+        "reviews" => format!("reviews(first:{n}{a}){{{PAGE} nodes{{state submittedAt {c}}}}}"),
         _ => format!(
-            "reviewThreads(first:100{a}){{{PAGE} nodes{{id isResolved isOutdated path line comments(first:50){{{PAGE} nodes{{createdAt {c}}}}}}}}}"
+            "reviewThreads(first:{n}{a}){{{PAGE} nodes{{id isResolved isOutdated path line comments(first:{r}){{{PAGE} nodes{{createdAt {c}}}}}}}}}",
+            r = if after { 50 } else { FIRST_REPLIES }
         ),
     }
 }
+
+/// Items per connection and replies per thread in the first comments request.
+const FIRST_PAGE: usize = 50;
+const FIRST_REPLIES: usize = 20;
 
 /// `only` restricts to one connection (a follow-up page); None is the first request for everything.
 fn comments_query(pr: bool, only: Option<&str>) -> String {
@@ -1143,7 +1687,9 @@ fn comments_query(pr: bool, only: Option<&str>) -> String {
         (false, _) => format!("issue(number:$p){{{}}}", conn_query("comments", after)),
     };
     let a = if after { ",$a:String" } else { "" };
-    format!("query($o:String!,$n:String!,$p:Int!{a}){{repository(owner:$o,name:$n){{{body}}}}}")
+    format!(
+        "query($o:String!,$n:String!,$p:Int!{a}){{repository(owner:$o,name:$n){{{body}}} rateLimit{{cost remaining resetAt limit}}}}"
+    )
 }
 
 fn graphql_comments(
@@ -1169,7 +1715,7 @@ fn graphql_comments(
     if let Some(c) = after {
         a.extend(["-f".to_string(), format!("a={c}")]);
     }
-    gh(a)
+    graphql(a)
 }
 
 fn fetch_comments(repo: &str, n: &str, pr: bool) -> Result<CommentsData, String> {
@@ -1178,7 +1724,7 @@ fn fetch_comments(repo: &str, n: &str, pr: bool) -> Result<CommentsData, String>
     Ok(cd)
 }
 
-const REPLIES_Q: &str = "query($id:ID!,$a:String){node(id:$id){... on PullRequestReviewThread{comments(first:50,after:$a){totalCount pageInfo{hasNextPage endCursor} nodes{createdAt CARD}}}}}";
+const REPLIES_Q: &str = "query($id:ID!,$a:String){node(id:$id){... on PullRequestReviewThread{comments(first:50,after:$a){totalCount pageInfo{hasNextPage endCursor} nodes{createdAt CARD}}}} rateLimit{cost remaining resetAt limit}}";
 
 /// (cards, next cursor) from a `REPLIES_Q` response.
 pub fn parse_replies(graphql: &str) -> Result<(Vec<Card>, Option<String>), String> {
@@ -1243,8 +1789,12 @@ pub fn rate_limit_secs(e: &str) -> Option<u64> {
                     .ok()
             })
             .unwrap_or(60)
+            .min(MAX_BACKOFF_SECS)
     })
 }
+
+/// Longest wait any server message can make us accept (a hostile `Retry-After: 99999999999` included).
+pub const MAX_BACKOFF_SECS: u64 = 3600;
 
 /// Fetch up to `budget` more pages (throttled), sending each as it arrives, then `Paused` if cursors
 /// remain, `Done` if not. Returns early when `send` says the receiver is gone.
@@ -1296,15 +1846,15 @@ pub fn more_pages(
             }
             Work::Replies(id, c) => {
                 let q = REPLIES_Q.replace("CARD", CARD_FIELDS);
-                let out = gh([
-                    "api",
-                    "graphql",
-                    "-f",
-                    &format!("query={q}"),
-                    "-f",
-                    &format!("id={id}"),
-                    "-f",
-                    &format!("a={c}"),
+                let out = graphql(vec![
+                    "api".to_string(),
+                    "graphql".into(),
+                    "-f".into(),
+                    format!("query={q}"),
+                    "-f".into(),
+                    format!("id={id}"),
+                    "-f".into(),
+                    format!("a={c}"),
                 ]);
                 match out.and_then(|o| parse_replies(&o)) {
                     Err(e) => fail(e, pend.clone()),
@@ -1456,10 +2006,9 @@ fn detail_raw(repo: &str, it: &Item, tab: Tab) -> Result<Data, String> {
                 "name,bucket,link,workflow,startedAt,completedAt",
             ];
             // gh exits non-zero for failing/pending checks but still prints the JSON.
-            let o = Command::new("gh")
-                .args(a)
-                .output()
-                .map_err(|e| e.to_string())?;
+            let mut c = Command::new(program());
+            c.args(a);
+            let o = run_child(c, None, timeout())?;
             match serde_json::from_slice(&o.stdout) {
                 Ok(c) => Ok(Data::Checks(c)),
                 Err(_) if String::from_utf8_lossy(&o.stderr).contains("no checks reported") => {
@@ -1706,7 +2255,7 @@ pub fn files_to_diff(files: &Value) -> String {
     out
 }
 
-const COMMITS_Q: &str = "query($o:String!,$n:String!,$p:Int!,$a:String){repository(owner:$o,name:$n){pullRequest(number:$p){commits(first:100,after:$a){pageInfo{hasNextPage endCursor} nodes{commit{oid messageHeadline committedDate additions deletions author{name user{login}}}}}}}}";
+const COMMITS_Q: &str = "query($o:String!,$n:String!,$p:Int!,$a:String){repository(owner:$o,name:$n){pullRequest(number:$p){commits(first:100,after:$a){pageInfo{hasNextPage endCursor} nodes{commit{oid messageHeadline committedDate additions deletions author{name user{login}}}}}}} rateLimit{cost remaining resetAt limit}}";
 
 /// (rows, next cursor) from one GraphQL page of `pullRequest.commits`.
 pub fn parse_commits(graphql: &str) -> Result<(Vec<CommitRow>, Option<String>), String> {
@@ -1767,7 +2316,7 @@ fn fetch_pr_commits(repo: &str, n: &str) -> Result<Vec<CommitRow>, String> {
         if let Some(c) = &after {
             a.extend(["-f".to_string(), format!("a={c}")]);
         }
-        let (rows, next) = parse_commits(&gh(a)?)?;
+        let (rows, next) = parse_commits(&graphql(a)?)?;
         all.extend(rows);
         match next {
             Some(c) => after = Some(c),
@@ -1791,18 +2340,18 @@ fn files_diff(repo: &str, n: &str) -> Result<String, String> {
 
 fn threads(repo: &str, n: &str) -> Result<Vec<Thread>, String> {
     let (owner, name) = repo.split_once('/').ok_or("bad repo")?;
-    let q = "query($o:String!,$n:String!,$p:Int!){repository(owner:$o,name:$n){pullRequest(number:$p){reviewThreads(first:100){nodes{id isResolved isOutdated path line comments(first:50){nodes{author{login} body createdAt}}}}}}}";
-    let out = gh([
-        "api",
-        "graphql",
-        "-f",
-        &format!("query={q}"),
-        "-f",
-        &format!("o={owner}"),
-        "-f",
-        &format!("n={name}"),
-        "-F",
-        &format!("p={n}"),
+    let q = "query($o:String!,$n:String!,$p:Int!){repository(owner:$o,name:$n){pullRequest(number:$p){reviewThreads(first:100){nodes{path}}}} rateLimit{cost remaining resetAt limit}}";
+    let out = graphql(vec![
+        "api".to_string(),
+        "graphql".into(),
+        "-f".into(),
+        format!("query={q}"),
+        "-f".into(),
+        format!("o={owner}"),
+        "-f".into(),
+        format!("n={name}"),
+        "-F".into(),
+        format!("p={n}"),
     ])?;
     parse_threads(&out)
 }
@@ -1880,30 +2429,20 @@ fn status(repo: &str) -> Result<String, String> {
 /// Runs a full command line (program first), as built by an Action.
 /// Like `run`, optionally piping `stdin` to the command (large bodies via `--body-file -`).
 pub fn run_with(cmd: &[String], stdin: Option<&str>) -> Result<String, String> {
-    use std::io::Write;
-    use std::process::Stdio;
     let Some((prog, args)) = cmd.split_first() else {
         return Err("empty command".into());
     };
     log_cmd(prog, args);
-    let mut child = Command::new(prog)
-        .args(args)
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("cannot run {prog}: {e}"))?;
-    if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
-        // the child reads it all before answering; a broken pipe just means it failed early
-        let _ = pipe.write_all(text.as_bytes());
-    }
-    let o = child
-        .wait_with_output()
-        .map_err(|e| format!("cannot run {prog}: {e}"))?;
+    let exe = if prog == "gh" { program() } else { prog.into() };
+    let mut c = Command::new(exe);
+    c.args(args);
+    // a write may legitimately take long (an upload): five times the read limit
+    let o = run_child(c, stdin, timeout().saturating_mul(5)).map_err(|e| {
+        if e.contains("timed out") {
+            push_log(format!("  error: {e}"));
+        }
+        e
+    })?;
     let (out, err) = (
         String::from_utf8_lossy(&o.stdout),
         String::from_utf8_lossy(&o.stderr),
@@ -1973,12 +2512,16 @@ fn raw_file(repo: &str, path: &str) -> Option<String> {
     if path.split('/').any(|seg| seg == ".." || seg.is_empty()) {
         return None;
     }
-    gh([
-        "api",
-        "-H",
-        "Accept: application/vnd.github.raw",
-        &format!("repos/{repo}/contents/{}", crate::act::enc_path(path)),
-    ])
+    gh_cached(
+        vec![
+            "api".into(),
+            "-H".into(),
+            "Accept: application/vnd.github.raw".into(),
+            format!("repos/{repo}/contents/{}", crate::act::enc_path(path)),
+        ],
+        "1h",
+        false,
+    )
     .ok()
 }
 
@@ -2019,29 +2562,46 @@ pub fn form_data(repo: &str, head: Option<&str>, workflow_path: Option<&str>) ->
     if let Some(path) = workflow_path {
         d.default_branch = default_branch(repo);
         d.branches = branch_names(repo);
-        d.tags = gh([
-            "api",
-            &format!("repos/{repo}/tags?per_page=100"),
-            "--jq",
-            ".[].name",
-        ])
+        d.tags = gh_cached(
+            vec![
+                "api".into(),
+                format!("repos/{repo}/tags?per_page=100"),
+                "--jq".into(),
+                ".[].name".into(),
+            ],
+            "10m",
+            false,
+        )
         .map(|s| name_lines(s, 100))
         .unwrap_or_default();
         // parsed here, off the UI thread, with the size and alias limits of `dispatch::parse`
         d.dispatch = raw_file(repo, path).map(|y| crate::dispatch::parse(&y));
         return d;
     }
-    d.labels = gh([
-        "label", "list", "-R", repo, "--limit", "300", "--json", "name", "-q", ".[].name",
-    ])
+    // up to 300 names are kept: a repo with more skips label validation (see Form::set_labels)
+    d.labels = gh_cached(
+        vec![
+            "api".into(),
+            format!("repos/{repo}/labels?per_page=100"),
+            "--paginate".into(),
+            "--jq".into(),
+            ".[].name".into(),
+        ],
+        "1h",
+        false,
+    )
     .map(|s| name_lines(s, 300))
     .unwrap_or_default();
     match head {
         None => {
-            if let Ok(list) = gh([
-                "api",
-                &format!("repos/{repo}/contents/.github/ISSUE_TEMPLATE"),
-            ]) {
+            if let Ok(list) = gh_cached(
+                vec![
+                    "api".into(),
+                    format!("repos/{repo}/contents/.github/ISSUE_TEMPLATE"),
+                ],
+                "1h",
+                false,
+            ) {
                 for (name, path) in parse_template_list(&list).into_iter().take(10) {
                     if let Some(text) = raw_file(repo, &path) {
                         let (fm_name, body) = split_front_matter(&text);
@@ -2137,6 +2697,256 @@ pub fn checkout(repo: &str, n: u64) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_gh_is_killed_at_the_deadline_and_on_quit() {
+        let shim = crate::testshim::Shim::new();
+        shim.set("sleep", "30");
+        set_timeout(1);
+        let t = std::time::Instant::now();
+        let e = gh(["api", "x"]).unwrap_err();
+        assert!(e.contains("timed out after 1s"), "{e}");
+        assert!(
+            t.elapsed().as_secs() < 25,
+            "killed at the deadline, not after the 30 s sleep"
+        );
+        // the killed child really is gone (not left sleeping)
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let alive = Command::new("pgrep")
+            .args(["-f", "sleep 30"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&alive.stdout).trim().is_empty(),
+            "orphan left behind"
+        );
+        assert!(cmd_log().iter().any(|l| l.contains("error: gh timed out")));
+        // pagination gets double, writes five times
+        let a = |s: &str| vec![OsString::from(s)];
+        assert_eq!(limit_for(&a("api")).as_secs(), 1);
+        assert_eq!(limit_for(&a("--paginate")).as_secs(), 2);
+        // quitting ends whatever is still running
+        set_timeout(60);
+        let h = std::thread::spawn(|| gh(["api", "y"]));
+        for _ in 0..2000 {
+            if !CHILDREN.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let t = std::time::Instant::now();
+        kill_children();
+        assert!(h.join().unwrap().is_err());
+        assert!(t.elapsed().as_secs() < 25, "no 30 s wait for an orphan");
+    }
+
+    #[test]
+    fn the_batched_startup_response_gives_the_same_items_as_the_cli_lists() {
+        let want = StartupWant {
+            prs: Some(0),
+            issues: Some(0),
+            meta: true,
+        };
+        let st = parse_startup(include_str!("../tests/startup.json"), "o/r", &want).unwrap();
+        let old = parse_items(include_str!("../tests/startup_cli.json"), Kind::Pr, "o/r").unwrap();
+        let new = st.prs.unwrap();
+        assert_eq!(
+            new.len(),
+            2,
+            "empty search nodes (issues among PRs) are skipped"
+        );
+        for (a, b) in new.iter().zip(&old) {
+            assert_eq!(
+                (
+                    a.number,
+                    &a.title,
+                    &a.url,
+                    &a.state,
+                    a.is_draft,
+                    &a.body,
+                    &a.author.login,
+                    a.kind,
+                    &a.repo
+                ),
+                (
+                    b.number,
+                    &b.title,
+                    &b.url,
+                    &b.state,
+                    b.is_draft,
+                    &b.body,
+                    &b.author.login,
+                    b.kind,
+                    &b.repo
+                )
+            );
+            assert_eq!(
+                a.labels.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
+                b.labels.iter().map(|l| l.name.as_str()).collect::<Vec<_>>()
+            );
+        }
+        let is = st.issues.unwrap();
+        assert_eq!(
+            (is[0].number, is[0].kind, is[0].author.login.as_str()),
+            (3, Kind::Issue, "bob")
+        );
+        let m = st.meta.unwrap();
+        assert_eq!(
+            (
+                m.stars,
+                m.forks,
+                m.issues,
+                m.branch.as_str(),
+                m.license.as_str(),
+                m.topics.len()
+            ),
+            (1234, 56, 38, "trunk", "MIT License", 2)
+        );
+        assert_eq!(
+            (st.user.as_str(), st.open_prs, m.pushed.as_str()),
+            ("octocat", Some(74), "2026-10-02")
+        );
+        // text from GitHub is neutralized like every other list
+        let evil = include_str!("../tests/startup.json").replace("Add notes", "Add\\u202e notes");
+        let st = parse_startup(&evil, "o/r", &want).unwrap();
+        assert!(st.prs.unwrap()[0].title.contains("<U+202E>"));
+        // without the facts (cached) none are claimed
+        let none = StartupWant {
+            meta: false,
+            ..want
+        };
+        assert!(
+            parse_startup(include_str!("../tests/startup.json"), "o/r", &none)
+                .unwrap()
+                .meta
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn startup_variables_carry_the_values_and_the_query_is_constant() {
+        let v = |w: &StartupWant| startup_vars("o/r", w).unwrap();
+        let get = |v: &[(String, String, bool)], k: &str| {
+            v.iter().find(|x| x.0 == k).map(|x| x.1.clone()).unwrap()
+        };
+        let mine = v(&StartupWant {
+            prs: Some(0),
+            issues: Some(2),
+            meta: false,
+        });
+        assert_eq!(
+            get(&mine, "qpr"),
+            "repo:o/r is:pr is:open author:@me sort:created-desc"
+        );
+        assert_eq!(get(&mine, "prSearch"), "true");
+        assert_eq!(get(&mine, "isOpen"), "true");
+        assert_eq!(get(&mine, "meta"), "false");
+        let merged = v(&StartupWant {
+            prs: Some(3),
+            issues: Some(1),
+            meta: true,
+        });
+        assert_eq!(get(&merged, "prMerged"), "true");
+        assert_eq!(
+            get(&merged, "qis"),
+            "repo:o/r is:issue is:open author:@me sort:created-desc"
+        );
+        assert!(
+            !STARTUP_Q.contains("o/r")
+                && STARTUP_Q.contains("rateLimit{cost remaining resetAt limit}")
+        );
+        assert!(startup_vars("nonsense", &StartupWant::default()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_graphql_call_covers_startup_and_feeds_the_quota_state() {
+        let shim = crate::testshim::Shim::new();
+        shim.set("graphql.out", include_str!("../tests/startup.json"));
+        let want = StartupWant {
+            prs: Some(0),
+            issues: Some(0),
+            meta: true,
+        };
+        let st = startup("o/r", &want).unwrap();
+        assert_eq!(st.prs.unwrap().len(), 2);
+        let calls = shim.calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(
+            calls[0].starts_with("api graphql -f query=query($o:String!")
+                && calls[0].contains("-f o=o -f n=r"),
+            "{calls:?}"
+        );
+        assert!(
+            calls[0].contains("-F meta=true"),
+            "booleans travel as variables: {calls:?}"
+        );
+        let g = crate::rate::snapshot()
+            .graphql
+            .expect("rateLimit footer was noted");
+        assert_eq!((g.remaining, g.limit), (4990, 5000));
+        assert!(
+            cmd_log()
+                .iter()
+                .any(|l| l.contains("rate: cost 1, graphql 4990/5000 left"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_calls_add_the_flag_only_when_allowed() {
+        // the cache switch is process-wide: hold the shim lock so no other test sees it flip
+        let _shim = crate::testshim::Shim::new();
+        crate::cache::set_enabled(true);
+        let base = || vec!["api".to_string(), "repos/o/r/tags".to_string()];
+        let (a, env) = cached_call(base(), "10m", false);
+        if crate::cache::gh_home().is_some() {
+            assert_eq!(a, ["api", "--cache", "10m", "repos/o/r/tags"]);
+            assert_eq!(env[0].0, "XDG_CACHE_HOME");
+        }
+        let (a, env) = cached_call(base(), "10m", true);
+        assert_eq!(a, base(), "r/R bypass the cache");
+        assert!(env.is_empty());
+        crate::cache::set_enabled(false);
+        let (a, _) = cached_call(base(), "10m", false);
+        crate::cache::set_enabled(true);
+        assert_eq!(a, base(), "[api] cache = false");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slow_lookups_are_cached_privately_and_refresh_skips_the_cache() {
+        let shim = crate::testshim::Shim::new();
+        shim.set("rest.out", r#"[{"name":"v1","commit":{"sha":"abc1234"}}]"#);
+        list("o/r", false, 7, 0, false).unwrap();
+        list("o/r", false, 7, 0, true).unwrap();
+        form_data("o/r", None, None);
+        let calls = shim.calls();
+        assert!(
+            calls[0].starts_with("api --cache 10m repos/o/r/tags"),
+            "{calls:?}"
+        );
+        assert!(!calls[1].contains("--cache"), "fresh: {calls:?}");
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("--cache 1h") && c.contains("labels")),
+            "labels cached an hour: {calls:?}"
+        );
+        let envs = shim.envs();
+        assert!(
+            envs[0].ends_with("cache"),
+            "gh's cache lives in gh-pulse's directory: {envs:?}"
+        );
+        assert_eq!(envs[1], "", "uncached calls leave the environment alone");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&envs[0]).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "the cache directory is private");
+        // writes and comments never ask for the cache
+        assert!(!viewed_mutation("id", "p", true).contains(&"--cache".to_string()));
+        assert!(!comments_query(true, None).contains("cache"));
+    }
+
     #[test]
     fn tags_and_notifications_carry_what_the_actions_need() {
         let v: Value = serde_json::from_str(
@@ -2562,10 +3372,25 @@ mod tests {
                 && q.contains("$a:String")
                 && !q.contains("reviews")
         );
+        let first = comments_query(true, None);
         assert!(
-            comments_query(true, None).contains("reviewThreads(first:100)")
-                && !comments_query(true, None).contains("after:$a")
+            first.contains("reviewThreads(first:50)")
+                && first.contains("comments(first:20)")
+                && !first.contains("after:$a"),
+            "the first request is the small one: {first}"
         );
+        assert!(
+            comments_query(true, Some("reviews")).contains("reviews(first:100,after:$a)"),
+            "later pages keep 100"
+        );
+        for q in [&first, &q] {
+            assert!(
+                q.contains("rateLimit{cost remaining resetAt limit}")
+                    && q.contains("reactionGroups{content users{totalCount}}")
+                    && !q.contains("nodes{login}"),
+                "own queries ask for the quota, and for reaction counts only: {q}"
+            );
+        }
     }
 
     #[test]
@@ -2641,7 +3466,7 @@ mod tests {
     }
 
     /// Live: a >300-file PR (gh pr diff refuses) must still produce a diff via the files API.
-    /// GH_PULSE_HUGE_PR=owner/repo#N cargo test -- --ignored --nocapture
+    /// GH_PULSE_LIVE=1 GH_PULSE_HUGE_PR=owner/repo#N cargo test -- --ignored --nocapture
     #[test]
     #[ignore]
     fn huge_pr_diff_falls_back() {
@@ -2662,7 +3487,7 @@ mod tests {
         assert!(f.len() > 300 && f.iter().any(|f| f.lines.len() > 1));
     }
 
-    /// Live smoke test: GH_PULSE_REPO=o/r cargo test -- --ignored --nocapture
+    /// Live smoke test: GH_PULSE_LIVE=1 GH_PULSE_REPO=o/r cargo test -- --ignored --nocapture
     #[test]
     #[ignore]
     fn live_smoke() {
@@ -2680,7 +3505,7 @@ mod tests {
             (3, 1),
             (4, 0),
         ] {
-            let items = list(&repo, false, panel, tab)
+            let items = list(&repo, false, panel, tab, true)
                 .unwrap_or_else(|e| panic!("list {panel}/{tab}: {e}"));
             println!("list {panel}/{tab}: {} items", items.len());
             for it in items.iter().take(2) {

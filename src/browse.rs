@@ -6,7 +6,7 @@ use serde_json::Value;
 /// Safety valve for accounts with a huge number of repos; the UI shows "N+" past it.
 pub const MAX_REPOS: usize = 3000;
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RepoRow {
     pub name: String,
     pub owner: String,
@@ -28,7 +28,7 @@ pub struct Page {
     pub next: Option<String>,
 }
 
-const QUERY: &str = "query($after:String){viewer{login repositories(first:100,after:$after,affiliations:[OWNER,COLLABORATOR,ORGANIZATION_MEMBER],orderBy:{field:PUSHED_AT,direction:DESC}){pageInfo{hasNextPage endCursor} nodes{nameWithOwner isPrivate isFork isArchived stargazerCount pushedAt primaryLanguage{name} owner{__typename login} issues(states:OPEN){totalCount} pullRequests(states:OPEN){totalCount}}}}}";
+const QUERY: &str = "query($after:String){viewer{login repositories(first:100,after:$after,affiliations:[OWNER,COLLABORATOR,ORGANIZATION_MEMBER],orderBy:{field:PUSHED_AT,direction:DESC}){pageInfo{hasNextPage endCursor} nodes{nameWithOwner isPrivate isFork isArchived stargazerCount pushedAt primaryLanguage{name} owner{__typename login} issues(states:OPEN){totalCount} pullRequests(states:OPEN){totalCount}}}} rateLimit{cost remaining resetAt limit}}";
 
 pub fn parse_page(json: &str) -> Result<Page, String> {
     let v: Value = serde_json::from_str(json).map_err(|e| format!("bad gh output: {e}"))?;
@@ -78,7 +78,7 @@ pub fn fetch_page(after: Option<&str>) -> Result<Page, String> {
     if let Some(c) = after {
         a.extend(["-f".to_string(), format!("after={c}")]);
     }
-    parse_page(&gh::gh(a)?)
+    parse_page(&gh::graphql(a)?)
 }
 
 /// "3d", "5mo", "2y" since `iso`, given the current unix time.

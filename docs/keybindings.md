@@ -19,8 +19,8 @@ Press `?` in the app for the same list. Keys are checked against `src/app.rs` (`
 | `o` | Open in the browser (`open`, or `xdg-open` off macOS) |
 | `y` | Copy the URL (`pbcopy`, `wl-copy` or `xclip`); on a tag, its name |
 | `c` | Check out the selected PR (cwd must be a clone of its repo); not available for tags |
-| `r` | Refresh the focused panel (and clear cached details) |
-| `R` | Refresh all panels |
+| `r` | Refresh the selected item (its cached details) and the list tab it is in, skipping the on-disk cache |
+| `R` | Reload everything, skipping the on-disk cache |
 | `L` | Toggle the command log strip |
 | `f` | Zoom the right pane to full width; `f` or `Esc` restores |
 | `B` / `Ctrl-r` | Repo browser (full screen) |
@@ -85,7 +85,7 @@ cancels. Nothing is created without that confirm.
 | `j` `k` | Move by comment |
 | `Ctrl-d` `Ctrl-u` | Half a page: scrolls inside a comment taller than the pane first, then moves to the next/previous comment |
 | `Enter` | Expand / collapse the comment (long bodies, `<details>`) |
-| `e` | Show / hide who reacted |
+| `e` | Show / hide who reacted (the first page has counts only; names are one call per comment, made on demand) |
 | `m` | Load the next page of comments (shadows the merge shortcut on this tab; merge stays in `x`). The next page also loads by itself when you scroll within 20 rows of the end |
 | `x` | Menu: reply to / resolve the thread, comment |
 

@@ -1,15 +1,20 @@
 mod act;
 mod app;
 mod browse;
+mod cache;
 mod config;
 mod diff;
 mod dispatch;
 mod form;
 mod gh;
 mod md;
+mod pool;
+mod rate;
 mod sanitize;
 mod state;
 mod syn;
+#[cfg(test)]
+mod testshim;
 mod theme;
 mod ui;
 
@@ -21,7 +26,8 @@ use std::io::IsTerminal;
 use std::time::Duration;
 use theme::{IconSet, Theme};
 
-const USAGE: &str = "usage: gh-pulse [-R owner/repo] [--theme dark|light] [--ascii] [--nerd]";
+const USAGE: &str =
+    "usage: gh-pulse [-R owner/repo] [--theme dark|light] [--ascii] [--nerd] [--clear-cache]";
 
 struct MouseGuard;
 
@@ -53,6 +59,14 @@ fn main() -> std::io::Result<()> {
             },
             "--ascii" => ascii = true,
             "--nerd" => nerd = true,
+            "--clear-cache" => {
+                match cache::clear() {
+                    Ok(Some(d)) => println!("removed {}", d.display()),
+                    Ok(None) => println!("nothing cached"),
+                    Err(e) => die(&e),
+                }
+                return Ok(());
+            }
             "-h" | "--help" => die(USAGE),
             _ => die(USAGE),
         }
@@ -97,7 +111,7 @@ fn main() -> std::io::Result<()> {
         prev(i);
     }));
     // ratatui::run installs a panic hook and restores the terminal on every exit path.
-    ratatui::run(|term| {
+    let result = ratatui::run(|term| {
         crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
         let _guard = MouseGuard;
         let mut app = app::App::from_config(repo, theme, cfg, keys);
@@ -119,5 +133,8 @@ fn main() -> std::io::Result<()> {
                 _ => {} // Resize: the next draw re-lays-out from the new size
             }
         }
-    })
+    });
+    // no orphaned `gh` processes after we are gone
+    gh::kill_children();
+    result
 }

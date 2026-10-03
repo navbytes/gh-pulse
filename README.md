@@ -118,6 +118,7 @@ gh-pulse                       # then press B to browse every repo you can acces
 | `--theme dark\|light` | Color palette (default `dark`). |
 | `--ascii` | ASCII icons and borders. Also automatic when the locale is not UTF-8. |
 | `--nerd` | Nerd Font icons. |
+| `--clear-cache` | Delete gh-pulse's on-disk cache (`~/.cache/gh-pulse`) and exit. |
 
 gh-pulse needs an interactive terminal; piping stdin/stdout prints a message and exits.
 
@@ -129,6 +130,19 @@ defaults; an invalid file stops startup with `file:line: message`. See [docs/con
 The file never contains credentials; authentication stays entirely with `gh`.
 
 ## Local state
+
+Slow-changing lookups are cached under `$XDG_CACHE_HOME/gh-pulse` (default `~/.cache/gh-pulse`; a `0700` directory
+you own, files `0600`; a relative `XDG_CACHE_HOME` is ignored, and if the directory is not yours or is a symlink the
+cache switches itself off with a notice). What is stored:
+
+- **Repo list** (10 min) and **repo header facts** (5 min): repo names, descriptions, topics, counts; keyed by host and
+  login, so another account or host never sees them. Cached rows are cleaned again when read.
+- **Raw file text from repos: issue/PR templates and workflow YAML (1 h), labels (1 h) and tags (10 min).** These come
+  from the repo you opened, private ones included, so their contents sit on your disk for up to an hour. They are
+  gh's own cache entries (`gh api --cache`, keyed on host, token and request), kept inside gh-pulse's directory.
+
+Never cached: tokens, comments, notifications, PR details, diffs, anything from a write. `gh-pulse --clear-cache`
+deletes the whole directory; `[api] cache = false` turns caching off; `r` and `R` skip it.
 
 Files you mark viewed (`v`) are remembered in `$XDG_STATE_HOME/gh-pulse/viewed.json` (default
 `~/.local/state/`), per repo and PR, and reset when the PR's head commit changes. Nothing is written to GitHub.
@@ -158,7 +172,7 @@ The full reference is in [docs/keybindings.md](docs/keybindings.md). The essenti
 | Global | `1`-`5`, `Tab`, `Shift-Tab` | Focus panel |
 | Global | `x` | Action menu for the selected item |
 | Global | `o` `y` `c` | Open in browser / copy URL / check out PR |
-| Global | `r` `R` `L` | Refresh panel / all / command log |
+| Global | `r` `R` `L` | Refresh selected item / reload everything / command log |
 | Lists | `j` `k` `Ctrl-d` `Ctrl-u` `g` `G` | Move |
 | Lists | `/` `Esc` | Filter / clear |
 | Lists | `{` `}` | Panel list tab |
@@ -203,6 +217,14 @@ at word boundaries with a `↪` marker; `w` switches to clipping. `f` zooms the 
 - **"Terminal too small".** The minimum is 50x12. On short terminals unfocused panels collapse to one line.
 - **Colors look washed out or odd.** Your terminal probably lacks truecolor: set `COLORTERM=truecolor` if it
   supports it, or try `--theme light` on light backgrounds.
+- **A `⚡ 412/5000` chip appears in the header / "paused background refresh".** GitHub's API quota is running
+  low (under 20%, configurable). Below 10% gh-pulse stops everything it does by itself (tab counts, extra comment
+  pages, the inbox badge) until the window resets, shown as `resets HH:MM`; what you ask for still works. At
+  `Retry-After` / secondary-limit messages it backs off for the time given.
+- **How much API does it use?** One GraphQL request fills the first screen (PRs, issues, repo facts), other panels
+  load when first focused, at most 4 `gh` processes run at once, and the only polling is the unread badge (2 min)
+  and a free `gh api rate_limit` check (5 min). Tab counts of search-backed tabs show `?` until opened. See
+  [docs/configuration.md](docs/configuration.md#api-etiquette).
 - **Boxes and icons are garbled.** Use `--ascii`, or install a Nerd Font and use `--nerd`.
 - **A huge PR shows its diff anyway.** Over 300 files `gh pr diff` refuses; gh-pulse falls back to the files API.
 

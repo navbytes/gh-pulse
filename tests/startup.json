@@ -1,0 +1,19 @@
+{"data":{
+ "viewer":{"login":"octocat"},
+ "rateLimit":{"cost":1,"remaining":4990,"resetAt":"2030-01-01T00:00:00Z","limit":5000},
+ "repository":{
+  "openPrs":{"totalCount":74},
+  "stargazerCount":1234,"forkCount":56,"isPrivate":false,"description":"A synthetic repo","pushedAt":"2026-10-02T23:13:52Z",
+  "licenseInfo":{"name":"MIT License"},"defaultBranchRef":{"name":"trunk"},
+  "openIssues":{"totalCount":38},
+  "repositoryTopics":{"nodes":[{"topic":{"name":"cli"}},{"topic":{"name":"golang"}}]}
+ },
+ "prSearch":{"nodes":[
+  {"number":7,"title":"Add notes","url":"https://github.com/o/r/pull/7","state":"OPEN","isDraft":false,"body":"Fixes things","author":{"login":"alice"},"labels":{"nodes":[{"name":"docs"},{"name":"bug"}]}},
+  {"number":9,"title":"Draft: ghost author","url":"https://github.com/o/r/pull/9","state":"OPEN","isDraft":true,"body":"","author":null,"labels":{"nodes":[]}},
+  {}
+ ]},
+ "isSearch":{"nodes":[
+  {"number":3,"title":"Crash on start","url":"https://github.com/o/r/issues/3","state":"OPEN","body":"steps","author":{"login":"bob"},"labels":{"nodes":[{"name":"bug"}]}}
+ ]}
+}}
