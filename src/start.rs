@@ -1,4 +1,4 @@
-//! Where gh-pulse opens: a repo, or the global home. One pure decision, so the table of cases is a test.
+//! Where gh-tui opens: a repo, or the global home. One pure decision, so the table of cases is a test.
 use crate::config::StartMode;
 
 #[derive(Debug, PartialEq, Eq)]

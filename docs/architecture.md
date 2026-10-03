@@ -1,6 +1,6 @@
 # Architecture
 
-gh-pulse is a single binary: a synchronous ratatui event loop that talks to GitHub only by running `gh` (and
+gh-tui is a single binary: a synchronous ratatui event loop that talks to GitHub only by running `gh` (and
 `git`) as subprocesses on background threads. No async runtime.
 
 ## Module map
@@ -16,7 +16,7 @@ gh-pulse is a single binary: a synchronous ratatui event loop that talks to GitH
 | `src/syn.rs` | syntect highlighter (cargo feature `syntax`, on by default); a no-op stub with `--no-default-features` |
 | `src/pool.rs` | The worker pool every `gh` job runs on: two queues (user first), a cap on processes in flight, stale-job dropping, background work standing down under rate pressure |
 | `src/rate.rs` | Shared quota state (graphql / core / search, backoff), thresholds, the chip and pause rules (pure, take `now`) |
-| `src/cache.rs` | `0600` JSON cache in `$XDG_CACHE_HOME/gh-pulse` (repo list, repo facts) and the directory `gh --cache` uses |
+| `src/cache.rs` | `0600` JSON cache in `$XDG_CACHE_HOME/gh-tui` (repo list, repo facts) and the directory `gh --cache` uses |
 | `src/global.rs` | The global home: scopes, the exact `gh search` arguments per section / tab / favorites chunk, merge-and-sort, hidden-repo filtering with top-up, the organizations list, Repos-panel rows |
 | `src/start.rs` | The start decision (`auto` / `repo` / `global` x `-R` x clone), pure and table-tested |
 | `src/config.rs` | `config.toml` model (incl. `[panels]` layout and tab sets, `[[sections]]` and the filter parser), validation with line numbers, atomic save, the named-action `Keymap` |
@@ -140,4 +140,4 @@ log shown with `L`.
 
 Parsers have fixture tests (`tests/*.json`, synthetic data). Layout is tested with ratatui's `TestBackend` using
 a seeded `App` (`App::with(.., load = false)` and the test-only `seed`). Live smoke tests are `#[ignore]` and read
-their target from environment variables (`GH_PULSE_REPO`, `GH_PULSE_HUGE_PR`).
+their target from environment variables (`GH_TUI_REPO`, `GH_TUI_HUGE_PR`).

@@ -1,10 +1,12 @@
 # Configuration
 
-gh-pulse reads an optional `config.toml` from `$XDG_CONFIG_HOME/gh-pulse/` (default `~/.config/gh-pulse/`).
+gh-tui reads an optional `config.toml` from `$XDG_CONFIG_HOME/gh-tui/` (default `~/.config/gh-tui/`).
+If the `gh-tui` directory is absent but the legacy `gh-pulse` directory exists, gh-tui reads and writes there instead.
+It does not migrate files. The same directory fallback applies to state and cache.
 
 - A missing file means defaults.
 - An invalid file (syntax error, unknown key, bad value, clashing key binding) stops startup with a message like
-  `~/.config/gh-pulse/config.toml:7: unknown field `theem``, exit code 2. Nothing is ignored silently.
+  `~/.config/gh-tui/config.toml:7: unknown field `theem``, exit code 2. Nothing is ignored silently.
 - Command-line flags override the file.
 - The file is written by the repo browser (favorites, hidden). Saves are atomic (temp file + rename) and refused
   if the file currently fails to parse, so hand edits in progress are never overwritten. Comments are not
@@ -57,7 +59,7 @@ filter = "is:open review-requested:@me org:acme draft:false"
 
 ## API etiquette
 
-gh-pulse is a polite client. Every `gh` process runs through one small worker pool: at most `max_concurrent`
+gh-tui is a polite client. Every `gh` process runs through one small worker pool: at most `max_concurrent`
 (default 4) at once, what you asked for (the selected item, actions, forms) before anything automatic, and queued
 work for something you have already moved past is dropped before it starts (an already-running `gh` is left to finish).
 
@@ -91,7 +93,7 @@ work for something you have already moved past is dropped before it starts (an a
 
 ### Cache
 
-Slow-changing lookups are cached under `$XDG_CACHE_HOME/gh-pulse` (default `~/.cache/gh-pulse`; only absolute paths
+Slow-changing lookups are cached under `$XDG_CACHE_HOME/gh-tui` (default `~/.cache/gh-tui`; only absolute paths
 are honored). The directory must be a real directory you own: an existing one with looser permissions is tightened to
 `0700`, one owned by someone else or reached through a symlink is refused and the cache turns itself off (the status
 line says why). Files are `0600`, written through unique temp files created exclusively, and read only if they are
@@ -108,12 +110,12 @@ regular files you own.
 an hour.** If the repo list or header facts cannot be tied to your login (a token from the environment rather than
 `gh auth login`), they are not cached at all. Text read back from the cache is neutralized again like everything else.
 Never cached: tokens, comments, notifications, PR details, diffs, anything from a write. `r` / `R` fetch fresh data
-(the cached copy still expires on its own schedule). `gh-pulse --clear-cache` deletes the directory (only after the same
+(the cached copy still expires on its own schedule). `gh-tui --clear-cache` deletes the directory (only after the same
 ownership checks); `[api] cache = false` turns caching off.
 
 ## Start mode and the global home
 
-`[ui] start` (or `--start`, which wins) decides where gh-pulse opens:
+`[ui] start` (or `--start`, which wins) decides where gh-tui opens:
 
 | Mode | In a clone / with `-R` | Elsewhere |
 |---|---|---|
@@ -128,7 +130,7 @@ search` call, or one per four favorites with the favorites scope, at most 4): `r
 archived:false`; `author:@me` with `is:open` / `is:merged` / `is:closed is:unmerged`; `assignee:@me`, `author:@me` or
 `mentions:@me` with `is:open` for issues; `involves:@me` (PRs and issues, two calls) for Involved. Rows from hidden
 repos (`[repos] hidden`, the repo browser's `h`) are dropped client side; when that empties a full page one bigger
-request tops it up. The scope (`all`, `favorites`, `org:x`, `repo:a/b`; `org:` also takes any org or user you type, member or not) is stored in `$XDG_STATE_HOME/gh-pulse/scope.json`.
+request tops it up. The scope (`all`, `favorites`, `org:x`, `repo:a/b`; `org:` also takes any org or user you type, member or not) is stored in `$XDG_STATE_HOME/gh-tui/scope.json`.
 Search budget: one section refresh costs one search per scope chunk (two for Involved), so at most 8, plus - only
 for a single-chunk scope with at least 10 searches (and a third of the minute) left - one bigger re-ask of just the
 searches that came back full after hidden repos emptied a page. A refresh that the rest of the minute can't pay for
@@ -259,7 +261,7 @@ where  = "both"
 
 ## Syncing viewed marks with GitHub
 
-`v` always remembers viewed files locally (`$XDG_STATE_HOME/gh-pulse/viewed.json`). With `sync_viewed = true` it also
+`v` always remembers viewed files locally (`$XDG_STATE_HOME/gh-tui/viewed.json`). With `sync_viewed = true` it also
 tells GitHub, through the `markFileAsViewed` / `unmarkFileAsViewed` GraphQL mutations (PR id and path travel as
 GraphQL variables), and when you open a PR's files, the files GitHub already has marked viewed are added to your local
 marks. This is a write to GitHub, so it is **off by default and setting it to true is the consent**: there is no

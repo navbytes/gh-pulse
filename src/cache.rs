@@ -1,6 +1,6 @@
 //! A small on-disk cache for slow-changing facts (the repo list, a repo's header facts) plus the
 //! directory `gh` keeps its own `--cache` entries in. Files are 0600 in a 0700 directory under
-//! `$XDG_CACHE_HOME/gh-pulse` (default `~/.cache/gh-pulse`). They hold repo names and public-ish
+//! `$XDG_CACHE_HOME/gh-tui` (default `~/.cache/gh-tui`). They hold repo names and public-ish
 //! metadata only: no tokens, nothing from write actions, notifications, comments or PR details.
 use serde::{Serialize, de::DeserializeOwned};
 use std::path::{Path, PathBuf};
@@ -25,7 +25,7 @@ pub fn set_dir(p: Option<PathBuf>) {
     *DIR_OVERRIDE.lock().unwrap() = p;
 }
 
-/// `$XDG_CACHE_HOME/gh-pulse`, or `~/.cache/gh-pulse`. Relative paths in either variable are ignored.
+/// `$XDG_CACHE_HOME/gh-tui`, or `~/.cache/gh-tui`. Relative paths in either variable are ignored.
 pub fn dir() -> Option<PathBuf> {
     #[cfg(test)]
     if let Some(d) = DIR_OVERRIDE.lock().unwrap().clone() {
@@ -37,7 +37,7 @@ pub fn dir() -> Option<PathBuf> {
 fn dir_from(xdg: Option<std::ffi::OsString>, home: Option<std::ffi::OsString>) -> Option<PathBuf> {
     let abs = |v: Option<std::ffi::OsString>| v.map(PathBuf::from).filter(|p| p.is_absolute());
     let base = abs(xdg).or_else(|| abs(home).map(|h| h.join(".cache")))?;
-    Some(base.join("gh-pulse"))
+    Some(crate::paths::data_dir(&base))
 }
 
 static WARNING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -147,7 +147,7 @@ pub fn gh_home() -> Option<PathBuf> {
     }
 }
 
-/// Deletes everything gh-pulse cached (`gh-pulse --clear-cache`); returns what was removed. Only a
+/// Deletes everything gh-tui cached (`gh-tui --clear-cache`); returns what was removed. Only a
 /// directory that passes the ownership checks is ever touched.
 pub fn clear() -> Result<Option<PathBuf>, String> {
     let Some(d) = dir() else { return Ok(None) };
@@ -257,7 +257,7 @@ mod tests {
     use super::*;
 
     fn store(name: &str) -> Store {
-        let d = std::env::temp_dir().join(format!("gh-pulse-cache-{name}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("gh-tui-cache-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         Store::new(d)
     }
@@ -349,16 +349,13 @@ mod tests {
         let os = |s: &str| Some(std::ffi::OsString::from(s));
         assert_eq!(
             dir_from(os("/x/cache"), os("/h")),
-            Some("/x/cache/gh-pulse".into())
+            Some("/x/cache/gh-tui".into())
         );
         assert_eq!(
             dir_from(os("rel/cache"), os("/h")),
-            Some("/h/.cache/gh-pulse".into())
+            Some("/h/.cache/gh-tui".into())
         );
-        assert_eq!(
-            dir_from(os(""), os("/h")),
-            Some("/h/.cache/gh-pulse".into())
-        );
+        assert_eq!(dir_from(os(""), os("/h")), Some("/h/.cache/gh-tui".into()));
         assert_eq!(
             dir_from(None, os("relative-home")),
             None,
@@ -391,7 +388,7 @@ mod tests {
         let target = store("target");
         std::fs::create_dir_all(&target.dir).unwrap();
         std::fs::write(target.dir.join("precious"), "x").unwrap();
-        let link = std::env::temp_dir().join(format!("gh-pulse-cache-link-{}", std::process::id()));
+        let link = std::env::temp_dir().join(format!("gh-tui-cache-link-{}", std::process::id()));
         let _ = std::fs::remove_file(&link);
         symlink(&target.dir, &link).unwrap();
         assert!(

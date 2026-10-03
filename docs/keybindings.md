@@ -115,7 +115,7 @@ cancels. Nothing is created without that confirm.
 | `j` `k`, `Ctrl-d` `Ctrl-u`, `g` `G` | Move the line cursor / half page / first and last row (the cursor line is what inline comments attach to) |
 | `t` | Cycle layout: auto, unified, split. Auto goes side-by-side when each half has at least 60 columns |
 | `w` | Toggle soft-wrap / clip |
-| `v` | Mark the file viewed (saved to `$XDG_STATE_HOME/gh-pulse/viewed.json`, per PR head commit; PR files only; also on GitHub with `sync_viewed = true`) |
+| `v` | Mark the file viewed (saved to `$XDG_STATE_HOME/gh-tui/viewed.json`, per PR head commit; PR files only; also on GitHub with `sync_viewed = true`) |
 | `f` | Zoom |
 | `x` | Menu, including "Comment on file:line" for the cursor line |
 

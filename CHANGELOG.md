@@ -3,6 +3,17 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] - Unreleased
+
+### Changed
+- Renamed the project and GitHub CLI extension from gh-pulse (`gh pulse`) to gh-tui (`gh tui`).
+- New installations use `gh extension install navbytes/gh-tui`; the standalone executable and XDG directories use `gh-tui`.
+- Documentation and GitHub Pages move to `navbytes/gh-tui` and `/gh-tui/`.
+
+### Compatibility
+- Existing gh-pulse XDG directories continue to be used for reads and writes when the new directories are absent. Files are not moved or deleted automatically.
+- Whether `gh extension upgrade pulse` follows the repository redirect must be verified with the published release.
+
 ## [0.2.0]
 
 ### Added

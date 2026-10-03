@@ -1,12 +1,12 @@
 [package]
-name = "gh-pulse"
-version = "0.2.0"
+name = "gh-tui"
+version = "0.3.0"
 edition = "2024"
 description = "A lazygit-style terminal UI for GitHub: review PRs, diffs, checks, issues, runs and releases through the gh CLI"
 license = "MIT"
 rust-version = "1.89"
-repository = "https://github.com/navbytes/gh-pulse"
-homepage = "https://github.com/navbytes/gh-pulse"
+repository = "https://github.com/navbytes/gh-tui"
+homepage = "https://github.com/navbytes/gh-tui"
 readme = "README.md"
 keywords = ["github", "tui", "gh", "pull-requests", "code-review"]
 categories = ["command-line-utilities", "development-tools"]

@@ -495,8 +495,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "gh-pulse"
-version = "0.2.0"
+name = "gh-tui"
+version = "0.3.0"
 dependencies = [
  "crossterm",
  "pulldown-cmark",

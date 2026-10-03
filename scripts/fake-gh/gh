@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fake `gh` for reproducible gh-pulse screenshots: answers from fixtures/*.json (synthetic data only).
+"""Fake `gh` for reproducible gh-tui screenshots: answers from fixtures/*.json (synthetic data only).
 
 Offline by construction (stdlib only, no sockets, never reads ~/.config/gh). Anything that would write
 (non-GET api calls, mutations, pr/issue edits, ...) is refused: it is appended to $FAKE_GH_LOG/writes.log
@@ -95,7 +95,7 @@ def item_json(it, repo_field=True):
 
 
 def matches(it, terms):
-    """Evaluate the search qualifiers gh-pulse sends; `(repo:a OR repo:b)` groups are OR-ed."""
+    """Evaluate the search qualifiers gh-tui sends; `(repo:a OR repo:b)` groups are OR-ed."""
     owners, repos, ok = set(), set(), True
     for t in terms:
         t = t.strip('()')
