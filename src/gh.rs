@@ -1039,12 +1039,6 @@ fn remotes_include(remotes: &str, repo: &str) -> bool {
     })
 }
 
-/// (rows, more than that) of one list tab, for the panel titles.
-pub fn count(repo: &str, panel: usize, tab: usize) -> Result<(usize, bool), String> {
-    let n = list(repo, panel, tab, false)?.len();
-    Ok((n, n >= cap(panel)))
-}
-
 /// Panels: 0 Status, 1 Pull requests, 2 Issues, 3 Actions, 4 Branches, 5 Releases, 6 Notifications, 7 Tags.
 /// In the global view panels 1-2 search across all repos and the repo-only ones are empty.
 /// `fresh` skips the on-disk cache (the user asked for a refresh).

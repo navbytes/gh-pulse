@@ -174,14 +174,12 @@ struct StoredList {
     rows: Vec<Row>,
     hidden: usize,
     not_shown: usize,
-    note: Option<String>,
 }
 
 pub struct CachedList {
     pub items: Vec<Item>,
     pub hidden: usize,
     pub not_shown: usize,
-    pub note: Option<String>,
     pub age: u64,
 }
 
@@ -223,19 +221,12 @@ pub fn read_list(key: &str, now: u64) -> Option<CachedList> {
         items,
         hidden: l.hidden,
         not_shown: l.not_shown,
-        note: l.note,
         age,
     })
 }
 
-pub fn write_list(
-    key: &str,
-    items: &[Item],
-    hidden: usize,
-    not_shown: usize,
-    note: &Option<String>,
-    now: u64,
-) {
+/// A list that is partial (a search failed) is never passed in: it would pass for complete.
+pub fn write_list(key: &str, items: &[Item], hidden: usize, not_shown: usize, now: u64) {
     // only PR and issue rows round-trip; a list of anything else is not kept
     if items
         .iter()
@@ -267,7 +258,6 @@ pub fn write_list(
             .collect(),
         hidden,
         not_shown,
-        note: note.clone(),
     };
     let _ = st.write(&list_file(&host, &login, key), &l, now);
 }
@@ -454,26 +444,16 @@ mod tests {
             is_draft: true,
             ..Default::default()
         };
-        write_list(
-            "k1",
-            &[row(Kind::Pr, 1), row(Kind::Issue, 2)],
-            3,
-            1,
-            &Some("note".into()),
-            500,
-        );
+        write_list("k1", &[row(Kind::Pr, 1), row(Kind::Issue, 2)], 3, 1, 500);
         let l = read_list("k1", 560).unwrap();
-        assert_eq!(
-            (l.age, l.hidden, l.not_shown, l.note.as_deref()),
-            (60, 3, 1, Some("note"))
-        );
+        assert_eq!((l.age, l.hidden, l.not_shown), (60, 3, 1));
         assert_eq!(l.items.len(), 2);
         let (a, b) = (&l.items[0], &l.items[1]);
         assert!((a.kind, b.kind) == (Kind::Pr, Kind::Issue) && a.repo == "o/r" && a.is_draft);
         assert!(
             a.author.login == "bob" && a.labels[0].name == "bug" && a.updated.starts_with("2026")
         );
-        write_list("k2", &[row(Kind::Run, 1)], 0, 0, &None, 500);
+        write_list("k2", &[row(Kind::Run, 1)], 0, 0, 500);
         assert!(read_list("k2", 500).is_none(), "runs are not kept");
         crate::gh::set_identity(Some(("github.com".into(), "other".into())));
         assert!(read_list("k1", 560).is_none());

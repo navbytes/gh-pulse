@@ -221,6 +221,8 @@ pub struct Panel {
     pub hidden: usize,
     /// Favorites a favorites-scoped search could not include.
     pub not_shown: usize,
+    /// The rows are a copy from disk (fetched at this time) while a refresh is on its way.
+    pub cached_at: Option<u64>,
 }
 
 impl Panel {
@@ -239,6 +241,7 @@ impl Panel {
             unloaded: false,
             hidden: 0,
             not_shown: 0,
+            cached_at: None,
         }
     }
 
@@ -1272,6 +1275,12 @@ impl App {
         }
         let mut jobs = vec![];
         for &i in &cov {
+            let (kind, tab_id) = (self.panels[i].kind, self.panels[i].tab_id());
+            let key = self.list_key(kind, tab_id);
+            // a copy kept on disk is shown at once; while it is fresh this list needs no request
+            if self.net && !fresh && self.show_cached_list(i, key.as_deref()) {
+                continue;
+            }
             let p = &mut self.panels[i];
             p.loading = true;
             p.error = None;
@@ -1283,7 +1292,7 @@ impl App {
                 PK::Prs => want.prs = Some(tab),
                 _ => want.issues = Some(tab),
             }
-            jobs.push((p.kind, p.tab, p.seq, p.stamp.clone()));
+            jobs.push((p.kind, p.tab, p.seq, p.stamp.clone(), key));
         }
         if !self.net {
             return;
@@ -1291,20 +1300,34 @@ impl App {
         if cov.is_empty() {
             // global view or no PR/issue panel: only the facts (and the viewer) are needed
             want.meta = want.meta || self.meta.is_none();
+        } else if jobs.is_empty()
+            && !want.meta
+            && let Some((_, login)) = gh::identity()
+        {
+            // every list and the facts came from fresh copies on disk, and gh's own config names
+            // the viewer: nothing to ask GitHub
+            if self.user.is_empty() {
+                self.user = login;
+                self.rebuild_header();
+            }
+            return;
         }
         let (tx, repo, g, cg) = (self.tx.clone(), self.repo.clone(), self.hgen, self.cgen);
         let (tx_lost, lost): (_, Vec<_>) = (
             self.tx.clone(),
-            jobs.iter().map(|(k, t, sq, _)| (*k, *t, *sq)).collect(),
+            jobs.iter().map(|(k, t, sq, _, _)| (*k, *t, *sq)).collect(),
         );
         self.user_job_or(
             move || match gh::startup(&repo, &want) {
                 Ok(st) => {
-                    for (kind, tab, seq, stamp) in jobs {
+                    for (kind, tab, seq, stamp, key) in jobs {
                         if stamp.load(Relaxed) != seq {
                             continue;
                         }
                         let items = if kind == PK::Prs { &st.prs } else { &st.issues };
+                        if let (Some(k), Some(v)) = (&key, items) {
+                            dcache::write_list(k, v, 0, 0, rate::now());
+                        }
                         let _ = tx.send(Msg::List(
                             kind,
                             tab,
@@ -1322,7 +1345,7 @@ impl App {
                     }
                 }
                 Err(e) if gh::rate_limit_secs(&e).is_some() => {
-                    for (kind, tab, seq, _) in jobs {
+                    for (kind, tab, seq, _, _) in jobs {
                         let _ = tx.send(Msg::List(kind, tab, seq, Err(e.clone())));
                     }
                 }
@@ -1453,9 +1476,18 @@ impl App {
 
     fn load_panel(&mut self, i: usize, fresh: bool) {
         match self.panels[i].kind {
-            k if k.is_global_search() => return self.load_global(i),
+            k if k.is_global_search() => return self.load_global(i, fresh),
             PK::Repos => return self.load_repos_panel(i),
             _ => {}
+        }
+        let (kind0, tab0) = (self.panels[i].kind, self.panels[i].tab_id());
+        let key = self.list_key(kind0, tab0);
+        if self.net
+            && !fresh
+            && self.panels[i].source().is_some()
+            && self.show_cached_list(i, key.as_deref())
+        {
+            return;
         }
         let p = &mut self.panels[i];
         let Some((src, tab_id)) = p.source() else {
@@ -1476,12 +1508,11 @@ impl App {
             Prio::User,
             move || stamp.load(Relaxed) != seq,
             move || {
-                let _ = tx.send(Msg::List(
-                    kind,
-                    tab,
-                    seq,
-                    gh::list(&repo, src, tab_id, fresh),
-                ));
+                let res = gh::list(&repo, src, tab_id, fresh);
+                if let (Ok(items), Some(k)) = (&res, &key) {
+                    dcache::write_list(k, items, 0, 0, rate::now());
+                }
+                let _ = tx.send(Msg::List(kind, tab, seq, res));
             },
             // lost (queue full, panic): the panel must not sit on "loading..."
             move || {
@@ -1493,6 +1524,94 @@ impl App {
                 ));
             },
         );
+    }
+
+    /// Seconds a cached copy of this list counts as fresh (`[cache] hot_s`, `warm_s`, `cold_s`).
+    fn list_ttl(&self, kind: PK, tab_id: usize) -> u64 {
+        let c = &self.cfg.cache;
+        match (kind, tab_id) {
+            (PK::Review, _) | (PK::MyPrs, 0) => c.hot_s,
+            (PK::MyPrs, _) => c.cold_s,
+            (PK::Prs, t) if t >= 3 => c.cold_s,
+            (PK::Prs, _) => c.hot_s,
+            _ => c.warm_s,
+        }
+    }
+
+    /// The disk key of a PR or issue list: everything its rows depend on is in it (scope, window,
+    /// favorites, hidden repos, the section's own filter, the repo), so a different view never reads
+    /// another's rows. None for lists that are not kept.
+    fn list_key(&self, kind: PK, tab_id: usize) -> Option<String> {
+        let favs = if self.scope == Scope::Favorites {
+            dcache::digest(&self.cfg.repos.favorites)
+        } else {
+            "-".into()
+        };
+        let mut hidden = self.cfg.repos.hidden.clone();
+        hidden.sort();
+        let common = format!(
+            "{}-{}-{favs}-{}",
+            self.scope.key(),
+            self.window.label(),
+            dcache::digest(&hidden)
+        );
+        let name = match kind {
+            PK::Review => "review".to_string(),
+            PK::MyPrs => "mine".to_string(),
+            PK::Assigned => "assigned".to_string(),
+            PK::Involved => "involved".to_string(),
+            k if k.custom().is_some() => {
+                let c = self.cfg.sections.get(k.custom()?)?;
+                let repo = if self.global { "" } else { self.repo.as_str() };
+                format!(
+                    "c{}",
+                    dcache::digest([
+                        c.title.as_str(),
+                        c.filter.as_str(),
+                        repo,
+                        &format!("{:?}", c.kind)
+                    ])
+                )
+            }
+            PK::Prs | PK::Issues if !self.global => {
+                let what = if kind == PK::Prs { "prs" } else { "issues" };
+                return Some(format!("r-{}-{what}-{tab_id}", self.repo.replace('/', "_")));
+            }
+            _ => return None,
+        };
+        Some(format!("g-{name}-{tab_id}-{common}"))
+    }
+
+    /// (rows, more than the page holds) as the list's count shows it.
+    fn list_count(&self, p: &Panel, n: usize) -> (usize, bool) {
+        let cap = p
+            .kind
+            .custom()
+            .and_then(|i| self.cfg.sections.get(i))
+            .map_or_else(
+                || p.source().map_or(gh::LIMIT, |s| gh::cap(s.0)),
+                config::SectionCfg::limit,
+            );
+        (n, n >= cap)
+    }
+
+    /// Show the copy of a list kept on disk, if any. Returns true when it is still fresh and
+    /// nothing needs fetching; a stale copy stays on screen, marked, while the refresh runs.
+    fn show_cached_list(&mut self, i: usize, key: Option<&str>) -> bool {
+        let (kind, tab_id) = (self.panels[i].kind, self.panels[i].tab_id());
+        let Some(c) = key.and_then(|k| dcache::read_list(k, rate::now())) else {
+            return false;
+        };
+        let fresh = c.age <= self.list_ttl(kind, tab_id);
+        let count = self.list_count(&self.panels[i], c.items.len());
+        let p = &mut self.panels[i];
+        p.cursor = p.cursor.min(c.items.len().saturating_sub(1));
+        p.items = c.items;
+        (p.hidden, p.not_shown, p.error, p.unloaded) = (c.hidden, c.not_shown, None, false);
+        p.cached_at = (!fresh).then(|| rate::now().saturating_sub(c.age));
+        p.loading = !fresh;
+        self.counts.insert((kind, tab_id), count);
+        fresh
     }
 
     /// A built-in section's search, narrowed to the window for its pull requests.
@@ -1509,12 +1628,12 @@ impl App {
         let pr_section = |p: &Panel| matches!(p.kind, PK::Review | PK::MyPrs | PK::Involved);
         for p in self.panels.iter_mut().filter(|p| pr_section(p)) {
             (p.unloaded, p.cursor, p.hidden, p.not_shown) = (true, 0, 0, 0);
-            p.items.clear();
+            (p.items, p.cached_at) = (vec![], None);
         }
         if let Some(o) = self.other.as_mut() {
             for p in o.panels.iter_mut().filter(|p| pr_section(p)) {
                 (p.unloaded, p.cursor, p.hidden, p.not_shown) = (true, 0, 0, 0);
-                p.items.clear();
+                (p.items, p.cached_at) = (vec![], None);
             }
         }
         let f = self.focus;
@@ -1545,7 +1664,7 @@ impl App {
 
     /// A global section: one search per scope chunk, run at user priority when the section is focused,
     /// reloaded or its scope changed. Hidden repos are dropped inside the job.
-    fn load_global(&mut self, i: usize) {
+    fn load_global(&mut self, i: usize, fresh: bool) {
         let kind = self.panels[i].kind;
         let tab_id = self.panels[i].tab_id();
         let query = match kind {
@@ -1572,6 +1691,11 @@ impl App {
                 return;
             }
         };
+        // what is on disk is shown at once; while it is fresh nothing is searched at all
+        let key = self.list_key(kind, tab_id);
+        if self.net && !fresh && self.show_cached_list(i, key.as_deref()) {
+            return;
+        }
         // the search API allows 30 requests a minute: never start a refresh the rest of the minute can't pay for
         let needed = query.searches_needed(&self.scope, &self.cfg.repos.favorites);
         if let Some(b) = self.rate.search.filter(|b| rate::now() < b.reset)
@@ -1621,6 +1745,9 @@ impl App {
             move || stamp.load(Relaxed) != seq,
             move || match query.fetch(&scope, &favs, &hidden, quota) {
                 Ok(l) => {
+                    if let (Some(k), None) = (&key, &l.note) {
+                        dcache::write_list(k, &l.items, l.hidden, l.not_shown, rate::now());
+                    }
                     let _ = tx.send(Msg::GMeta(kind, tab, seq, l.hidden, l.not_shown, l.note));
                     let _ = tx.send(Msg::List(kind, tab, seq, Ok(l.items)));
                 }
@@ -1704,11 +1831,28 @@ impl App {
             self.cgen,
         );
         let gen_a = self.cgen_a.clone();
+        // the count shares the list's copy on disk: a fresh one answers without a request, and a
+        // fetched one is kept for when the tab is opened
+        let (ckey, ttl) = (self.list_key(key.0, key.1), self.list_ttl(key.0, key.1));
         self.queue(
             Prio::Background,
             move || gen_a.load(Relaxed) != g,
             move || {
-                let _ = tx.send(Msg::Count(g, key, gh::count(&repo, src, tab)));
+                let now = rate::now();
+                let cached = ckey
+                    .as_ref()
+                    .and_then(|k| dcache::read_list(k, now))
+                    .filter(|c| c.age <= ttl);
+                let res = match cached {
+                    Some(c) => Ok((c.items.len(), c.items.len() >= gh::cap(src))),
+                    None => gh::list(&repo, src, tab, false).map(|items| {
+                        if let Some(k) = &ckey {
+                            dcache::write_list(k, &items, 0, 0, now);
+                        }
+                        (items.len(), items.len() >= gh::cap(src))
+                    }),
+                };
+                let _ = tx.send(Msg::Count(g, key, res));
             },
             move || {
                 let _ = tx2.send(Msg::Count(g, key, Err("dropped".into())));
@@ -1831,6 +1975,7 @@ impl App {
                             config::SectionCfg::limit,
                         );
                     let (mut found, mut rec) = (false, None);
+                    let mut kept_err = None;
                     match res {
                         Ok(items) => {
                             p.cursor = p.cursor.min(items.len().saturating_sub(1));
@@ -1845,8 +1990,16 @@ impl App {
                             }
                             rec = Some((items.len(), items.len() >= cap));
                             p.items = items;
+                            p.cached_at = None;
+                        }
+                        // a copy from disk is on screen: it stays, and the failure goes to the status line
+                        Err(e) if p.cached_at.is_some() && !p.items.is_empty() => {
+                            kept_err = Some(e)
                         }
                         Err(e) => p.error = Some(e),
+                    }
+                    if let Some(e) = kept_err {
+                        self.status = format!("refresh failed, showing the cached list: {e}");
                     }
                     if consumed {
                         // closed or merged: the lists only hold open items, so show it on GitHub
@@ -3652,7 +3805,7 @@ impl App {
                     && (all || p.kind.custom().is_none_or(|i| scope_applies(secs.get(i))))
             }) {
                 (p.unloaded, p.cursor, p.hidden, p.not_shown) = (true, 0, 0, 0);
-                p.items.clear();
+                (p.items, p.cached_at) = (vec![], None);
             }
         };
         // unhiding (`all`) also concerns the parked home: its sections may have lacked that repo's rows
@@ -5094,19 +5247,133 @@ mod tests {
         assert_eq!(a.counts.get(&(PK::Prs, 2)), Some(&(74, false)));
         assert_eq!(a.counts.get(&(PK::Prs, 0)), Some(&(2, false)));
         assert!(a.header.contains("user: octocat"));
-        // a second start within five minutes skips the facts; r/R do not
+        // a second start while the copies are fresh asks GitHub for nothing: lists, facts and the
+        // viewer all come from disk
         let mut b = live("");
         b.start_load(false);
+        assert!(
+            !b.panels[0].loading && b.panels[0].items.len() == 2,
+            "shown at once"
+        );
+        assert!(b.meta.is_some(), "the cached facts show at once");
+        assert!(b.header.contains("user: octocat"), "{}", b.header);
+        assert_eq!(shim.calls().len(), 1, "{:?}", shim.calls());
+        // r/R go to GitHub, facts included
+        b.start_load(true);
         wait(&mut b, "lists", |a| !a.panels[0].loading);
         assert!(
-            shim.calls()[1].contains("-F meta=false"),
+            shim.calls()[1].contains("-F meta=true"),
             "{:?}",
             shim.calls()
         );
-        assert!(b.meta.is_some(), "the cached facts show at once");
-        b.start_load(true);
-        wait(&mut b, "lists", |a| !a.panels[0].loading);
-        assert!(shim.calls()[2].contains("-F meta=true"));
+    }
+
+    fn cached_rows(kind: Kind, repo: &str, n: u64) -> Vec<Item> {
+        (1..=n)
+            .map(|i| Item {
+                number: i,
+                title: format!("cached {i}"),
+                url: format!("https://github.com/{repo}/pull/{i}"),
+                repo: repo.into(),
+                kind,
+                updated: "2026-10-03T10:00:00Z".into(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_repo_list_shows_at_once_marked_and_is_refreshed() {
+        let shim = crate::testshim::Shim::new();
+        shim.set("graphql.out", include_str!("../tests/startup.json"));
+        let mut a = live("");
+        let key = a.list_key(PK::Prs, 0).unwrap();
+        // older than hot_s (120 s): stale, but better than a blank while GitHub answers
+        dcache::write_list(
+            &key,
+            &cached_rows(Kind::Pr, "o/r", 1),
+            0,
+            0,
+            rate::now() - 1000,
+        );
+        a.start_load(false);
+        let p = &a.panels[0];
+        assert!(
+            p.loading && p.items.len() == 1 && p.cached_at.is_some(),
+            "shown, marked, refreshing"
+        );
+        wait(&mut a, "the refresh", |a| !a.panels[0].loading);
+        assert!(a.panels[0].cached_at.is_none() && a.panels[0].items.len() == 2);
+        assert_eq!(shim.calls().len(), 1, "one request, as before");
+        // the refreshed list is on disk for the next run
+        let l = dcache::read_list(&key, rate::now()).unwrap();
+        assert_eq!(l.items.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_global_section_uses_a_fresh_copy_without_searching_and_refreshes_a_stale_one() {
+        let shim = crate::testshim::Shim::new();
+        shim.set("searchprs.out", "[]");
+        let mut a = home();
+        a.net = true;
+        let key = a.list_key(PK::Review, 0).unwrap();
+        dcache::write_list(
+            &key,
+            &cached_rows(Kind::Pr, "a/b", 3),
+            2,
+            0,
+            rate::now() - 30,
+        );
+        a.load_panel(0, false);
+        assert_eq!((a.panels[0].items.len(), a.panels[0].hidden), (3, 2));
+        assert!(!a.panels[0].loading && a.panels[0].cached_at.is_none());
+        assert_eq!(a.counts.get(&(PK::Review, 0)), Some(&(3, false)));
+        assert!(
+            shim.calls().is_empty(),
+            "fresh: no search: {:?}",
+            shim.calls()
+        );
+        // r searches regardless
+        a.load_panel(0, true);
+        wait(&mut a, "the search", |a| !a.panels[0].loading);
+        assert_eq!(shim.calls().len(), 1);
+        assert!(a.panels[0].items.is_empty(), "the answer replaced the copy");
+        // a copy past hot_s is shown marked while the search runs
+        dcache::write_list(
+            &key,
+            &cached_rows(Kind::Pr, "a/b", 3),
+            0,
+            0,
+            rate::now() - 600,
+        );
+        a.load_panel(0, false);
+        assert!(
+            a.panels[0].loading && a.panels[0].items.len() == 3 && a.panels[0].cached_at.is_some()
+        );
+        wait(&mut a, "the refresh", |a| !a.panels[0].loading);
+        assert_eq!(shim.calls().len(), 2);
+        assert!(a.panels[0].cached_at.is_none());
+        // a failed refresh keeps the copy and says so
+        dcache::write_list(
+            &key,
+            &cached_rows(Kind::Pr, "a/b", 3),
+            0,
+            0,
+            rate::now() - 600,
+        );
+        shim.set("searchprs.err", "boom");
+        a.load_panel(0, false);
+        wait(&mut a, "the failure", |a| !a.panels[0].loading);
+        assert!(a.panels[0].error.is_none() && a.panels[0].items.len() == 3);
+        assert!(a.status.contains("showing the cached list"), "{}", a.status);
+        // another window, scope or hidden set is another list
+        a.window = config::Window::Day;
+        assert_ne!(a.list_key(PK::Review, 0).unwrap(), key);
+        a.window = config::Window::Week;
+        a.cfg.repos.hidden = vec!["x/y".into()];
+        assert_ne!(a.list_key(PK::Review, 0).unwrap(), key);
     }
 
     #[cfg(unix)]
@@ -6509,7 +6776,7 @@ mod tests {
             reset: rate::now() + 600,
         });
         a.panels[0].items = vec![gitem("a/b", 1)];
-        a.load_panel(0, false);
+        a.load_panel(0, true);
         assert!(
             !a.panels[0].loading && a.panels[0].items.len() == 1,
             "the list is kept"
@@ -6522,7 +6789,7 @@ mod tests {
         assert_eq!(shim.calls().len(), calls, "no search was made");
         // an empty list shows the reason instead of a blank
         a.panels[0].items.clear();
-        a.load_panel(0, false);
+        a.load_panel(0, true);
         assert!(
             a.panels[0]
                 .error
@@ -6536,7 +6803,7 @@ mod tests {
             remaining: 0,
             reset: rate::now() - 1,
         });
-        a.load_panel(0, false);
+        a.load_panel(0, true);
         assert!(a.panels[0].loading);
         wait(&mut a, "the section", |a| !a.panels[0].loading);
     }
