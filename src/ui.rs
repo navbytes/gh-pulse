@@ -32,7 +32,8 @@ Panels (default: Pull requests, Files, Issues, Actions, Repo; choose them in [pa
 Global home (opens outside a repo or with --start global; [panels] global picks the sections)
   Review requested, My PRs, Issues, Repos: searches across all your repos, newest update first
   {scope}  scope: all / favorites / an org / one repo      {switch}  open the selected item's repo (G returns)
-  Repos panel: Enter open the repo   {scope} scope the home to it   {zoom} favorite   H hide
+  Repos panel: Enter open the repo   {scope} scope the home to it   {zoom} favorite
+  H  hide the selected row's repo (any section; unhide in the Repos panel or the browser, `.` shows hidden)
 Repo panel (Branches / Tags / Releases tabs)
   Enter/l  details (a tag: commit, date, release)   {copy} on a tag copies its name   {actions}  branch/release actions
 Pull requests

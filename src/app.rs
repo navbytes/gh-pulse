@@ -2801,7 +2801,7 @@ impl App {
             KeyCode::Esc => self.filter.clear(),
             KeyCode::Char('w') if self.diff_active() => self.wrap = !self.wrap,
             KeyCode::Char('v') if self.cur_tab() == Tab::Diff => self.toggle_viewed(),
-            KeyCode::Char('H') if self.on_repo_row() => self.toggle_hide(),
+            KeyCode::Char('H') if self.on_repo_row() || self.on_global_row() => self.toggle_hide(),
             KeyCode::Char('l') | KeyCode::Right if self.selected().is_some() => {
                 self.detail_focus = true
             }
@@ -3566,7 +3566,7 @@ impl App {
         }
     }
 
-    /// `H` on a Repos row: hide or unhide the repo everywhere.
+    /// `H` on a Repos row or a row of a global section: hide or unhide its repo everywhere.
     fn toggle_hide(&mut self) {
         let Some(r) = self.selected_in(self.focus).map(|i| i.repo.clone()) else {
             return;
@@ -3633,6 +3633,15 @@ impl App {
     }
 
     /// The selected row is a repo in the Repos panel (list focus).
+    /// A row of a global search section (Review, My PRs, Issues, custom...): its repo can be hidden.
+    fn on_global_row(&self) -> bool {
+        self.global
+            && self.panels[self.focus].kind.is_global_search()
+            && !self.detail_focus
+            && self.ctx.is_none()
+            && self.selected_in(self.focus).is_some()
+    }
+
     fn on_repo_row(&self) -> bool {
         self.panels[self.focus].kind == PK::Repos
             && !self.detail_focus
@@ -6407,6 +6416,23 @@ mod tests {
         }];
         (b.typing, b.loading, b.show_hidden) = (false, false, true);
         a.browser = Some(b);
+    }
+
+    #[test]
+    fn h_on_a_review_row_hides_that_repo_without_a_search() {
+        let dir = std::env::temp_dir().join(format!("gh-tui-hide-row-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = home();
+        a.cfg_path = Some(dir.join("config.toml"));
+        a.panels[0].items = vec![gitem("e/f", 5), gitem("a/b", 1), gitem("e/f", 6)];
+        a.panels[0].unloaded = false;
+        a.focus = 0;
+        press(&mut a, 'H');
+        assert!(a.cfg.repos.is_hidden("e/f"));
+        assert_eq!(a.panels[0].items.len(), 1);
+        assert_eq!((a.panels[0].hidden, a.panels[0].loading), (2, false));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

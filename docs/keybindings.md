@@ -60,6 +60,7 @@ and `s` applies to those whose filter has no `repo:` / `org:` / `user:` of its o
 | `S` | Open the row's repo as the app's repo; `G` leads back |
 | `r` | Search this section again |
 | Repos panel: `Enter` | Open the repo (`S` too) |
+| `H` | On any row of a global section (Review requested, My PRs, Issues, custom...): hide that row's repo everywhere; unhide it in the Repos panel or the browser (`.` shows hidden repos) |
 | Repos panel: `s` / `f` / `H` | Scope the home to it / toggle favorite (same list as the repo browser) / hide it everywhere |
 
 ## PR drill-in (after `Enter` on a PR)
