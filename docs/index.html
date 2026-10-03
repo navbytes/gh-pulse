@@ -1,74 +1,88 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="theme-color" content="#0c1118">
-    <meta name="description" content="gh-pulse is a keyboard-driven terminal UI for GitHub. Review pull requests, triage issues, watch Actions and move across repositories with the gh CLI.">
-    <meta property="og:title" content="gh-pulse — GitHub at terminal speed">
-    <meta property="og:description" content="Review, triage and act across GitHub without leaving your terminal.">
-    <meta property="og:type" content="website">
-    <meta property="og:url" content="https://navbytes.github.io/gh-pulse/">
-    <meta property="og:image" content="https://navbytes.github.io/gh-pulse/img/1-main.png">
-    <title>gh-pulse — GitHub at terminal speed</title>
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230c1118'/%3E%3Cpath d='M14 33h10l5-13 7 25 5-12h9' fill='none' stroke='%23a6e87a' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
-    <link rel="stylesheet" href="site.css">
-  </head>
-  <body>
-    <a class="skip-link" href="#main">Skip to content</a>
-    <header class="site-header">
-      <div class="shell nav-row">
-        <a class="brand" href="#top" aria-label="gh-pulse home"><span class="brand-mark" aria-hidden="true">&gt;_</span> gh<span class="brand-accent">-pulse</span></a>
-        <nav aria-label="Main navigation">
-          <a href="#features">Features</a>
-          <a href="#workflow">Workflow</a>
-          <a href="#install">Install</a>
-          <a class="nav-github" href="https://github.com/navbytes/gh-pulse">GitHub <span aria-hidden="true">↗</span></a>
-        </nav>
-      </div>
-    </header>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b1013">
+  <meta name="description" content="gh-pulse is a fast, keyboard-driven GitHub workspace in your terminal. Review pull requests, inspect diffs and checks, triage issues, and act through the gh CLI.">
+  <meta property="og:title" content="gh-pulse — Your GitHub cockpit, in the terminal">
+  <meta property="og:description" content="Review, triage, and ship without leaving the terminal. Built on the GitHub CLI you already use.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://navbytes.github.io/gh-pulse/">
+  <meta property="og:image" content="https://navbytes.github.io/gh-pulse/img/1-main.png">
+  <title>gh-pulse — Your GitHub cockpit, in the terminal</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230b1013'/%3E%3Cpath d='M12 34h12l5-15 7 27 5-12h11' fill='none' stroke='%23b5f386' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="site.css">
+  <script src="site.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <div class="shell header-inner">
+      <a class="brand" href="#top" aria-label="gh-pulse home"><span class="brand-mark" aria-hidden="true">⌁</span><span>gh<span class="brand-accent">-pulse</span></span></a>
+      <nav class="primary-nav" aria-label="Main navigation">
+        <a href="#product">Product</a>
+        <a href="#workflow">Workflow</a>
+        <a href="#install">Install</a>
+        <a href="https://github.com/navbytes/gh-pulse/blob/main/README.md">Docs <span aria-hidden="true">↗</span></a>
+      </nav>
+      <a class="header-source" href="https://github.com/navbytes/gh-pulse">View source <span aria-hidden="true">↗</span></a>
+    </div>
+  </header>
 
-    <main id="main">
-      <section class="hero shell" id="top" aria-labelledby="hero-title">
+  <main id="main">
+    <section class="hero" id="top" aria-labelledby="hero-title">
+      <div class="hero-glow" aria-hidden="true"></div>
+      <div class="shell hero-grid">
         <div class="hero-copy">
-          <div class="eyebrow"><span class="live-dot" aria-hidden="true"></span> YOUR GITHUB WORKSPACE, ONE TERMINAL AWAY</div>
-          <h1 id="hero-title">Stay in flow.<br><span>Stay on GitHub.</span></h1>
-          <p class="hero-lede">The keyboard-driven GitHub cockpit for people who live in the terminal. Review pull requests, follow checks, triage issues and move between repos without breaking your rhythm.</p>
-          <div class="hero-actions">
-            <a class="button button-primary" href="#install">Get started <span aria-hidden="true">↗</span></a>
-            <a class="button button-secondary" href="https://github.com/navbytes/gh-pulse">View on GitHub <span aria-hidden="true">↗</span></a>
+          <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span> OPEN SOURCE · POWERED BY THE GH CLI</p>
+          <h1 id="hero-title">Your GitHub cockpit.<br><span>Still your terminal.</span></h1>
+          <p class="hero-lede">A keyboard-driven workspace for pull requests, diffs, checks, issues, Actions, and repos. Get the whole picture, take the next action, and stay in flow.</p>
+          <div class="quick-install" aria-label="Quick install command">
+            <span class="quick-prompt" aria-hidden="true">$</span>
+            <code id="hero-command">gh extension install navbytes/gh-pulse</code>
+            <button class="copy-button" type="button" data-copy="hero-command" aria-label="Copy installation command">Copy</button>
           </div>
-          <div class="hero-note"><span class="prompt" aria-hidden="true">$</span> <code>gh extension install navbytes/gh-pulse</code></div>
+          <p class="copy-status" id="copy-status" role="status" aria-live="polite"></p>
+          <div class="hero-links"><a class="button button-primary" href="#install">Install &amp; run <span aria-hidden="true">↗</span></a><a class="button button-ghost" href="https://github.com/navbytes/gh-pulse">Explore on GitHub <span aria-hidden="true">↗</span></a></div>
+          <p class="hero-compat">Already using <code>gh</code>? Your existing login is all you need. <span>macOS &amp; Linux · MIT licensed</span></p>
         </div>
-        <div class="hero-visual">
-          <div class="visual-label"><span>01 / THE WORKSPACE</span><span>REAL PRODUCT SCREENSHOT</span></div>
-          <div class="screen-frame"><img src="img/1-main.png" width="1982" height="1280" alt="gh-pulse showing pull requests, files, issues, Actions and repository panels beside a pull request overview" fetchpriority="high"></div>
-          <p class="screen-caption">A real gh-pulse session against a public repository. Login shown as “you”.</p>
+        <div class="hero-stage">
+          <div class="stage-top"><span><i aria-hidden="true"></i> REAL PRODUCT SCREENSHOT</span><span>01 / 03</span></div>
+          <div class="stage-screen">
+            <picture><source media="(max-width: 680px)" srcset="img/10-compact.png"><img src="img/1-main.png" width="1982" height="1280" alt="gh-pulse in a real public repository, with pull requests and other panels beside a PR overview" fetchpriority="high"></picture>
+          </div>
+          <div class="stage-caption"><span class="swipe-hint">Swipe to inspect ↔</span><span class="stage-key"><kbd>Enter</kbd> drill in <kbd>f</kbd> focus diff <kbd>x</kbd> actions</span><span>Real public repo · login “you” · <a href="img/1-main.png">Open full screenshot ↗</a></span></div>
         </div>
-      </section>
+      </div>
+      <div class="hero-bottom shell"><span>ONE WORKSPACE / MANY REPOSITORIES</span><a href="#product">Discover the flow <span aria-hidden="true">↓</span></a></div>
+    </section>
 
-      <div class="ticker" aria-label="What you can do"><div class="shell ticker-inner"><span>REVIEW PRS</span><i aria-hidden="true">✳</i><span>TRACE CHECKS</span><i aria-hidden="true">✳</i><span>TRIAGE ISSUES</span><i aria-hidden="true">✳</i><span>WATCH RUNS</span><i aria-hidden="true">✳</i><span>SWITCH REPOS</span></div></div>
+    <section class="proof-bar" aria-label="Why developers use gh-pulse"><div class="shell proof-grid">
+      <div><span class="proof-number">01</span><p><strong>Use your existing <code>gh</code> login.</strong><br>No token to paste into another app.</p></div>
+      <div><span class="proof-number">02</span><p><strong>See the exact command.</strong><br>Nothing runs until you confirm it.</p></div>
+      <div><span class="proof-number">03</span><p><strong>Inspect the trail.</strong><br>A command log shows what ran.</p></div>
+    </div></section>
 
-      <section class="section shell" id="features" aria-labelledby="features-title">
-        <div class="section-heading"><p class="kicker">01 / ALL THE SIGNAL, LESS NOISE</p><h2 id="features-title">Your GitHub day,<br><em>in one place.</em></h2><p>From a quick review to a deep dive, the next useful detail is a keystroke away.</p></div>
-        <div class="feature-grid">
-          <article class="feature-card feature-primary"><span class="feature-index">01 — REVIEW</span><div class="feature-icon" aria-hidden="true">±</div><h3>Review code in context</h3><p>Read split or unified diffs, check CI, follow review threads and mark files viewed. Drill from a PR into files, commits, checks and comments.</p><a href="https://github.com/navbytes/gh-pulse#features">Explore review features <span aria-hidden="true">↗</span></a></article>
-          <article class="feature-card"><span class="feature-index">02 — MOVE</span><div class="feature-icon" aria-hidden="true">⌘</div><h3>Go across repositories</h3><p>Start anywhere. A global home brings together review requests, your PRs, issues and repositories. Narrow your scope or browse everything you can access.</p></article>
-          <article class="feature-card"><span class="feature-index">03 — ACT</span><div class="feature-icon" aria-hidden="true">✓</div><h3>Make the next move</h3><p>Review, comment, label, merge, rerun workflows and more. Actions show the exact <code>gh</code> command before you confirm.</p></article>
-          <article class="feature-card"><span class="feature-index">04 — FOLLOW</span><div class="feature-icon" aria-hidden="true">↗</div><h3>Keep the pulse</h3><p>See workflow runs and failed steps, browse branches and releases, and open an inbox of unread notifications across repos.</p></article>
-        </div>
-      </section>
+    <section class="section product-section shell" id="product" aria-labelledby="product-title">
+      <div class="section-intro"><p class="kicker">THE PRODUCT / NO CONTEXT SWITCH REQUIRED</p><h2 id="product-title">The work is already here.<br><em>Now the workflow is too.</em></h2><p>gh-pulse brings the GitHub surfaces you visit all day into one focused terminal UI. Go from a list to the line, check, or thread that needs you.</p></div>
+      <div class="product-grid">
+        <article class="product-card product-card-large"><div class="card-top"><span>01 / REVIEW</span><span class="card-glyph" aria-hidden="true">±</span></div><h3>Stay with the code.</h3><p>Move through PR files, commits, checks, and comments. Switch between split and unified diffs, follow review threads, and mark files viewed.</p><div class="card-visual diff-visual"><img src="img/2-diff-split.png" width="1982" height="1280" loading="lazy" alt="Real gh-pulse split diff with highlighted changes"></div><span class="visual-note">REAL PUBLIC-REPO SCREENSHOT</span></article>
+        <article class="product-card global-card"><div class="card-top"><span>02 / GLOBAL HOME</span><span class="card-glyph" aria-hidden="true">⌘</span></div><h3>All your repos. One starting point.</h3><p>Launch outside a repo to see review requests, your PRs, issues, and favorites. Browse or narrow the scope without changing directories.</p><div class="mini-rows" aria-label="Illustration of global home sections"><span><b>01</b> Review requested <i>↗</i></span><span><b>02</b> My PRs <i>↗</i></span><span><b>03</b> Issues <i>↗</i></span><span><b>04</b> Repos <i>↗</i></span></div><p class="card-footnote">Global-home screenshots in the <a href="https://github.com/navbytes/gh-pulse#screenshots">gallery</a> use synthetic demo data.</p></article>
+        <article class="product-card pulse-card"><div class="card-top"><span>03 / THE PULSE</span><span class="card-glyph" aria-hidden="true">↗</span></div><h3>Follow what happens next.</h3><p>See workflow runs, drill into failed checks, triage issues, browse releases, and read notifications across repos.</p><div class="status-stack" aria-label="Illustrative statuses"><span><i class="status-ok" aria-hidden="true"></i> Pull requests <b>REVIEW</b></span><span><i class="status-warn" aria-hidden="true"></i> Workflow runs <b>CHECK</b></span><span><i class="status-ok" aria-hidden="true"></i> Releases <b>BROWSE</b></span></div></article>
+      </div>
+    </section>
 
-      <section class="showcase" id="workflow" aria-labelledby="workflow-title"><div class="shell showcase-grid">
-        <div class="showcase-copy"><p class="kicker">02 / BUILT FOR THE WAY YOU WORK</p><h2 id="workflow-title">From overview<br>to <em>the exact line.</em></h2><p>Keep the whole picture in view, then zoom into the detail that matters. Keyboard navigation, clickable panels and mouse scrolling all work together.</p><ul class="check-list"><li>Syntax highlighting and word-level diff changes</li><li>Checks, comments and threads beside the code</li><li>Dark and light themes with ASCII fallback</li></ul><a class="text-link" href="https://github.com/navbytes/gh-pulse/blob/main/docs/keybindings.md">See the keybindings <span aria-hidden="true">↗</span></a></div>
-        <figure class="showcase-shot"><div class="shot-top"><span>DIFF VIEW</span><span>REAL PRODUCT SCREENSHOT</span></div><img src="img/2-diff-split.png" width="1982" height="1280" loading="lazy" alt="Side-by-side highlighted code diff in gh-pulse"><figcaption>A real split diff captured from the gh-pulse binary.</figcaption></figure>
-      </div></section>
+    <section class="workflow-section" id="workflow" aria-labelledby="workflow-title"><div class="shell workflow-grid">
+      <div class="workflow-heading"><p class="kicker">THE FLOW / FROM OPEN TO DONE</p><h2 id="workflow-title">A few keys.<br><em>A complete review.</em></h2><p>Navigation stays fast because every step has a direct path. Mouse support is there when you want it.</p><a class="text-link" href="https://github.com/navbytes/gh-pulse/blob/main/docs/keybindings.md">Explore every keybinding <span aria-hidden="true">↗</span></a></div>
+      <ol class="steps"><li><span class="step-no">01</span><div><div class="step-key"><kbd>gh pulse</kbd></div><h3>Open your workspace</h3><p>Start in a repo, or launch anywhere for your cross-repo home.</p></div></li><li><span class="step-no">02</span><div><div class="step-key"><kbd>Enter</kbd><kbd>f</kbd></div><h3>Drill in. Focus the diff.</h3><p>Open a PR, move through its details, and zoom into code when it matters.</p></div></li><li><span class="step-no">03</span><div><div class="step-key"><kbd>x</kbd><kbd>y</kbd></div><h3>Act with a seatbelt</h3><p>Open the action menu. Review the exact <code>gh</code> command, then confirm with <kbd>y</kbd>.</p></div></li></ol>
+    </div></section>
 
-      <section class="section shell global-section" aria-labelledby="global-title"><div class="global-heading"><div><p class="kicker">03 / YOUR WORK, NOT ONE REPO</p><h2 id="global-title">Pick up anywhere.<br><em>Stay in the loop.</em></h2></div><p>Open gh-pulse outside a repository to see a cross-repo home. Review requests, PRs and issues stay close, while the scope picker and repo browser help you move quickly.</p></div><figure class="global-shot"><div class="shot-top"><span>GLOBAL HOME</span><span>SYNTHETIC DEMO DATA</span></div><img src="img/11-global-home.png" width="1982" height="1280" loading="lazy" alt="Cross-repository global home with review requests, pull requests, issues and favorite repositories"><figcaption>Global home shown with synthetic data from a fake <code>gh</code>; no real account is shown.</figcaption></figure></section>
+    <section class="trust-section shell" aria-labelledby="trust-title"><div class="trust-head"><div><p class="kicker">DESIGNED FOR TRUST</p><h2 id="trust-title">Power you can<br><em>see before you use.</em></h2></div><p>gh-pulse shells out to the GitHub CLI for authentication and actions. The confirmation popup previews the command before a write, and <kbd>L</kbd> opens the command log.</p></div><div class="trust-grid"><div class="confirm-window"><div class="window-chrome"><span class="window-dots" aria-hidden="true"><i></i><i></i><i></i></span><span>gh-pulse / confirm action</span></div><div class="confirm-body"><p class="confirm-label">Run this command? <span>[y yes, n/Esc no]</span></p><code>gh pr review 5 -R navbytes/gh-pulse --approve</code></div><a class="trust-source" href="img/8b-confirm.png">Inspect the real confirmation screen ↗</a><p class="window-caption">Command reproduced from a real gh-pulse screenshot.</p></div><div class="trust-points"><div><span>01</span><h3>Your GitHub CLI session</h3><p>Authentication stays with <code>gh</code>; there is no separate token setup for gh-pulse.</p></div><div><span>02</span><h3>A visible action trail</h3><p>The command log records <code>gh</code> and <code>git</code> commands the app ran.</p></div><div><span>03</span><h3>Verifiable releases</h3><p>Release assets include checksums and build provenance attestations.</p></div></div></div></section>
 
-      <section class="install-section" id="install" aria-labelledby="install-title"><div class="shell install-grid"><div><p class="kicker">04 / READY WHEN YOU ARE</p><h2 id="install-title">Two commands.<br><em>Back in flow.</em></h2><p>gh-pulse uses your authenticated GitHub CLI session. Install the extension, then run it from a repo or anywhere for the global home.</p><div class="requirements">Requires the <a href="https://cli.github.com/">GitHub CLI</a> and <code>gh auth login</code>. Prebuilt binaries for macOS and Linux; Windows is unsupported.</div></div><div class="install-terminal" aria-label="Install commands"><div class="terminal-header"><span class="terminal-dots" aria-hidden="true"><i></i><i></i><i></i></span><span>TERMINAL</span></div><div class="terminal-body"><p><span>$</span> <code>gh extension install navbytes/gh-pulse</code></p><p><span>$</span> <code>gh pulse</code></p><p class="terminal-comment"># Or run anywhere for your global home</p></div><a href="https://github.com/navbytes/gh-pulse#installation">More installation options <span aria-hidden="true">↗</span></a></div></div></section>
-    </main>
+    <section class="install-section" id="install" aria-labelledby="install-title"><div class="shell install-grid"><div class="install-intro"><p class="kicker">START HERE / QUICK SETUP</p><h2 id="install-title">Install it.<br><em>Keep moving.</em></h2><p>gh-pulse is a GitHub CLI extension. Authenticate with <code>gh</code>, install once, then launch from any directory.</p><div class="platform-note"><strong>Prebuilt for</strong> macOS (arm64, amd64) and Linux (arm64, amd64; glibc 2.35+). Windows is unsupported.</div><a class="text-link" href="https://github.com/navbytes/gh-pulse#installation">Cargo install and release verification <span aria-hidden="true">↗</span></a></div><div class="install-panel"><div class="install-panel-top"><span class="window-dots" aria-hidden="true"><i></i><i></i><i></i></span><span>QUICK START</span><span>gh CLI</span></div><div class="command-row"><span class="command-index">01</span><div><small>Authenticate with GitHub</small><code id="auth-command">gh auth login</code></div><button class="copy-button" type="button" data-copy="auth-command" aria-label="Copy authentication command">Copy</button></div><div class="command-row"><span class="command-index">02</span><div><small>Install the extension</small><code id="install-command">gh extension install navbytes/gh-pulse</code></div><button class="copy-button" type="button" data-copy="install-command" aria-label="Copy installation command">Copy</button></div><div class="command-row"><span class="command-index">03</span><div><small>Launch the workspace</small><code id="run-command">gh pulse</code></div><button class="copy-button" type="button" data-copy="run-command" aria-label="Copy launch command">Copy</button></div><p class="install-copy-status" id="install-copy-status" role="status" aria-live="polite"></p><div class="install-panel-bottom"><span>Tip: run it outside a repo for global home.</span><a href="https://github.com/navbytes/gh-pulse/blob/main/docs/configuration.md">Configuration ↗</a></div></div></div></section>
+  </main>
 
-    <footer class="site-footer"><div class="shell footer-grid"><div><a class="brand" href="#top"><span class="brand-mark" aria-hidden="true">&gt;_</span> gh<span class="brand-accent">-pulse</span></a><p>GitHub at terminal speed. Open source under the MIT License.</p></div><nav aria-label="Footer navigation"><a href="https://github.com/navbytes/gh-pulse">Source</a><a href="https://github.com/navbytes/gh-pulse/blob/main/README.md">README</a><a href="https://github.com/navbytes/gh-pulse/blob/main/docs/configuration.md">Configuration</a><a href="https://github.com/navbytes/gh-pulse/releases">Releases</a></nav></div></footer>
-  </body>
+  <footer class="site-footer"><div class="shell footer-main"><div><a class="brand" href="#top"><span class="brand-mark" aria-hidden="true">⌁</span><span>gh<span class="brand-accent">-pulse</span></span></a><p>GitHub work, at terminal speed.<br>Open source under the MIT License.</p></div><nav aria-label="Footer navigation"><a href="https://github.com/navbytes/gh-pulse">Source</a><a href="https://github.com/navbytes/gh-pulse/blob/main/README.md">README</a><a href="https://github.com/navbytes/gh-pulse/blob/main/docs/keybindings.md">Keybindings</a><a href="https://github.com/navbytes/gh-pulse/releases">Releases</a></nav></div><div class="shell footer-bottom"><span>BUILT FOR PEOPLE WHO LIVE IN THE TERMINAL</span><a href="#top">Back to top ↑</a></div></footer>
+</body>
 </html>
