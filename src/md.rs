@@ -57,10 +57,7 @@ fn split_urls(t: &str) -> Vec<(bool, &str)> {
             .find(|c: char| c.is_whitespace() || "<>\"`".contains(c))
             .unwrap_or(tail.len());
         let mut url = &tail[..end];
-        loop {
-            let Some(last) = url.chars().last() else {
-                break;
-            };
+        while let Some(last) = url.chars().last() {
             let unbalanced =
                 |open: char, close: char| url.matches(close).count() > url.matches(open).count();
             let trim = match last {

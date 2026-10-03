@@ -28,11 +28,11 @@ use std::io::IsTerminal;
 use std::time::Duration;
 use theme::{IconSet, Theme};
 
-const USAGE: &str = "usage: gh-pulse [-R owner/repo] [--start auto|repo|global] [--theme dark|light] [--ascii] [--nerd] [--clear-cache]";
+const USAGE: &str = "usage: gh-pulse [-R owner/repo] [--start auto|repo|global] [--theme dark|light] [--ascii] [--nerd] [--clear-cache] [-V]";
 
 const HELP: &str = "gh-pulse: a lazygit-style terminal UI for GitHub
 
-usage: gh-pulse [-R owner/repo] [--start auto|repo|global] [--theme dark|light] [--ascii] [--nerd] [--clear-cache]
+usage: gh-pulse [-R owner/repo] [--start auto|repo|global] [--theme dark|light] [--ascii] [--nerd] [--clear-cache] [-V]
 
   -R, --repo owner/repo   open this repo
   --start MODE            where to open (config: [ui] start):
@@ -43,7 +43,14 @@ usage: gh-pulse [-R owner/repo] [--start auto|repo|global] [--theme dark|light] 
   --theme dark|light      color palette
   --ascii | --nerd        ASCII icons and borders | Nerd Font icons
   --clear-cache           delete gh-pulse's on-disk cache and exit
-  -h, --help              this text";
+  -V, --version           print the version
+  -h, --help              this text
+
+also runs as a GitHub CLI extension: `gh pulse [flags]`";
+
+fn version() -> String {
+    format!("gh-pulse {}", env!("CARGO_PKG_VERSION"))
+}
 
 struct MouseGuard;
 
@@ -89,7 +96,11 @@ fn main() -> std::io::Result<()> {
                 None => die("--start takes auto, repo or global"),
             },
             "-h" | "--help" => {
-                println!("{HELP}");
+                println!("{}\n\n{HELP}", version());
+                return Ok(());
+            }
+            "-V" | "--version" => {
+                println!("{}", version());
                 return Ok(());
             }
             _ => die(USAGE),
@@ -167,4 +178,15 @@ fn main() -> std::io::Result<()> {
     // no orphaned `gh` processes after we are gone
     gh::kill_children();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn version_line_uses_package_version() {
+        assert_eq!(
+            super::version(),
+            format!("gh-pulse {}", env!("CARGO_PKG_VERSION"))
+        );
+    }
 }
