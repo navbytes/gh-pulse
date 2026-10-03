@@ -395,7 +395,7 @@ mod tests {
             (4, 5),
             "16 searched, 5 reported as not shown"
         );
-        assert!(c.iter().all(|x| x.len() <= 2 * FAV_CHUNK - 1));
+        assert!(c.iter().all(|x| x.len() < 2 * FAV_CHUNK));
         // config junk never reaches a query
         let junk = vec![
             "o/ok".to_string(),

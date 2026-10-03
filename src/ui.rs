@@ -2445,10 +2445,12 @@ fn modal(f: &mut Frame, app: &App) {
                 );
             }
             let rows: Vec<ListItem> = if choices.is_empty() {
-                let msg = if p.stage == Orgs && app.orgs.is_none() {
-                    "loading your organizations..."
-                } else {
-                    "no match"
+                let msg = match (p.stage, &app.orgs) {
+                    (Orgs, None) => "loading your organizations...",
+                    (Orgs, Some(o)) if o.is_empty() && p.query.is_empty() => {
+                        "you are not in any organization"
+                    }
+                    _ => "no match",
                 };
                 vec![ListItem::new(Span::styled(msg, Style::new().fg(th.muted)))]
             } else {
