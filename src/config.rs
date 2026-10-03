@@ -23,6 +23,9 @@ pub struct Config {
     pub api: ApiCfg,
     #[serde(skip_serializing_if = "UiCfg::is_default")]
     pub ui: UiCfg,
+    /// `[[sections]]`: your own search-based panels. Last, so the file stays valid TOML when saved.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sections: Vec<SectionCfg>,
 }
 
 /// Where gh-pulse opens: the repo of the current directory, or the cross-repo home.
@@ -149,9 +152,9 @@ impl ApiCfg {
     }
 }
 
-/// Left-column panels, as named in `[panels] show`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
+/// Left-column panels, as named in `[panels] show` (`section:<title>` is one of your `[[sections]]`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
 pub enum PanelName {
     Prs,
     Files,
@@ -167,17 +170,19 @@ pub enum PanelName {
     Mine,
     Assigned,
     Involved,
+    /// A `[[sections]]` entry, by title.
+    Section(String),
 }
 
 impl PanelName {
-    fn repo_mode(self) -> bool {
+    fn repo_mode(&self) -> bool {
         !matches!(
             self,
             PanelName::Review | PanelName::Mine | PanelName::Assigned | PanelName::Involved
         )
     }
 
-    fn global_mode(self) -> bool {
+    fn global_mode(&self) -> bool {
         matches!(
             self,
             PanelName::Review
@@ -186,11 +191,50 @@ impl PanelName {
                 | PanelName::Involved
                 | PanelName::Repos
                 | PanelName::Files
+                | PanelName::Section(_)
         )
     }
 
-    pub fn word(self) -> String {
-        format!("{self:?}").to_lowercase()
+    pub fn word(&self) -> String {
+        match self {
+            PanelName::Section(t) => format!("section:{t}"),
+            _ => format!("{self:?}").to_lowercase(),
+        }
+    }
+}
+
+impl From<PanelName> for String {
+    fn from(n: PanelName) -> String {
+        n.word()
+    }
+}
+
+impl TryFrom<String> for PanelName {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, String> {
+        if let Some(t) = s.strip_prefix("section:") {
+            return Ok(PanelName::Section(t.to_string()));
+        }
+        Ok(match s.as_str() {
+            "prs" => PanelName::Prs,
+            "files" => PanelName::Files,
+            "issues" => PanelName::Issues,
+            "actions" => PanelName::Actions,
+            "repo" => PanelName::Repo,
+            "notifications" => PanelName::Notifications,
+            "status" => PanelName::Status,
+            "repos" => PanelName::Repos,
+            "review" => PanelName::Review,
+            "mine" => PanelName::Mine,
+            "assigned" => PanelName::Assigned,
+            "involved" => PanelName::Involved,
+            _ => {
+                return Err(format!(
+                    "unknown panel {s:?}; valid: {REPO_NAMES}, review, mine, assigned, involved, section:<title>"
+                ));
+            }
+        })
     }
 }
 
@@ -316,26 +360,28 @@ impl PanelsCfg {
         *self == PanelsCfg::default()
     }
 
-    /// `show` without `files` when `prs` is not shown (Files only ever describes the selected PR).
-    fn effective(&self) -> Vec<PanelName> {
-        let prs = self.show.contains(&PanelName::Prs);
-        self.show
-            .iter()
-            .copied()
+    /// `show` plus the sections that run in a repo and are not listed, without `files` when `prs` is
+    /// not shown (Files only ever describes the selected PR).
+    fn effective(&self, secs: &[SectionCfg]) -> Vec<PanelName> {
+        let all = with_sections(&self.show, secs, Where::in_repo);
+        let prs = all.contains(&PanelName::Prs);
+        all.into_iter()
             .filter(|n| prs || *n != PanelName::Files)
             .collect()
     }
 
     /// The global home's panels (`files` needs a PR section).
-    pub fn global_layout(&self) -> Vec<PanelSpec> {
+    pub fn global_layout(&self, secs: &[SectionCfg]) -> Vec<PanelSpec> {
         let td = |id, label, short| TabDef { id, label, short };
-        let prs = self
-            .global
-            .iter()
-            .any(|n| matches!(n, PanelName::Review | PanelName::Mine | PanelName::Involved));
-        self.global
-            .iter()
-            .copied()
+        let all = with_sections(&self.global, secs, Where::in_global);
+        let prs = all.iter().any(|n| match n {
+            PanelName::Review | PanelName::Mine | PanelName::Involved => true,
+            PanelName::Section(t) => secs
+                .iter()
+                .any(|s| s.title == *t && s.kind == SectionKind::Prs),
+            _ => false,
+        });
+        all.into_iter()
             .filter(|n| prs || *n != PanelName::Files)
             .map(|name| {
                 let tabs = match name {
@@ -357,8 +403,8 @@ impl PanelsCfg {
             .collect()
     }
 
-    pub fn layout(&self) -> Vec<PanelSpec> {
-        self.effective()
+    pub fn layout(&self, secs: &[SectionCfg]) -> Vec<PanelSpec> {
+        self.effective(secs)
             .into_iter()
             .map(|name| {
                 let (tabs, tab) = match name {
@@ -374,9 +420,31 @@ impl PanelsCfg {
     }
 
     /// (section header, key inside it, message): enough to point at the offending line.
-    fn check(&self) -> Result<(), (&'static str, &'static str, String)> {
-        let lower = |x: &dyn std::fmt::Debug| format!("{x:?}").to_lowercase();
+    fn check(&self, secs: &[SectionCfg]) -> Result<(), (&'static str, &'static str, String)> {
+        let section = |key: &'static str, n: &PanelName, here: fn(Where) -> bool| {
+            let PanelName::Section(t) = n else {
+                return Ok(());
+            };
+            let bad = |m: String| Err(("[panels]", key, format!("panels.{key}: {m}")));
+            match secs.iter().find(|s| s.title == *t) {
+                None => bad(format!(
+                    "unknown section {} (defined: {})",
+                    shown(t),
+                    secs.iter()
+                        .map(|s| shown(&s.title))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+                Some(s) if !here(s.at) => bad(format!(
+                    "section {} has where = \"{}\"; it cannot be listed here",
+                    shown(t),
+                    s.at.word()
+                )),
+                Some(_) => Ok(()),
+            }
+        };
         for n in &self.show {
+            section("show", n, Where::in_repo)?;
             if !n.repo_mode() {
                 return Err((
                     "[panels]",
@@ -389,6 +457,7 @@ impl PanelsCfg {
             }
         }
         for (i, n) in self.global.iter().enumerate() {
+            section("global", n, Where::in_global)?;
             if !n.global_mode() {
                 return Err((
                     "[panels]",
@@ -403,11 +472,11 @@ impl PanelsCfg {
                 return Err((
                     "[panels]",
                     "global",
-                    format!("panels.global: {} listed twice", n.word()),
+                    format!("panels.global: {} listed twice", label(n)),
                 ));
             }
         }
-        if self.global_layout().is_empty() {
+        if self.global_layout(secs).is_empty() {
             return Err((
                 "[panels]",
                 "global",
@@ -419,11 +488,11 @@ impl PanelsCfg {
                 return Err((
                     "[panels]",
                     "show",
-                    format!("panels.show: {} listed twice", lower(n)),
+                    format!("panels.show: {} listed twice", label(n)),
                 ));
             }
         }
-        if self.effective().is_empty() {
+        if self.effective(secs).is_empty() {
             return Err((
                 "[panels]",
                 "show",
@@ -468,6 +537,250 @@ impl PanelsCfg {
         tabs("[panels.actions]", &self.actions)?;
         tabs("[panels.repo]", &self.repo)
     }
+}
+
+/// `[[sections]] kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SectionKind {
+    Prs,
+    Issues,
+}
+
+/// `[[sections]] where`: the home(s) a section is a panel of.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Where {
+    #[default]
+    Global,
+    Repo,
+    Both,
+}
+
+impl Where {
+    pub fn in_global(self) -> bool {
+        self != Where::Repo
+    }
+
+    pub fn in_repo(self) -> bool {
+        self != Where::Global
+    }
+
+    fn word(self) -> String {
+        format!("{self:?}").to_lowercase()
+    }
+}
+
+/// One `[[sections]]` entry: a GitHub search shown as a panel.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SectionCfg {
+    pub title: String,
+    pub kind: SectionKind,
+    pub filter: String,
+    /// Rows to fetch, 1..=100 (default 30).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, rename = "where")]
+    pub at: Where,
+}
+
+pub const MAX_SECTIONS: usize = 12;
+pub const MAX_TITLE: usize = 40;
+pub const MAX_FILTER: usize = 256;
+pub const DEFAULT_LIMIT: usize = 30;
+/// GitHub rejects search queries with more AND / OR / NOT operators than this.
+pub const MAX_OPS: usize = 5;
+
+/// A section filter split into search terms, with what the app needs to know about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Filter {
+    pub terms: Vec<String>,
+    /// `OR` / `AND` / `NOT` words and `-qualifier` terms: GitHub allows at most `MAX_OPS`.
+    pub ops: usize,
+    /// Has a `repo:` / `org:` / `user:` qualifier, so the scope is not applied.
+    pub own_scope: bool,
+    pub own_repo: bool,
+    pub has_archived: bool,
+    pub has_or: bool,
+}
+
+/// A user-written name for an error message: neutralized and quoted.
+fn shown(s: &str) -> String {
+    format!("{:?}", crate::sanitize::clean(s))
+}
+
+/// A panel name for an error message; section titles are user text.
+fn label(n: &PanelName) -> String {
+    match n {
+        PanelName::Section(_) => shown(&n.word()),
+        _ => n.word(),
+    }
+}
+
+fn term_char_ok(c: char) -> bool {
+    c.is_alphanumeric() || "-_.:/@*<>=!,~()'#+?".contains(c)
+}
+
+/// Splits on whitespace outside double quotes. Every term later travels as its own argument after
+/// `--`, so nothing here is a shell or flag risk; the checks keep junk and surprises out of the query.
+pub fn parse_filter(src: &str) -> Result<Filter, String> {
+    if src.trim().is_empty() {
+        return Err("filter is empty".into());
+    }
+    if src.chars().count() > MAX_FILTER {
+        return Err(format!("filter is longer than {MAX_FILTER} characters"));
+    }
+    if let Some(c) = src.chars().find(|c| c.is_control()) {
+        return Err(format!(
+            "filter contains a control character (U+{:04X}); use a single line",
+            c as u32
+        ));
+    }
+    let (mut terms, mut cur, mut quoted, mut depth) = (vec![], String::new(), false, 0i32);
+    for c in src.chars() {
+        match c {
+            // gh re-quotes a term with spaces itself (`label:good first` -> `label:"good first"`), so the
+            // user's quotes only group words here and are not passed on
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !cur.is_empty() {
+                    terms.push(std::mem::take(&mut cur));
+                }
+            }
+            // parentheses outside quotes are terms of their own: glued to a quoted value they would end up
+            // inside gh's quoting (`label:"a b)"`)
+            '(' | ')' if !quoted => {
+                if !cur.is_empty() {
+                    terms.push(std::mem::take(&mut cur));
+                }
+                depth += i32::from(c == '(') - i32::from(c == ')');
+                if depth < 0 {
+                    return Err("filter has a ) without a matching (".into());
+                }
+                terms.push(c.to_string());
+            }
+            c if c.is_whitespace() || term_char_ok(c) => cur.push(c),
+            c => {
+                return Err(format!(
+                    "filter contains {c:?}, which is not allowed in a search"
+                ));
+            }
+        }
+    }
+    if quoted {
+        return Err("filter has an unclosed double quote".into());
+    }
+    if !cur.is_empty() {
+        terms.push(cur);
+    }
+    if depth != 0 {
+        return Err("filter has a ( without a matching )".into());
+    }
+    if let Some(t) = terms.iter().find(|t| t.starts_with("--")) {
+        return Err(format!("term {t:?} looks like a command-line flag"));
+    }
+    let qual = |t: &str| t.trim_start_matches('(').to_lowercase();
+    let starts = |t: &str, p: &[&str]| p.iter().any(|p| qual(t).starts_with(p));
+    Ok(Filter {
+        ops: terms
+            .iter()
+            .filter(|t| {
+                matches!(t.as_str(), "OR" | "AND" | "NOT")
+                    || (t.starts_with('-') && t.contains(':'))
+            })
+            .count(),
+        own_scope: terms.iter().any(|t| starts(t, &["repo:", "org:", "user:"])),
+        own_repo: terms.iter().any(|t| starts(t, &["repo:"])),
+        has_archived: terms.iter().any(|t| {
+            let q = qual(t);
+            let q = q.trim_start_matches('-');
+            q.starts_with("archived:") || q == "is:archived"
+        }),
+        has_or: terms.iter().any(|t| t == "OR"),
+        terms,
+    })
+}
+
+impl SectionCfg {
+    pub fn limit(&self) -> usize {
+        self.limit.unwrap_or(DEFAULT_LIMIT)
+    }
+
+    /// (key, message) of the first problem.
+    fn check(&self) -> Result<(), (&'static str, String)> {
+        // display width of what the panel will show, not the raw text
+        let shown = crate::sanitize::clean(&self.title);
+        let n = unicode_width::UnicodeWidthStr::width(shown.as_ref());
+        if shown.trim().is_empty() || n > MAX_TITLE {
+            return Err((
+                "title",
+                format!(
+                    "sections.title: must be 1..{MAX_TITLE} columns wide and not blank, got {n}"
+                ),
+            ));
+        }
+        if !self.limit.is_none_or(|l| (1..=100).contains(&l)) {
+            return Err(("limit", "sections.limit: must be 1..100".into()));
+        }
+        parse_filter(&self.filter)
+            .map(|_| ())
+            .map_err(|e| ("filter", format!("sections.filter: {e}")))
+    }
+}
+
+/// Soft problems worth telling the user about at startup (the file still loads).
+pub fn warnings(cfg: &Config) -> Vec<String> {
+    cfg.sections
+        .iter()
+        .filter_map(|s| {
+            let f = parse_filter(&s.filter).ok()?;
+            (f.ops > MAX_OPS).then(|| {
+                format!(
+                    "section {:?}: {} AND/OR/NOT operators; GitHub allows {MAX_OPS}, the search may fail",
+                    crate::sanitize::clean(&s.title),
+                    f.ops
+                )
+            })
+        })
+        .collect()
+}
+
+fn with_sections(
+    listed: &[PanelName],
+    secs: &[SectionCfg],
+    here: fn(Where) -> bool,
+) -> Vec<PanelName> {
+    let mut v = listed.to_vec();
+    for s in secs.iter().filter(|s| here(s.at)) {
+        let n = PanelName::Section(s.title.clone());
+        if !v.contains(&n) {
+            v.push(n);
+        }
+    }
+    v
+}
+
+fn check_sections(secs: &[SectionCfg]) -> Result<(), (usize, &'static str, String)> {
+    for (i, s) in secs.iter().enumerate() {
+        if i >= MAX_SECTIONS {
+            return Err((
+                i,
+                "title",
+                format!("sections: at most {MAX_SECTIONS} sections"),
+            ));
+        }
+        s.check().map_err(|(k, m)| (i, k, m))?;
+        let clean = |t: &str| crate::sanitize::clean(t).into_owned();
+        if secs[..i].iter().any(|o| clean(&o.title) == clean(&s.title)) {
+            return Err((
+                i,
+                "title",
+                format!("sections.title: {} is used twice", shown(&s.title)),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq)]
@@ -533,6 +846,25 @@ pub fn path() -> Option<PathBuf> {
     Some(base.join("gh-pulse").join("config.toml"))
 }
 
+/// 1-based line of `key` inside the `nth` table headed `header`; the header's line if the key is implied.
+fn key_line(src: &str, header: &str, nth: usize, key: &str) -> usize {
+    let lines: Vec<&str> = src.lines().collect();
+    let Some(h) = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.trim() == header)
+        .nth(nth)
+        .map(|(i, _)| i)
+    else {
+        return 1;
+    };
+    lines[h + 1..]
+        .iter()
+        .take_while(|l| !l.trim_start().starts_with('['))
+        .position(|l| l.trim_start().starts_with(key))
+        .map_or(h + 1, |k| h + 2 + k)
+}
+
 pub fn parse(src: &str, name: &str) -> Result<Config, String> {
     let cfg: Config = toml::from_str(src).map_err(|e| {
         let line = e.span().map_or(1, |s| {
@@ -551,36 +883,17 @@ pub fn parse(src: &str, name: &str) -> Result<Config, String> {
             "{name}:{line}: theme must be \"dark\" or \"light\", got {t:?}"
         ));
     }
-    if let Err((section, key, msg)) = cfg.panels.check() {
-        // the key inside its section; the section header if the key is implied (default tabs)
-        let lines: Vec<&str> = src.lines().collect();
-        let head = lines.iter().position(|l| l.trim() == section);
-        let line = head
-            .and_then(|h| {
-                lines[h + 1..]
-                    .iter()
-                    .take_while(|l| !l.trim_start().starts_with('['))
-                    .position(|l| l.trim_start().starts_with(key))
-                    .map(|k| h + 2 + k)
-            })
-            .or(head.map(|h| h + 1))
-            .unwrap_or(1);
-        return Err(format!("{name}:{line}: {msg}"));
+    if let Err((i, key, msg)) = check_sections(&cfg.sections) {
+        return Err(format!(
+            "{name}:{}: {msg}",
+            key_line(src, "[[sections]]", i, key)
+        ));
+    }
+    if let Err((section, key, msg)) = cfg.panels.check(&cfg.sections) {
+        return Err(format!("{name}:{}: {msg}", key_line(src, section, 0, key)));
     }
     if let Err((key, msg)) = cfg.api.check() {
-        let lines: Vec<&str> = src.lines().collect();
-        let head = lines.iter().position(|l| l.trim() == "[api]");
-        let line = head
-            .and_then(|h| {
-                lines[h + 1..]
-                    .iter()
-                    .take_while(|l| !l.trim_start().starts_with('['))
-                    .position(|l| l.trim_start().starts_with(key))
-                    .map(|k| h + 2 + k)
-            })
-            .or(head.map(|h| h + 1))
-            .unwrap_or(1);
-        return Err(format!("{name}:{line}: {msg}"));
+        return Err(format!("{name}:{}: {msg}", key_line(src, "[api]", 0, key)));
     }
     Ok(cfg)
 }
@@ -948,7 +1261,11 @@ mod tests {
     }
 
     fn names(c: &Config) -> Vec<PanelName> {
-        c.panels.layout().iter().map(|p| p.name).collect()
+        c.panels
+            .layout(&[])
+            .iter()
+            .map(|p| p.name.clone())
+            .collect()
     }
 
     #[test]
@@ -956,7 +1273,7 @@ mod tests {
         use PanelName::*;
         let c = parse("", "t").unwrap();
         assert_eq!(names(&c), [Prs, Files, Issues, Actions, Repo]);
-        let tabs: Vec<_> = c.panels.layout().iter().map(|p| p.tabs.len()).collect();
+        let tabs: Vec<_> = c.panels.layout(&[]).iter().map(|p| p.tabs.len()).collect();
         assert_eq!(tabs, [4, 0, 3, 2, 3]);
         assert!(!c.panels.hide_empty);
         // the inbox key is part of the closed key set
@@ -978,7 +1295,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(names(&c), [Repo, Prs, Issues], "order = numbering");
-        let l = c.panels.layout();
+        let l = c.panels.layout(&[]);
         assert_eq!(l[0].tabs.iter().map(|t| t.id).collect::<Vec<_>>(), [2, 0]);
         assert_eq!(l[0].tab, 1, "default_tab picks its position in tabs");
         assert_eq!((l[1].tabs[l[1].tab].label, l[1].tabs.len()), ("Review", 4));
@@ -1169,7 +1486,11 @@ mod tests {
     fn the_global_home_panels_are_configurable_and_validated() {
         use PanelName::*;
         let g = |c: &Config| -> Vec<PanelName> {
-            c.panels.global_layout().iter().map(|p| p.name).collect()
+            c.panels
+                .global_layout(&[])
+                .iter()
+                .map(|p| p.name.clone())
+                .collect()
         };
         let c = parse("", "t").unwrap();
         assert_eq!(
@@ -1179,7 +1500,7 @@ mod tests {
         );
         let tabs: Vec<_> = c
             .panels
-            .global_layout()
+            .global_layout(&[])
             .iter()
             .map(|p| p.tabs.len())
             .collect();
@@ -1196,7 +1517,11 @@ mod tests {
         // repo-mode lists may now include `repos`, but not the global sections (and vice versa)
         let c = parse("[panels]\nshow = [\"prs\", \"repos\"]\n", "t").unwrap();
         assert_eq!(
-            c.panels.layout().iter().map(|p| p.name).collect::<Vec<_>>(),
+            c.panels
+                .layout(&[])
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>(),
             [Prs, Repos]
         );
         let e = parse("[panels]\nshow = [\"prs\", \"review\"]\n", "cfg").unwrap_err();
@@ -1227,5 +1552,205 @@ mod tests {
         let mut over = BTreeMap::new();
         over.insert("scope".to_string(), Keys::One("z".into()));
         assert_eq!(Keymap::build(&over).unwrap().label(Act::Scope), "z");
+    }
+    const TWO: &str = r#"
+[[sections]]
+title  = "Needs my review (acme)"
+kind   = "prs"
+filter = "is:open review-requested:@me org:acme draft:false"
+limit  = 50
+where  = "both"
+
+[[sections]]
+title  = "Bugs"
+kind   = "issues"
+filter = 'is:open label:"good first issue" -label:wip'
+"#;
+
+    #[test]
+    fn sections_parse_with_defaults_and_survive_a_save() {
+        let c = parse(TWO, "cfg").unwrap();
+        assert_eq!(c.sections.len(), 2);
+        let (a, b) = (&c.sections[0], &c.sections[1]);
+        assert_eq!(
+            (a.kind, a.at, a.limit()),
+            (SectionKind::Prs, Where::Both, 50)
+        );
+        assert_eq!(
+            (b.kind, b.at, b.limit()),
+            (SectionKind::Issues, Where::Global, 30)
+        );
+        // quotes group words and are not passed on; `-label:wip` counts as an operator
+        let f = parse_filter(&b.filter).unwrap();
+        assert_eq!(f.terms, ["is:open", "label:good first issue", "-label:wip"]);
+        assert_eq!((f.ops, f.own_scope, f.has_archived), (1, false, false));
+        // saved files re-read to the same sections
+        let back = parse(&toml::to_string_pretty(&c).unwrap(), "cfg").unwrap();
+        assert_eq!(back.sections, c.sections);
+        // sections are extra panels after the built-in ones, per home
+        let names = |l: Vec<PanelSpec>| l.into_iter().map(|p| p.name.word()).collect::<Vec<_>>();
+        assert_eq!(
+            names(c.panels.global_layout(&c.sections)),
+            [
+                "review",
+                "mine",
+                "assigned",
+                "repos",
+                "section:Needs my review (acme)",
+                "section:Bugs"
+            ]
+        );
+        assert_eq!(
+            names(c.panels.layout(&c.sections))
+                .last()
+                .map(String::as_str),
+            Some("section:Needs my review (acme)"),
+            "only where = repo / both in the repo home"
+        );
+    }
+
+    #[test]
+    fn panels_lists_place_sections_and_unknown_names_are_errors() {
+        let src = format!(
+            "{TWO}\n[panels]\nglobal = [\"section:Bugs\", \"review\"]\nshow = [\"section:Needs my review (acme)\", \"prs\"]\n"
+        );
+        let c = parse(&src, "cfg").unwrap();
+        let g: Vec<_> = c
+            .panels
+            .global_layout(&c.sections)
+            .iter()
+            .map(|p| p.name.word())
+            .collect();
+        assert_eq!(
+            g,
+            ["section:Bugs", "review", "section:Needs my review (acme)"]
+        );
+        let e = parse("[[sections]]\ntitle=\"A\"\nkind=\"prs\"\nfilter=\"x\"\n[panels]\nglobal = [\"section:B\"]\n", "cfg").unwrap_err();
+        assert!(
+            e.starts_with("cfg:6:") && e.contains("unknown section \"B\"") && e.contains("A"),
+            "{e}"
+        );
+        let e = parse("[panels]\nshow = [\"section:B\"]\n", "cfg").unwrap_err();
+        assert!(
+            e.starts_with("cfg:2:") && e.contains("unknown section"),
+            "{e}"
+        );
+        // a global-only section cannot be placed in the repo home
+        let e = parse("[[sections]]\ntitle=\"A\"\nkind=\"prs\"\nfilter=\"x\"\n[panels]\nshow = [\"prs\", \"section:A\"]\n", "cfg").unwrap_err();
+        assert!(
+            e.starts_with("cfg:6:") && e.contains("where = \"global\""),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn bad_sections_are_errors_naming_the_line() {
+        let sec = |body: &str| {
+            format!("# top\n[[sections]]\ntitle = \"A\"\nkind = \"prs\"\nfilter = \"x\"\n{body}")
+        };
+        let bad = |src: String| parse(&src, "cfg").unwrap_err();
+        let e = bad(sec("").replace("\"prs\"", "\"repos\""));
+        assert!(
+            e.starts_with("cfg:4:") && e.contains("prs") && e.contains("issues"),
+            "{e}"
+        );
+        let e = bad(sec("limit = 0\n"));
+        assert!(e.starts_with("cfg:6:") && e.contains("1..100"), "{e}");
+        let e = bad(sec("limit = 101\n"));
+        assert!(e.contains("1..100"), "{e}");
+        let e = bad(sec("where = \"nowhere\"\n"));
+        assert!(e.starts_with("cfg:6:") && e.contains("nowhere"), "{e}");
+        let e = bad(sec("").replace("\"x\"", &format!("\"{}\"", "a".repeat(257))));
+        assert!(e.starts_with("cfg:5:") && e.contains("256"), "{e}");
+        for evil in ["a\\nb", "a\\u0007b", "a\\tb"] {
+            let e = bad(sec("").replace("\"x\"", &format!("\"{evil}\"")));
+            assert!(
+                e.starts_with("cfg:5:") && e.contains("control character"),
+                "{evil}: {e}"
+            );
+        }
+        for evil in [
+            "$(x)", "a;b", "`x`", "a|b", "a&b", "a\\\\b", "--web", "x --jq=.", "\\\"open",
+        ] {
+            let e = bad(sec("").replace("\"x\"", &format!("\"{evil}\"")));
+            assert!(
+                e.starts_with("cfg:5:") && e.contains("filter"),
+                "{evil}: {e}"
+            );
+        }
+        let e = bad(sec("").replace("\"x\"", "\" \""));
+        assert!(e.contains("empty"), "{e}");
+        let e = bad(sec("").replace("\"A\"", &format!("\"{}\"", "t".repeat(41))));
+        assert!(e.starts_with("cfg:3:") && e.contains("1..40"), "{e}");
+        let e = bad(format!("{}{}", sec(""), sec("")));
+        assert!(e.starts_with("cfg:8:") && e.contains("used twice"), "{e}");
+        let many: String = (0..13)
+            .map(|i| format!("[[sections]]\ntitle = \"s{i}\"\nkind = \"prs\"\nfilter = \"x\"\n"))
+            .collect();
+        let e = bad(many);
+        assert!(e.contains("at most 12"), "{e}");
+        let e = bad("[[sections]]\ntitle = \"A\"\n".into());
+        assert!(e.contains("missing field"), "{e}");
+    }
+
+    #[test]
+    fn operator_counts_and_scope_markers_come_from_the_terms() {
+        let f = |s: &str| parse_filter(s).unwrap();
+        assert_eq!(f("a OR b AND c NOT d -label:x").ops, 4);
+        assert_eq!(f("(repo:a/b OR repo:c/d)").ops, 1);
+        assert!(f("(repo:a/b OR repo:c/d)").own_scope && f("USER:me").own_scope);
+        assert!(!f("-org:x").own_scope && !f("label:org:x").own_scope);
+        assert!(f("-archived:true").has_archived && f("archived:false").has_archived);
+        // too many operators is a warning, not an error
+        let src = "[[sections]]\ntitle = \"A\"\nkind = \"prs\"\nfilter = \"a OR b OR c OR d OR e OR f OR g\"\n";
+        let c = parse(src, "cfg").unwrap();
+        let w = warnings(&c);
+        assert!(w.len() == 1 && w[0].contains("6 AND/OR/NOT"), "{w:?}");
+        assert!(warnings(&parse(TWO, "cfg").unwrap()).is_empty());
+    }
+    #[test]
+    fn parentheses_archived_and_titles_follow_the_audit_rules() {
+        let one = |filter: &str, title: &str| {
+            format!("[[sections]]\ntitle = '{title}'\nkind = \"prs\"\nfilter = {filter:?}\n")
+        };
+        for bad in ["(a OR b", "a OR b)", ")a(", "((a)"] {
+            let e = parse(&one(bad, "A"), "cfg").unwrap_err();
+            assert!(
+                e.starts_with("cfg:4:") && e.contains("matching"),
+                "{bad}: {e}"
+            );
+        }
+        // parentheses inside quotes are text, not groups
+        assert!(parse(&one("\"fix (x\" OR y", "A"), "cfg").is_ok());
+        let f = parse_filter(r#"(label:"a b" OR c)"#).unwrap();
+        assert_eq!(f.terms, ["(", "label:a b", "OR", "c", ")"]);
+        assert!(parse_filter("is:archived x").unwrap().has_archived);
+        assert!(parse_filter("-is:archived x").unwrap().has_archived);
+        assert!(!parse_filter("is:open").unwrap().has_archived);
+        // titles: width, blank, and look-alikes after neutralizing
+        let e = parse(&one("x", &"\u{4e2d}".repeat(21)), "cfg").unwrap_err();
+        assert!(
+            e.starts_with("cfg:2:") && e.contains("1..40"),
+            "42 columns: {e}"
+        );
+        assert!(parse(&one("x", &"\u{4e2d}".repeat(20)), "cfg").is_ok());
+        let e = parse(&one("x", "   "), "cfg").unwrap_err();
+        assert!(e.contains("not blank"), "{e}");
+        let two = format!("{}{}", one("x", "a\u{202e}b"), one("x", "a<U+202E>b"));
+        let e = parse(&two, "cfg").unwrap_err();
+        assert!(
+            e.starts_with("cfg:6:") && e.contains("used twice") && !e.contains('\u{202e}'),
+            "{e}"
+        );
+        // section titles in panels errors are quoted and neutralized
+        let src = format!(
+            "{}[panels]\nglobal = [\"section:x\\u202ey\"]\n",
+            one("x", "A")
+        );
+        let e = parse(&src, "cfg").unwrap_err();
+        assert!(
+            e.contains("unknown section") && !e.contains('\u{202e}'),
+            "{e}"
+        );
     }
 }

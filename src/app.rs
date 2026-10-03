@@ -1,10 +1,10 @@
 use crate::act::{self, Action, FormKind, Sel};
 use crate::browse::{self, Browser, Out, RepoRow};
-use crate::config::{self, Act, Config, Keymap, PanelName, PanelsCfg, TabDef};
+use crate::config::{self, Act, Config, Keymap, PanelName, TabDef};
 use crate::diff::{self, DiffMode};
 use crate::form::{self, Form};
 use crate::gh::{self, Data, FilesData, Item, Kind, Tab};
-use crate::global::{self, Scope, Section};
+use crate::global::{self, Query, Scope, Section};
 use crate::pool::{self, Prio};
 use crate::rate::{self, RateState};
 use crate::state::Viewed;
@@ -97,21 +97,36 @@ pub enum PK {
     Involved,
     /// Favorites / Recent repos.
     Repos,
+    /// `[[sections]]` entry by index: a custom search of pull requests / of issues.
+    CustomPr(u8),
+    CustomIssue(u8),
 }
 
 impl PK {
+    /// Index into `[[sections]]`.
+    pub fn custom(self) -> Option<usize> {
+        match self {
+            PK::CustomPr(i) | PK::CustomIssue(i) => Some(usize::from(i)),
+            _ => None,
+        }
+    }
+
     pub fn derived(self) -> bool {
         matches!(self, PK::Files | PK::Commits | PK::Checks | PK::Comments)
     }
 
     /// Lists whose rows are pull requests (the Files panel follows the one you were last in).
     pub fn is_pr_list(self) -> bool {
-        matches!(self, PK::Prs | PK::Review | PK::MyPrs | PK::Involved)
+        matches!(
+            self,
+            PK::Prs | PK::Review | PK::MyPrs | PK::Involved | PK::CustomPr(_)
+        )
     }
 
     /// The global sections: a GitHub search each, loaded when first focused, never counted in the background.
     pub fn is_global_search(self) -> bool {
         matches!(self, PK::Review | PK::MyPrs | PK::Assigned | PK::Involved)
+            || self.custom().is_some()
     }
 }
 
@@ -753,19 +768,31 @@ fn derive_items(kind: PK, pr: &Item, d: &Data) -> Vec<Item> {
     }
 }
 
-fn build_panels(cfg: &PanelsCfg) -> Vec<Panel> {
-    panels_from(cfg.layout())
+fn build_panels(cfg: &Config) -> Vec<Panel> {
+    panels_from(cfg.panels.layout(&cfg.sections), &cfg.sections)
 }
 
-fn build_global_panels(cfg: &PanelsCfg) -> Vec<Panel> {
-    panels_from(cfg.global_layout())
+fn build_global_panels(cfg: &Config) -> Vec<Panel> {
+    panels_from(cfg.panels.global_layout(&cfg.sections), &cfg.sections)
 }
 
-fn panels_from(specs: Vec<config::PanelSpec>) -> Vec<Panel> {
+/// Panel titles are `&'static str`; a section's is leaked once per distinct text (at most a dozen).
+fn leak_title(s: String) -> &'static str {
+    static SEEN: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(t) = seen.iter().find(|t| **t == s) {
+        return t;
+    }
+    let t: &'static str = Box::leak(s.into_boxed_str());
+    seen.push(t);
+    t
+}
+
+fn panels_from(specs: Vec<config::PanelSpec>, secs: &[config::SectionCfg]) -> Vec<Panel> {
     specs
         .into_iter()
-        .map(|s| {
-            let (kind, title) = match s.name {
+        .filter_map(|s| {
+            let (kind, title) = match &s.name {
                 PanelName::Prs => (PK::Prs, "Pull requests"),
                 PanelName::Files => (PK::Files, "Files"),
                 PanelName::Issues => (PK::Issues, "Issues"),
@@ -779,12 +806,35 @@ fn panels_from(specs: Vec<config::PanelSpec>) -> Vec<Panel> {
                 PanelName::Mine => (PK::MyPrs, "My PRs"),
                 PanelName::Assigned => (PK::Assigned, "Issues"),
                 PanelName::Involved => (PK::Involved, "Involved"),
+                PanelName::Section(t) => {
+                    let i = secs.iter().position(|c| c.title == *t)?;
+                    let c = &secs[i];
+                    let own = config::parse_filter(&c.filter).is_ok_and(|f| f.own_scope);
+                    let n = u8::try_from(i).ok()?;
+                    let name = crate::sanitize::clean(&c.title);
+                    (
+                        match c.kind {
+                            config::SectionKind::Prs => PK::CustomPr(n),
+                            config::SectionKind::Issues => PK::CustomIssue(n),
+                        },
+                        leak_title(if own {
+                            format!("{name} (own filter)")
+                        } else {
+                            name.into_owned()
+                        }),
+                    )
+                }
             };
             let mut p = Panel::new(kind, title, s.tabs);
             p.tab = s.tab;
-            p
+            Some(p)
         })
         .collect()
+}
+
+/// Does the `s` scope narrow this section (it has no `repo:` / `org:` / `user:` of its own)?
+fn scope_applies(c: Option<&config::SectionCfg>) -> bool {
+    c.is_none_or(|c| config::parse_filter(&c.filter).is_ok_and(|f| !f.own_scope))
 }
 
 fn step(cur: usize, d: isize, max: usize) -> usize {
@@ -805,7 +855,7 @@ impl App {
         (app.keys, app.cfg_path) = (keys, config::path());
         let (viewed, warn) = Viewed::load(crate::state::path());
         app.viewed = viewed;
-        if let Some(w) = warn {
+        if let Some(w) = warn.or_else(|| config::warnings(&app.cfg).into_iter().next()) {
             app.status = w;
         }
         app
@@ -832,9 +882,9 @@ impl App {
     ) -> Self {
         let (tx, rx) = channel();
         let panels = if global {
-            build_global_panels(&cfg.panels)
+            build_global_panels(&cfg)
         } else {
-            build_panels(&cfg.panels)
+            build_panels(&cfg)
         };
         let repo_name = repo.clone().unwrap_or_default();
         let mut app = App {
@@ -1355,15 +1405,33 @@ impl App {
     /// reloaded or its scope changed. Hidden repos are dropped inside the job.
     fn load_global(&mut self, i: usize) {
         let kind = self.panels[i].kind;
-        let sec = match kind {
-            PK::Review => Section::Review,
-            PK::MyPrs => Section::MyPrs,
-            PK::Assigned => Section::Assigned,
-            _ => Section::Involved,
-        };
         let tab_id = self.panels[i].tab_id();
+        let query = match kind {
+            PK::Review => Ok(Query::Section(Section::Review, tab_id)),
+            PK::MyPrs => Ok(Query::Section(Section::MyPrs, tab_id)),
+            PK::Assigned => Ok(Query::Section(Section::Assigned, tab_id)),
+            k if k.custom().is_some() => self
+                .cfg
+                .sections
+                .get(k.custom().unwrap_or_default())
+                .ok_or_else(|| "section is no longer in the config".to_string())
+                .and_then(|c| {
+                    let repo = (!self.global).then_some(self.repo.as_str());
+                    global::Custom::new(c, repo)
+                })
+                .map(Query::Custom),
+            _ => Ok(Query::Section(Section::Involved, tab_id)),
+        };
+        let query = match query {
+            Ok(q) => q,
+            Err(e) => {
+                let p = &mut self.panels[i];
+                (p.loading, p.unloaded, p.error) = (false, false, Some(e));
+                return;
+            }
+        };
         // the search API allows 30 requests a minute: never start a refresh the rest of the minute can't pay for
-        let needed = global::searches_needed(sec, tab_id, &self.scope, &self.cfg.repos.favorites);
+        let needed = query.searches_needed(&self.scope, &self.cfg.repos.favorites);
         if let Some(b) = self.rate.search.filter(|b| rate::now() < b.reset)
             && (b.remaining as usize) < needed
         {
@@ -1399,14 +1467,17 @@ impl App {
                 remaining: b.remaining,
                 limit: b.limit,
             });
-        if scope == Scope::Favorites && !favs.iter().any(|f| crate::state::valid_repo(f)) {
+        if scope == Scope::Favorites
+            && query.uses_scope()
+            && !favs.iter().any(|f| crate::state::valid_repo(f))
+        {
             self.status = "no favorites yet: press f on a repo in the Repos panel".into();
         }
         let (tx, tx2) = (self.tx.clone(), self.tx.clone());
         self.queue(
             Prio::User,
             move || stamp.load(Relaxed) != seq,
-            move || match global::fetch_section(sec, tab_id, &scope, &favs, &hidden, quota) {
+            move || match query.fetch(&scope, &favs, &hidden, quota) {
                 Ok(l) => {
                     let _ = tx.send(Msg::GMeta(kind, tab, seq, l.hidden, l.not_shown, l.note));
                     let _ = tx.send(Msg::List(kind, tab, seq, Ok(l.items)));
@@ -1609,7 +1680,14 @@ impl App {
                     p.loading = false;
                     let consumed = pending.as_ref().is_some_and(|x| x.0 == kind);
                     let key = (kind, p.tab_id());
-                    let cap = p.source().map_or(gh::LIMIT, |s| gh::cap(s.0));
+                    let cap = p
+                        .kind
+                        .custom()
+                        .and_then(|i| self.cfg.sections.get(i))
+                        .map_or_else(
+                            || p.source().map_or(gh::LIMIT, |s| gh::cap(s.0)),
+                            config::SectionCfg::limit,
+                        );
                     let (mut found, mut rec) = (false, None);
                     match res {
                         Ok(items) => {
@@ -2198,7 +2276,14 @@ impl App {
         // a trailing "N more" row is not an item; the count says "n+" while more are still coming
         let more = items.last().is_some_and(|x| x.state == "more");
         let n = items.len() - usize::from(more);
-        let cap = p.source().map_or(gh::LIMIT, |s| gh::cap(s.0));
+        let cap = p
+            .kind
+            .custom()
+            .and_then(|i| self.cfg.sections.get(i))
+            .map_or_else(
+                || p.source().map_or(gh::LIMIT, |s| gh::cap(s.0)),
+                config::SectionCfg::limit,
+            );
         // list sources are capped; Files/Checks/... are complete, except Files at GitHub's 3000-file ceiling
         let capped =
             (!p.kind.derived() && p.items.len() >= cap) || (p.kind == PK::Files && n >= 3000);
@@ -3140,6 +3225,10 @@ impl App {
             // REST-backed panels are looked at again before they are fetched again
             p.unloaded =
                 i != focus && !matches!(p.kind, PK::Prs | PK::Issues | PK::Files | PK::Repos);
+            // a section searched the old repo: its rows and count must not outlive the switch
+            if p.kind.custom().is_some() {
+                (p.items, p.error, p.hidden, p.not_shown) = (vec![], None, 0, 0);
+            }
         }
         self.refresh_repos_panels();
         self.reset_view();
@@ -3168,8 +3257,8 @@ impl App {
         let built = side.panels.is_empty();
         self.panels = match (built, to_global) {
             (false, _) => side.panels,
-            (true, true) => build_global_panels(&self.cfg.panels),
-            (true, false) => build_panels(&self.cfg.panels),
+            (true, true) => build_global_panels(&self.cfg),
+            (true, false) => build_panels(&self.cfg),
         };
         self.focus = if built {
             0
@@ -3273,19 +3362,33 @@ impl App {
         {
             self.status = format!("scope not remembered: {e}");
         }
+        self.stale_sections(false);
+    }
+
+    /// Searched sections are emptied and reload when focused (the focused one now). A section with a
+    /// scope qualifier of its own does not depend on the scope: only `all` (a hidden repo came back) reloads it.
+    fn stale_sections(&mut self, all: bool) {
+        let secs = self.cfg.sections.clone();
         let stale = |panels: &mut Vec<Panel>| {
-            for p in panels.iter_mut().filter(|p| p.kind.is_global_search()) {
+            for p in panels.iter_mut().filter(|p| {
+                p.kind.is_global_search()
+                    && (all || p.kind.custom().is_none_or(|i| scope_applies(secs.get(i))))
+            }) {
                 (p.unloaded, p.cursor, p.hidden, p.not_shown) = (true, 0, 0, 0);
                 p.items.clear();
             }
         };
-        if self.global {
+        // unhiding (`all`) also concerns the parked home: its sections may have lacked that repo's rows
+        if self.global || all {
             stale(&mut self.panels);
             let f = self.focus;
-            if self.panels[f].kind.is_global_search() {
+            if self.panels[f].unloaded && self.panels[f].kind.is_global_search() {
                 self.load_panel(f, false);
             }
-        } else if let Some(o) = self.other.as_mut() {
+        }
+        if (!self.global || all)
+            && let Some(o) = self.other.as_mut()
+        {
             stale(&mut o.panels);
         }
         self.reset_view();
@@ -3322,13 +3425,25 @@ impl App {
                 ("Org...".into(), ScopeChoice::Stage(ScopeStage::Orgs)),
                 ("Repo...".into(), ScopeChoice::Stage(ScopeStage::Repos)),
             ],
-            ScopeStage::Orgs => self
-                .orgs
-                .iter()
-                .flatten()
-                .filter(|o| has(o))
-                .map(|o| (o.clone(), ScopeChoice::Set(Scope::Org(o.clone()))))
-                .collect(),
+            ScopeStage::Orgs => {
+                let mut v: Vec<(String, ScopeChoice)> = self
+                    .orgs
+                    .iter()
+                    .flatten()
+                    .filter(|o| has(o))
+                    .map(|o| (o.clone(), ScopeChoice::Set(Scope::Org(o.clone()))))
+                    .collect();
+                // any org or user can be searched, not just the ones you belong to
+                if global::valid_owner(&p.query)
+                    && !v.iter().any(|(n, _)| n.eq_ignore_ascii_case(&p.query))
+                {
+                    v.push((
+                        format!("Use org '{}'", p.query),
+                        ScopeChoice::Set(Scope::Org(p.query.clone())),
+                    ));
+                }
+                v
+            }
             ScopeStage::Repos => {
                 let mut names: Vec<String> = vec![];
                 for n in &p.names {
@@ -3486,8 +3601,7 @@ impl App {
             }
             self.reset_view();
         } else {
-            let s = self.scope.clone();
-            self.set_scope(s);
+            self.stale_sections(true);
         }
     }
 
@@ -3497,6 +3611,14 @@ impl App {
                 self.load_repos_panel(i);
             }
         }
+    }
+
+    /// The `s` scope narrows panel `i` (always, for the built-in sections).
+    pub fn scope_applies_to(&self, i: usize) -> bool {
+        self.panels[i]
+            .kind
+            .custom()
+            .is_none_or(|k| self.global && scope_applies(self.cfg.sections.get(k)))
     }
 
     /// The favorites scope is on but there is nothing to search for.
@@ -3531,6 +3653,11 @@ impl App {
             self.cache.retain(|(ik, _), _| ik != k);
         }
         let k = self.panels[self.focus].kind;
+        // first, so a refusal from the load (search quota low) is what the status line ends up saying
+        self.status = match key {
+            Some(_) => "refreshing the selected item".into(),
+            None => "refreshing the list".into(),
+        };
         if self.ctx.is_none()
             && (self.panels[self.focus].source().is_some()
                 || k.is_global_search()
@@ -3538,10 +3665,6 @@ impl App {
         {
             self.load_panel(self.focus, true);
         }
-        self.status = match key {
-            Some(_) => "refreshing the selected item".into(),
-            None => "refreshing the list".into(),
-        };
     }
 
     /// False when the save was refused or failed; the status line then says why.
@@ -5308,7 +5431,11 @@ mod tests {
             panic!()
         };
         let names: Vec<_> = a.scope_choices(p).into_iter().map(|c| c.0).collect();
-        assert_eq!(names, ["acme"], "filtered by the typed text");
+        assert_eq!(
+            names,
+            ["acme", "Use org 'a'"],
+            "filtered by the typed text, plus the typed name as a free-text org"
+        );
         a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(a.scope, Scope::Org("acme".into()));
         assert_eq!(saved().as_deref(), Some("org:acme"));
@@ -5750,6 +5877,20 @@ mod tests {
         assert_eq!(a.panels[3].items.len(), 1, "the local list is rebuilt");
     }
 
+    /// `gh search prs --json` output for these (repo, number) pairs.
+    fn gsearch(rows: &[(&str, u64)]) -> String {
+        let rows: Vec<String> = rows
+            .iter()
+            .map(|(r, n)| {
+                format!(
+                    r#"{{"number":{n},"title":"t{n}","url":"https://github.com/{r}/pull/{n}","state":"open","isDraft":false,"author":{{"login":"a"}},"labels":[],"body":"","repository":{{"nameWithOwner":"{r}"}},"updatedAt":"2026-01-{:02}T00:00:00Z"}}"#,
+                    n % 28 + 1
+                )
+            })
+            .collect();
+        format!("[{}]", rows.join(","))
+    }
+
     fn list_reply(a: &mut App, kind: PK, tab: usize, seq: u64, items: Vec<Item>) {
         a.tx.send(Msg::List(kind, tab, seq, Ok(items))).unwrap();
         a.poll();
@@ -5963,6 +6104,267 @@ mod tests {
         a.load_panel(0, false);
         assert!(a.panels[0].loading);
         wait(&mut a, "the section", |a| !a.panels[0].loading);
+    }
+
+    fn section(title: &str, kind: config::SectionKind, filter: &str) -> config::SectionCfg {
+        config::SectionCfg {
+            title: title.into(),
+            kind,
+            filter: filter.into(),
+            limit: None,
+            at: config::Where::Global,
+        }
+    }
+
+    /// The global home with two custom sections (panels 5 and 6); nothing is fetched yet.
+    fn sec_home() -> App {
+        let cfg = Config {
+            sections: vec![
+                section(
+                    "Review (acme)",
+                    config::SectionKind::Prs,
+                    "is:open review-requested:@me",
+                ),
+                section(
+                    "Mine \u{202e}evil",
+                    config::SectionKind::Issues,
+                    "is:open org:own author:@me",
+                ),
+            ],
+            ..Default::default()
+        };
+        let mut a = App::build_start(
+            Some("o/r".into()),
+            true,
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+            cfg,
+        );
+        a.panels.iter_mut().for_each(|p| p.unloaded = true);
+        a
+    }
+
+    #[test]
+    fn custom_sections_are_extra_panels_that_know_their_kind_and_scope() {
+        let a = sec_home();
+        let kinds: Vec<_> = a.panels.iter().skip(4).map(|p| p.kind).collect();
+        assert_eq!(kinds, [PK::CustomPr(0), PK::CustomIssue(1)]);
+        assert!(
+            kinds.iter().all(|k| k.is_global_search())
+                && kinds[0].is_pr_list()
+                && !kinds[1].is_pr_list()
+        );
+        assert_eq!(a.panels[4].title, "Review (acme)");
+        assert!(
+            a.panels[5].title.ends_with("(own filter)") && !a.panels[5].title.contains('\u{202e}'),
+            "{:?}: marked, and the bidi override is made visible",
+            a.panels[5].title
+        );
+        assert!(a.scope_applies_to(4) && !a.scope_applies_to(5) && a.scope_applies_to(0));
+        assert_eq!(
+            a.active_count(4),
+            None,
+            "no count until it has been searched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_custom_section_loads_only_when_focused_with_one_search_per_refresh() {
+        let shim = crate::testshim::Shim::new();
+        shim.set(
+            "searchprs.out",
+            &gsearch(&[("a/b", 1), ("noisy/bot", 2), ("c/d", 3)]),
+        );
+        let mut a = sec_home();
+        a.net = true;
+        a.cfg.repos.hidden = vec!["noisy/bot".into()];
+        wait(&mut a, "start", |_| true);
+        quiesce();
+        assert!(
+            shim.calls().iter().all(|c| !c.starts_with("search ")),
+            "nothing searched before focus"
+        );
+        press(&mut a, '5');
+        assert!(a.panels[4].loading);
+        wait(&mut a, "the section", |a| !a.panels[4].loading);
+        let searches = || {
+            shim.calls()
+                .into_iter()
+                .filter(|c| c.starts_with("search "))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(searches().len(), 1, "{:?}", searches());
+        assert!(
+            searches()[0].starts_with("search prs --limit=30 ")
+                && searches()[0].ends_with("-- is:open review-requested:@me archived:false"),
+            "{:?}",
+            searches()
+        );
+        let repos: Vec<_> = a.panels[4].items.iter().map(|i| i.repo.as_str()).collect();
+        assert_eq!(
+            (repos, a.panels[4].hidden),
+            (vec!["c/d", "a/b"], 1),
+            "hidden repos are dropped"
+        );
+        assert_eq!(a.active_count(4), Some((2, false)));
+        assert!(a.panels[5].unloaded, "the other section still waits");
+        // the second section has a scope of its own: the `s` scope never reaches it
+        press(&mut a, '6');
+        wait(&mut a, "the section", |a| !a.panels[5].loading);
+        assert!(
+            searches()[1].starts_with("search issues ")
+                && searches()[1].ends_with("-- is:open org:own author:@me archived:false")
+        );
+        a.set_scope(Scope::Org("acme".into()));
+        assert!(
+            !a.panels[5].unloaded,
+            "own-scope section is not reloaded by a scope change"
+        );
+        quiesce();
+        assert_eq!(
+            searches().len(),
+            2,
+            "set_scope on the focused own-scope section does not search"
+        );
+        // r refreshes the focused one with exactly one search; the scope applies to the other
+        press(&mut a, '5');
+        wait(&mut a, "reload", |a| !a.panels[4].loading);
+        press(&mut a, 'r');
+        wait(&mut a, "refresh", |a| !a.panels[4].loading);
+        let s = searches();
+        assert_eq!(s.len(), 4, "{s:?}");
+        assert!(
+            s[2].ends_with("archived:false org:acme") && s[3].ends_with("archived:false org:acme"),
+            "{s:?}"
+        );
+        // the quota guard refuses a refresh the minute cannot pay for and keeps the list
+        a.rate.search = Some(rate::Bucket {
+            limit: 30,
+            remaining: 0,
+            reset: rate::now() + 600,
+        });
+        press(&mut a, 'r');
+        assert!(
+            a.status.starts_with("search quota low, resets "),
+            "{}",
+            a.status
+        );
+        assert!(!a.panels[4].loading && a.panels[4].items.len() == 2);
+        quiesce();
+        assert_eq!(searches().len(), 4, "no search was made");
+    }
+
+    #[test]
+    fn the_org_picker_accepts_an_org_you_are_not_a_member_of() {
+        let dir = std::env::temp_dir().join(format!("gh-pulse-freeorg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut a = home();
+        a.state_dir = Some(dir.clone());
+        a.orgs = Some(vec!["cli".into(), "acme".into()]);
+        press(&mut a, 's');
+        for _ in 0..2 {
+            a.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let names = |a: &App| match &a.modal {
+            Some(Modal::Scope(p)) => a
+                .scope_choices(p)
+                .into_iter()
+                .map(|c| c.0)
+                .collect::<Vec<_>>(),
+            _ => panic!("picker closed"),
+        };
+        assert_eq!(names(&a), ["cli", "acme"]);
+        for c in "charmbracelet".chars() {
+            press(&mut a, c);
+        }
+        assert_eq!(
+            names(&a),
+            ["Use org 'charmbracelet'"],
+            "no member matches, still selectable"
+        );
+        // a member match comes first so Enter on a partial name still picks the member org
+        a.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        for _ in 0..12 {
+            a.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        press(&mut a, 'a');
+        assert_eq!(names(&a), ["acme", "Use org 'a'"]);
+        // a name that is already a member org is not offered twice; junk is never offered
+        press(&mut a, 'c');
+        press(&mut a, 'm');
+        press(&mut a, 'e');
+        assert_eq!(names(&a), ["acme"]);
+        for _ in 0..4 {
+            a.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        for c in "bad name".chars() {
+            press(&mut a, c);
+        }
+        assert!(names(&a).is_empty());
+        for _ in 0..8 {
+            a.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        for c in "charmbracelet".chars() {
+            press(&mut a, c);
+        }
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(a.modal.is_none());
+        assert_eq!(a.scope, Scope::Org("charmbracelet".into()));
+        assert_eq!(
+            crate::state::load_scope(&dir.join("scope.json"), "github.com").as_deref(),
+            Some("org:charmbracelet"),
+            "persisted like any other scope"
+        );
+    }
+
+    #[test]
+    fn unhiding_a_repo_marks_repo_home_sections_stale_too() {
+        let mut sc = section("Here", config::SectionKind::Prs, "is:open");
+        sc.at = config::Where::Both;
+        let cfg = Config {
+            sections: vec![sc],
+            ..Default::default()
+        };
+        let mut a = App::build(
+            "o/r".into(),
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+            cfg,
+        );
+        let i = a.panels.len() - 1;
+        assert!(a.panels[i].kind.custom().is_some());
+        (a.panels[i].unloaded, a.panels[i].items) = (false, vec![gitem("o/r", 1)]);
+        a.hidden_changed("x/y", false);
+        assert!(a.panels[i].unloaded && a.panels[i].items.is_empty());
+    }
+
+    #[test]
+    fn repo_sections_forget_the_old_repos_rows_and_count_on_a_repo_switch() {
+        let mut sc = section("R", config::SectionKind::Prs, "is:open");
+        sc.at = config::Where::Repo;
+        let cfg = Config {
+            sections: vec![sc],
+            ..Default::default()
+        };
+        let mut a = App::build(
+            "o1/alpha".into(),
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+            cfg,
+        );
+        let i = a.panels.len() - 1;
+        (a.panels[i].unloaded, a.panels[i].items) =
+            (false, vec![gitem("o1/alpha", 1), gitem("o1/alpha", 2)]);
+        assert_eq!(a.active_count(i), Some((2, false)));
+        a.switch_repo("o2/beta".into());
+        assert!(a.panels[i].items.is_empty() && a.panels[i].unloaded);
+        assert_eq!(
+            a.active_count(i),
+            None,
+            "the title shows ? until it is focused and searched"
+        );
     }
 
     #[test]

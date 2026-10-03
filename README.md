@@ -104,6 +104,9 @@ Regenerate with `GH_PULSE_SHOT_BLOCKLIST=word,word python3 scripts/screenshots.p
   action work across repos without switching. `s` narrows the home to all repos, your favorites, one org or one repo;
   `S` opens the selected item's repo (`G` goes back); hidden repos are left out. A full-screen **repo browser** (`B`)
   covers every repo you can access, with search, sort, favorites and hide.
+- **Custom sections**: add your own GitHub searches as panels with `[[sections]]` in the config (gh-dash style), for the
+  global home, the repo home or both, e.g. `filter = "is:open review-requested:@me org:acme"`. They load when focused,
+  cost one search per refresh, and the scope picker applies unless the filter names its own `repo:` / `org:` / `user:`.
 - **Mouse and keyboard**: click panels, rows and tabs; wheel scrolls. `?` shows every key.
 - **Themes**: dark and light palettes, truecolor with a 256-color fallback, ASCII and Nerd Font icon sets.
 - **Create from the terminal**: new issue (labels validated, `.md` templates, body in a multi-line field), new PR
@@ -191,6 +194,14 @@ Optional `~/.config/gh-pulse/config.toml` (`$XDG_CONFIG_HOME` is honored): defau
 hidden repos (written by the repo browser), and key remapping. Flags override the file; a missing file means
 defaults; an invalid file stops startup with `file:line: message`. See [docs/configuration.md](docs/configuration.md).
 The file never contains credentials; authentication stays entirely with `gh`.
+
+```toml
+[[sections]]                  # an extra panel: your own search
+title  = "Needs my review (acme)"
+kind   = "prs"                # or "issues"
+filter = "is:open review-requested:@me org:acme draft:false"
+limit  = 50                   # optional, 1..100 (default 30); where = "global" | "repo" | "both"
+```
 
 ## Local state
 

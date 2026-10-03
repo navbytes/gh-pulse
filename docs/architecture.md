@@ -19,7 +19,7 @@ gh-pulse is a single binary: a synchronous ratatui event loop that talks to GitH
 | `src/cache.rs` | `0600` JSON cache in `$XDG_CACHE_HOME/gh-pulse` (repo list, repo facts) and the directory `gh --cache` uses |
 | `src/global.rs` | The global home: scopes, the exact `gh search` arguments per section / tab / favorites chunk, merge-and-sort, hidden-repo filtering with top-up, the organizations list, Repos-panel rows |
 | `src/start.rs` | The start decision (`auto` / `repo` / `global` x `-R` x clone), pure and table-tested |
-| `src/config.rs` | `config.toml` model (incl. `[panels]` layout and tab sets), validation with line numbers, atomic save, the named-action `Keymap` |
+| `src/config.rs` | `config.toml` model (incl. `[panels]` layout and tab sets, `[[sections]]` and the filter parser), validation with line numbers, atomic save, the named-action `Keymap` |
 | `src/browse.rs` | Repo browser: GraphQL page parser, filter/sort/favorite/hide logic, browser key handling |
 | `src/md.rs` | Markdown to styled, wrapped lines (pulldown-cmark): headings, code, quotes, lists, tables, folding of `<details>` and long comments |
 | `src/sanitize.rs` | Makes bidi/zero-width/control characters visible (`<U+202E>`) in everything GitHub-sourced and in confirm-popup commands |
@@ -55,7 +55,7 @@ key/mouse event -> App (state change) -> spawn thread -> gh subprocess
 
 `App` shows one home at a time (`global` flag) and parks the other in a `Side` (panels, focus, repo, facts, counts,
 filter, breadcrumb); `G` swaps them, so each comes back exactly as left. The global home's panels are searches
-(`PK::Review`, `MyPrs`, `Assigned`, `Involved`), loaded by `load_global` as user-priority pool jobs when focused;
+(`PK::Review`, `MyPrs`, `Assigned`, `Involved`, and `PK::CustomPr/CustomIssue(i)` for `[[sections]]` entry `i`; `global::Query` is the one thing `load_global` runs for any of them), loaded by `load_global` as user-priority pool jobs when focused;
 `PK::Repos` is built synchronously from the config, `recent.json` and the cached repo list. Items carry their repo, and
 every detail fetch and action uses `Item::repo`, so the same panes, drill-in and write actions work across repos. The
 Files panel follows the PR list you were last in (`pr_src`). Result messages for a parked home still find their panel
