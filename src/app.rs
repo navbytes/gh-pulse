@@ -362,7 +362,6 @@ pub enum Modal {
     Scope(ScopePicker),
 }
 
-/// Screen regions recorded by the last draw, for mouse hit-testing.
 /// How the global lists are sectioned (`g` cycles): flat, by PR author, by repo.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GroupBy {
@@ -398,6 +397,7 @@ impl GroupBy {
     }
 }
 
+/// Screen regions recorded by the last draw, for mouse hit-testing.
 #[derive(Default, Clone)]
 pub struct Hit {
     pub panels: Vec<Rect>,
