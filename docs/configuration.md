@@ -43,6 +43,16 @@ cache = true              # on-disk cache of slow-changing lookups
 start = "auto"            # auto | repo | global (flag: --start)
 window = "7d"             # PRs in the global home updated within: 24h | 7d | 30d | all (W cycles it)
 
+[cache]                   # seconds a cached copy counts as fresh (5..604800); older ones still show at once
+details = true            # keep PR/issue details (comments, diffs, commits, checks) on disk between runs
+hot_s = 120               # Review requested, My PRs (open), a repo's PR list
+warm_s = 300              # Involved, issues, a repo's issue list
+cold_s = 900              # merged / closed tabs
+checks_s = 45             # CI checks while one is pending
+overview_s = 300          # PR overview (review state, mergeability), and finished checks
+detail_s = 86400          # comments, diffs, commits: valid while the PR is unchanged, never longer than this
+slow_s = 3600             # repo list, repo facts, tags, workflow files (labels, templates, orgs: 24x this)
+
 [panels]
 show = ["prs", "files", "issues", "actions", "repo"]   # order = numbering
 global = ["review", "mine", "assigned", "repos"]       # the global home
@@ -94,25 +104,50 @@ work for something you have already moved past is dropped before it starts (an a
 
 ### Cache
 
-Slow-changing lookups are cached under `$XDG_CACHE_HOME/gh-tui` (default `~/.cache/gh-tui`; only absolute paths
-are honored). The directory must be a real directory you own: an existing one with looser permissions is tightened to
-`0700`, one owned by someone else or reached through a symlink is refused and the cache turns itself off (the status
-line says why). Files are `0600`, written through unique temp files created exclusively, and read only if they are
-regular files you own.
+gh-tui keeps what it fetched under `$XDG_CACHE_HOME/gh-tui` (default `~/.cache/gh-tui`; only absolute paths
+are honored) and shows it at once on the next focus or run. The directory must be a real directory you own: an
+existing one with looser permissions is tightened to `0700`, one owned by someone else or reached through a symlink
+is refused and the cache turns itself off (the status line says why). Files are `0600`, written through unique temp
+files created exclusively, and read only if they are regular files you own. Everything is stored per host and login,
+and read back through the same cleaning as fresh data.
+
+**What is kept, and for how long** (`[cache]`, see the example above):
+
+| Data | Fresh for | Why |
+|---|---|---|
+| Review requested, My PRs (open), a repo's PR list | `hot_s` (2 min) | what you act on |
+| Involved, issues, a repo's issue list | `warm_s` (5 min) | changes less often |
+| Merged / closed tabs | `cold_s` (15 min) | rarely change |
+| PR comments, diff, commits | while the PR is unchanged, at most `detail_s` (a day) | the list's `updatedAt` is compared, so a new comment or push makes the copy stale at once |
+| CI checks | `checks_s` (45 s) while one is pending, then `overview_s` | results do not bump `updatedAt` |
+| PR overview (review state, mergeability) | `overview_s` (5 min) | mergeability changes when the base moves, with no update to the PR |
+| Repo list, repo header facts, tags, workflow files | `slow_s` (1 h) | |
+| Labels, issue/PR templates, organizations | 24 x `slow_s` (a day) | |
+
+A copy that is past its time is still shown at once, marked `cached 3m ago, refreshing` in the list's border, and
+replaced when the new data arrives; if the refresh fails the copy stays and the status line says so. Lists are
+requested again only when they are stale (or on `r` / `R`), so re-focusing a panel or restarting costs no API calls
+while they are fresh, and tab counts share the list's copy instead of fetching it twice. A list that was only partly
+fetched (one of several searches failed) is never kept. Files stay on disk for at most a week, at most 400 details
+(150 MB together) and 200 lists (20 MB) are kept, the oldest going first, and a detail over 4 MB is not stored.
+
+**This puts the text of PRs and issues on disk, private repos included**: titles, bodies, comments, diffs and
+templates, in `0600` files in a `0700` directory under your home, readable by you with the same `gh` commands.
+`[cache] details = false` stops details being kept (lists and slow facts still are); `[api] cache = false` turns the
+whole cache off; `gh-tui --clear-cache` deletes it.
 
 | What | TTL | Where | Keyed by |
 |---|---|---|---|
-| Your repo list (repo browser) | 10 min (shown at once, refreshed behind it when older) | `repos-<host>-<login>.json` | host + login, also stored inside and checked |
-| A repo's header facts | 5 min | `meta-<host>-<repo>.json` | host + repo; the stored login must match yours |
-| Labels, issue/PR templates, workflow YAML | 1 hour | `gh/...` (gh's own entries, via `gh api --cache`) | URL + token + request (verified: another token misses the cache) |
-| Tags | 10 min | `gh/...` | same |
+| Your repo list (repo browser) | `slow_s` (shown at once, refreshed behind it when older) | `repos-<host>-<login>.json` | host + login, also stored inside and checked |
+| A repo's header facts | `slow_s` | `meta-<host>-<repo>.json` | host + repo; the stored login must match yours |
+| PR / issue details | see above | `d-<host>-<login>-<repo>-<kind><number>-<tab>.json` | host + login, also stored inside and checked |
+| PR / issue lists | see above | `l-<host>-<login>-<scope, window, ...>.json` | host + login + everything the rows depend on |
+| Labels, issue/PR templates, workflow YAML, tags, organizations | see above | `gh/...` (gh's own entries, via `gh api --cache`) | URL + token + request (verified: another token misses the cache) |
 
-**Templates and workflow files are raw text from the repo you opened, private repos included, and stay on disk for up to
-an hour.** If the repo list or header facts cannot be tied to your login (a token from the environment rather than
-`gh auth login`), they are not cached at all. Text read back from the cache is neutralized again like everything else.
-Never cached: tokens, comments, notifications, PR details, diffs, anything from a write. `r` / `R` fetch fresh data
-(the cached copy still expires on its own schedule). `gh-tui --clear-cache` deletes the directory (only after the same
-ownership checks); `[api] cache = false` turns caching off.
+Templates and workflow files are raw text from the repo you opened, private repos included. If something cannot be
+tied to your login (a token from the environment rather than `gh auth login`), it is not cached at all. Never
+cached: tokens, notifications, logs, anything from a write. `r` / `R` fetch fresh data (`r` the selected item and its
+list, `R` everything), skipping the disk copy.
 
 ## Start mode and the global home
 

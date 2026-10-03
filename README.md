@@ -236,18 +236,19 @@ atomically, and a corrupt one is ignored. The directory is `0700` and must be yo
 is refused with a notice); files are read without following links. `scope.json` and `recent.json` remember their host.
 None of it contains credentials.
 
-Slow-changing lookups are cached under `$XDG_CACHE_HOME/gh-tui` (default `~/.cache/gh-tui`; a `0700` directory
+What gh-tui fetched is cached under `$XDG_CACHE_HOME/gh-tui` (default `~/.cache/gh-tui`; a `0700` directory
 you own, files `0600`; a relative `XDG_CACHE_HOME` is ignored, and if the directory is not yours or is a symlink the
-cache switches itself off with a notice). What is stored:
+cache switches itself off with a notice), per host and login. What is stored:
 
-- **Repo list** (10 min) and **repo header facts** (5 min): repo names, descriptions, topics, counts; keyed by host and
-  login, so another account or host never sees them. Cached rows are cleaned again when read.
-- **Raw file text from repos: issue/PR templates and workflow YAML (1 h), labels (1 h) and tags (10 min).** These come
-  from the repo you opened, private ones included, so their contents sit on your disk for up to an hour. They are
-  gh's own cache entries (`gh api --cache`, keyed on host, token and request), kept inside gh-tui's directory.
+- **PR and issue lists** (Review requested, My PRs, Issues, a repo's PRs...) and their **details** (overview, checks,
+  comments, diffs, commits): shown at once on the next focus or run, refreshed in the background when past their
+  time (2 min for the lists you act on, up to a day for comments and diffs of a PR that has not changed). **This puts
+  the text of PRs and issues on disk, private repos included** (`[cache] details = false` stops details being kept).
+- **Repo list, repo header facts, tags** (1 h) and **labels, templates, organizations** (a day).
 
-Never cached: tokens, comments, notifications, PR details, diffs, anything from a write. `gh-tui --clear-cache`
-deletes the whole directory; `[api] cache = false` turns caching off; `r` and `R` skip it.
+Never cached: tokens, notifications, logs, anything from a write. Every time is tunable in `[cache]`
+(docs/configuration.md); `gh-tui --clear-cache` deletes the directory; `[api] cache = false` turns caching off; `r`
+and `R` skip it.
 
 Files you mark viewed (`v`) reset when the PR's head commit changes; nothing is written to GitHub unless you set `sync_viewed`.
 
@@ -330,8 +331,9 @@ at word boundaries with a `↪` marker; `w` switches to clipping. `f` zooms the 
 - **Quota chip.** `⚡ 412/5000` in the header means a quota is under 20% (`low_quota_percent`; `rate_header = false` hides it).
 - **Pause.** Under 10% (`pause_percent`) everything automatic stops (counts, extra comment pages, the inbox badge)
   until the window resets (`resets HH:MM`); your own actions still work. `Retry-After` and secondary-limit messages are honored.
-- **Cache.** Slow-changing lookups (repo list, header facts, labels, templates, tags) are cached on disk;
-  `r` / `R` skip it, `[api] cache = false` disables it, `--clear-cache` wipes it.
+- **Cache.** Lists and PR details are kept on disk and shown at once (stale ones marked `cached 3m ago`), refreshed
+  only when past their time; `[cache]` tunes it, `r` / `R` skip it, `[api] cache = false` disables it,
+  `--clear-cache` wipes it.
 - The only polling is the unread badge (2 min) and a free `gh api rate_limit` check (5 min).
 
 Details and every `[api]` key: [docs/configuration.md](docs/configuration.md#api-etiquette).

@@ -1134,7 +1134,18 @@ fn panel(f: &mut Frame, app: &App, i: usize, area: Rect, compact: bool) {
         return f.render_widget(Paragraph::new(line), area);
     }
     let title = Line::from(spans);
-    let block = bordered_line(app, title, focused && !app.detail_focus);
+    let mut block = bordered_line(app, title, focused && !app.detail_focus);
+    // rows that came from disk say so while the refresh runs
+    if focused && let Some(t) = p.cached_at {
+        let age = crate::browse::ago(&crate::global::iso_utc(t), now_secs());
+        block = block.title_bottom(
+            Line::styled(
+                format!(" cached {age} ago, refreshing "),
+                Style::new().fg(th.muted),
+            )
+            .right_aligned(),
+        );
+    }
     let inner = block.inner(area);
 
     let cur = items.get(p.cursor.min(items.len().saturating_sub(1)));
@@ -2982,6 +2993,31 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
         assert!(a.ctx.is_some(), "in drill-in");
         assert!(!a.global, "no toggle");
         assert_eq!(a.file(), 1, "{}", a.status);
+    }
+
+    #[test]
+    fn rows_from_disk_are_marked_while_the_refresh_runs() {
+        let mut a = crate::app::App::build_start(
+            Some("o/r".into()),
+            true,
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+            crate::config::Config::default(),
+        );
+        a.panels[0].items = vec![Item {
+            number: 1,
+            title: "old row".into(),
+            repo: "a/b".into(),
+            kind: Kind::Pr,
+            ..Default::default()
+        }];
+        a.panels[0].unloaded = false;
+        assert!(!render_app(&a, 100, 30).contains("cached"));
+        a.panels[0].cached_at = Some(crate::rate::now() - 180);
+        let s = render_app(&a, 100, 30);
+        assert!(s.contains("cached 3m ago, refreshing"), "{s}");
+        a.panels[0].cached_at = None;
+        assert!(!render_app(&a, 100, 30).contains("cached"));
     }
 
     #[test]

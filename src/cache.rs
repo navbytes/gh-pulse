@@ -1,12 +1,29 @@
-//! A small on-disk cache for slow-changing facts (the repo list, a repo's header facts) plus the
-//! directory `gh` keeps its own `--cache` entries in. Files are 0600 in a 0700 directory under
-//! `$XDG_CACHE_HOME/gh-tui` (default `~/.cache/gh-tui`). They hold repo names and public-ish
-//! metadata only: no tokens, nothing from write actions, notifications, comments or PR details.
+//! The on-disk cache: a small store of JSON entries (the repo list, a repo's header facts, and via
+//! `dcache` PR/issue lists and details) plus the directory `gh` keeps its own `--cache` entries in.
+//! Files are 0600 in a 0700 directory under `$XDG_CACHE_HOME/gh-tui` (default `~/.cache/gh-tui`).
+//! They can hold the text of PRs and issues (private repos included, `[cache] details = false` stops
+//! details); never tokens, notifications, logs or anything from a write action.
 use serde::{Serialize, de::DeserializeOwned};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
+static SLOW_S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(3600);
+
+/// `[cache] slow_s`: how long slow facts stay fresh.
+pub fn set_slow(secs: u64) {
+    SLOW_S.store(secs, Relaxed);
+}
+
+pub fn slow_s() -> u64 {
+    SLOW_S.load(Relaxed)
+}
+
+/// A `gh --cache` duration of `mult` times the slow-facts time (the rarest facts, such as labels,
+/// templates and organizations, use 24 times it: a day by default).
+pub fn slow_ttl(mult: u64) -> String {
+    format!("{}s", slow_s().saturating_mul(mult))
+}
 
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Relaxed);
@@ -218,11 +235,25 @@ impl Store {
     }
 
     pub fn write<T: Serialize>(&self, key: &str, data: &T, now: u64) -> Result<(), String> {
+        self.write_limited(key, data, now, usize::MAX)
+    }
+
+    /// Like `write`, but an entry that serializes to more than `max` bytes is left out (Ok: not an error).
+    pub fn write_limited<T: Serialize>(
+        &self,
+        key: &str,
+        data: &T,
+        now: u64,
+        max: usize,
+    ) -> Result<(), String> {
         if let Err(e) = self.ensure() {
             refuse(e.clone());
             return Err(e);
         }
         let body = serde_json::to_string(&Entry { at: now, data }).map_err(|e| e.to_string())?;
+        if body.len() > max {
+            return Ok(());
+        }
         let path = self.file(key);
         // unique per process and call, and created exclusively: it can't be a pre-planted link
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -236,6 +267,44 @@ impl Store {
             let _ = std::fs::remove_file(&tmp);
             e.to_string()
         })
+    }
+}
+
+impl Store {
+    /// Remove entries whose file name starts with `prefix` and that are older than the hard maximum,
+    /// then the oldest ones beyond `keep` files or `max_bytes` in total. Our own files only: a symlink
+    /// or other file type is never touched. Returns how many were removed.
+    pub fn prune(&self, prefix: &str, keep: usize, max_bytes: u64) -> usize {
+        let Ok(rd) = std::fs::read_dir(&self.dir) else {
+            return 0;
+        };
+        let now = std::time::SystemTime::now();
+        let mut files: Vec<(std::time::SystemTime, PathBuf, u64)> = vec![];
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with(prefix) || !name.ends_with(".json") {
+                continue;
+            }
+            let Ok(m) = std::fs::symlink_metadata(e.path()) else {
+                continue;
+            };
+            if m.is_file() {
+                files.push((m.modified().unwrap_or(now), e.path(), m.len()));
+            }
+        }
+        files.sort_by_key(|f| std::cmp::Reverse(f.0)); // newest first
+        let (mut removed, mut total) = (0, 0u64);
+        for (i, (t, path, len)) in files.iter().enumerate() {
+            total = total.saturating_add(*len);
+            let old = now
+                .duration_since(*t)
+                .is_ok_and(|d| d.as_secs() > HARD_MAX_AGE);
+            if (old || i >= keep || total > max_bytes) && std::fs::remove_file(path).is_ok() {
+                removed += 1;
+            }
+        }
+        removed
     }
 }
 
@@ -260,6 +329,38 @@ mod tests {
         let d = std::env::temp_dir().join(format!("gh-tui-cache-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         Store::new(d)
+    }
+
+    #[test]
+    fn prune_keeps_the_newest_files_with_the_prefix_and_leaves_others_alone() {
+        let s = store("prune");
+        for (i, k) in ["d-a", "d-b", "d-c", "other"].into_iter().enumerate() {
+            s.write(k, &i, 1).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            s.prune("d-", 2, u64::MAX),
+            1,
+            "only d-a is beyond the newest two"
+        );
+        assert!(s.read::<usize>("d-a", 1).is_none());
+        assert!(s.read::<usize>("d-b", 1).is_some() && s.read::<usize>("d-c", 1).is_some());
+        assert!(
+            s.read::<usize>("other", 1).is_some(),
+            "other prefixes are not ours to prune"
+        );
+        // a byte budget drops the oldest files first, too
+        let t = store("prune-bytes");
+        for k in ["d-1", "d-2", "d-3"] {
+            t.write(k, &"x".repeat(100), 1).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let one = std::fs::metadata(t.file("d-3")).unwrap().len();
+        assert_eq!(t.prune("d-", 10, one * 2), 1, "room for two files");
+        assert!(t.read::<String>("d-1", 1).is_none() && t.read::<String>("d-3", 1).is_some());
+        // an entry over the limit is not written, and that is not an error
+        assert!(s.write_limited("big", &"x".repeat(100), 1, 50).is_ok());
+        assert!(s.read::<String>("big", 1).is_none());
     }
 
     #[test]

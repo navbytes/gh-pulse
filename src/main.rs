@@ -3,6 +3,7 @@ mod app;
 mod browse;
 mod cache;
 mod config;
+mod dcache;
 mod diff;
 mod dispatch;
 mod form;
