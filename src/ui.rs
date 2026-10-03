@@ -24,9 +24,13 @@ Panels (default: Pull requests, Files, Issues, Actions, Repo; choose them in [pa
   j/k, arrows     move             Ctrl-d/u  half page     g/G or Home/End  top/bottom
   {filter}  filter (Enter apply, Esc clear)
   l/Right         focus the detail pane   h/Esc/Left  back to the list
-  {global}  (PR/Issues/... list focus) toggle global view; in Files and PR drill-in it jumps to the last row
+  {global}  (list focus) switch between the repo and the global home; in Files and PR drill-in it jumps to the last row
   {browser}  repo browser: all your repos (search, sort, favorite, hide, Enter switches)
   {inbox}  inbox: unread notifications of all repos (Enter opens it here, m marks read, o browser)
+Global home (opens outside a repo or with --start global; [panels] global picks the sections)
+  Review requested, My PRs, Issues, Repos: searches across all your repos, newest update first
+  {scope}  scope: all / favorites / an org / one repo      {switch}  open the selected item's repo (G returns)
+  Repos panel: Enter open the repo   {scope} scope the home to it   {zoom} favorite   H hide
 Repo panel (Branches / Tags / Releases tabs)
   Enter/l  details (a tag: commit, date, release)   {copy} on a tag copies its name   {actions}  branch/release actions
 Pull requests
@@ -55,6 +59,8 @@ Anywhere
         global = k(Act::Global),
         browser = k(Act::Browser),
         inbox = k(Act::Inbox),
+        scope = k(Act::Scope),
+        switch = k(Act::SwitchRepoContext),
         zoom = k(Act::Zoom),
         actions = k(Act::Actions),
         approve = k(Act::Approve),
@@ -162,19 +168,12 @@ pub fn draw(f: &mut Frame, app: &App) {
             facts.push(format!("{n}{} open PRs", if more { "+" } else { "" }));
         }
     }
-    let extra = if app.global {
-        "  [global view]".len()
-    } else {
-        0
-    } + if loading { 4 } else { 0 };
+    let extra = if loading { 4 } else { 0 };
     let avail = (head.width as usize).saturating_sub(extra);
     let (title, tail) = fit_header(&title, &facts, th.ic.dot, th.ic.ell, avail);
     let mut hdr = vec![Span::styled(title, Style::new().fg(th.accent).bold())];
     if !tail.is_empty() {
         hdr.push(Span::styled(tail, Style::new().fg(th.muted)));
-    }
-    if app.global {
-        hdr.push(Span::styled("  [global view]", Style::new().fg(th.warn)));
     }
     if loading {
         hdr.push(Span::styled(
@@ -736,6 +735,14 @@ fn hints(app: &App) -> String {
         }
     } else if app.ctx.is_some() {
         "j/k move".into()
+    } else if app.global {
+        format!(
+            "j/k move  Enter drill in  [ ] detail tab  {filter} filter  {} scope  {} open repo  {} repos  {} inbox  {actions} actions",
+            kl(Act::Scope),
+            kl(Act::SwitchRepoContext),
+            kl(Act::Browser),
+            kl(Act::Inbox)
+        )
     } else {
         format!(
             "j/k move  Enter drill in  [ ] detail tab  {{ }} list tab  {filter} filter  {actions} actions  {} repos  {} inbox",
@@ -809,16 +816,38 @@ fn label(app: &App, it: &Item, show_repo: bool, w: usize) -> Line<'static> {
         "read" => v.push(Span::raw("  ")),
         _ => {}
     }
-    if show_repo && !it.repo.is_empty() {
+    let prefixed = matches!(it.kind, Kind::Pr | Kind::Issue);
+    if show_repo && !it.repo.is_empty() && !prefixed {
         v.push(Span::styled(format!("{} ", it.repo), muted));
     }
     match it.kind {
         Kind::Pr | Kind::Issue => {
-            v.push(Span::styled(format!("#{} ", it.number), muted));
+            // `owner/repo#N` with the owner dimmed, when rows from several repos share a list
+            match it.repo.split_once('/').filter(|_| show_repo) {
+                Some((owner, name)) => {
+                    v.push(Span::styled(format!("{owner}/"), muted));
+                    v.push(Span::raw(name.to_string()));
+                    v.push(Span::styled(format!("#{} ", it.number), muted));
+                }
+                None => v.push(Span::styled(format!("#{} ", it.number), muted)),
+            }
             if it.is_draft {
                 v.push(Span::styled("[draft] ", muted));
             }
             v.push(Span::raw(it.title.clone()));
+            if show_repo && matches!(it.state.to_lowercase().as_str(), "merged" | "closed") {
+                v.push(Span::styled(format!(" [{}]", it.state.to_lowercase()), muted));
+            }
+        }
+        Kind::Repo => {
+            let (owner, name) = it.repo.split_once('/').unwrap_or(("", &it.repo));
+            let star = if it.state == "fav" { th.ic.star } else { " " };
+            v.push(Span::styled(format!("{star} "), Style::new().fg(th.warn)));
+            v.push(Span::styled(format!("{owner}/"), muted));
+            v.push(Span::raw(name.to_string()));
+            if !it.meta.is_empty() {
+                v.push(Span::styled(format!("  {}", it.meta), muted));
+            }
         }
         Kind::Run => {
             v.push(status_icon(th, &it.state));
@@ -950,8 +979,23 @@ fn tab_title(app: &App, i: usize, short_name: bool, short_tabs: bool) -> Vec<Par
             active: ti == p.tab,
         });
     }
-    v.push(plain(" ".into()));
+    v.push(plain(extra_note(app, i, short_tabs)));
     v
+}
+
+/// ` · 3 hidden` / ` · +4 favorites not shown` after the tabs of a global section (full labels only).
+fn extra_note(app: &App, i: usize, squeezed: bool) -> String {
+    let p = &app.panels[i];
+    let mut s = String::new();
+    if !squeezed {
+        if p.hidden > 0 {
+            s += &format!(" {} {} hidden", app.theme.ic.dot, p.hidden);
+        }
+        if p.not_shown > 0 {
+            s += &format!(" {} +{} favorites not shown", app.theme.ic.dot, p.not_shown);
+        }
+    }
+    s + " "
 }
 
 /// The one-tab form: `[2] Files (12)`, `[1] Pull requests · Mine (3)`; `with_tab` keeps the tab name,
@@ -981,7 +1025,12 @@ fn simple_title(app: &App, i: usize, with_tab: bool, short_name: Option<bool>) -
         (_, None) if app.tab_failed(i, p.tab) => format!("({})", th.ic.fail),
         (_, None) => format!("({})", th.ic.ell),
     };
-    let text = format!(" [{}] {name}{extra}{count} ", i + 1);
+    let note = if with_tab && short_name == Some(false) {
+        extra_note(app, i, false)
+    } else {
+        " ".to_string()
+    };
+    let text = format!(" [{}] {name}{extra}{count}{note}", i + 1);
     vec![Part {
         text,
         tab: None,
@@ -1236,6 +1285,25 @@ fn detail(f: &mut Frame, app: &App, area: Rect) {
     let Some(it) = app.selected() else {
         return repo_overview(f, app, area);
     };
+    if it.kind == Kind::Repo {
+        let block = bordered(app, " Repo ".into(), app.detail_focus);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let lines: Vec<Line> = it
+            .body
+            .lines()
+            .enumerate()
+            .flat_map(|(i, l)| wrap(l, inner.width as usize).into_iter().map(move |r| (i, r)))
+            .map(|(i, r)| {
+                if i == 0 {
+                    Line::styled(r, Style::new().bold())
+                } else {
+                    Line::raw(r)
+                }
+            })
+            .collect();
+        return f.render_widget(Paragraph::new(lines), inner);
+    }
     let sep = format!(" {} ", th.border.vertical_left);
     let mut title = vec![Span::raw(" ")];
     let (mut x, mut tabs) = (area.x + 2, vec![]);
@@ -2337,6 +2405,54 @@ fn modal(f: &mut Frame, app: &App) {
                 list,
                 area,
                 &mut ListState::default().with_selected(Some(*i)),
+            );
+        }
+        Modal::Scope(p) => {
+            use crate::app::ScopeStage::*;
+            let choices = app.scope_choices(p);
+            let typing = p.stage != Top;
+            let title = match p.stage {
+                Top => "Scope (Enter pick, Esc cancel)",
+                Orgs => "Scope: organization (type to filter, Backspace back)",
+                Repos => "Scope: repo (type owner/name, Backspace back)",
+            };
+            let h = (choices.len().clamp(1, 12) + 2 + usize::from(typing)) as u16;
+            let area = popup(f, app, 60, h, title);
+            let [qa, la] = Layout::vertical([
+                Constraint::Length(u16::from(typing)),
+                Constraint::Min(0),
+            ])
+            .areas(area);
+            if typing {
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled("> ", Style::new().fg(th.accent)),
+                        Span::raw(format!("{}_", p.query)),
+                    ])),
+                    qa,
+                );
+            }
+            let rows: Vec<ListItem> = if choices.is_empty() {
+                let msg = if p.stage == Orgs && app.orgs.is_none() {
+                    "loading your organizations..."
+                } else {
+                    "no match"
+                };
+                vec![ListItem::new(Span::styled(msg, Style::new().fg(th.muted)))]
+            } else {
+                choices
+                    .iter()
+                    .map(|(l, _)| {
+                        let cur = *l == app.scope.label()
+                            || (l.starts_with("All") && app.scope == crate::global::Scope::All);
+                        ListItem::new(format!("{}{l}", if cur { "\u{25cf} " } else { "  " }))
+                    })
+                    .collect()
+            };
+            f.render_stateful_widget(
+                List::new(rows).highlight_style(bar),
+                la,
+                &mut ListState::default().with_selected(Some(p.cursor.min(choices.len().saturating_sub(1)))),
             );
         }
         Modal::Input { title, buf, .. } => {

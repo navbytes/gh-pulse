@@ -4,6 +4,7 @@ use crate::config::{self, Act, Config, Keymap, PanelName, PanelsCfg, TabDef};
 use crate::diff::{self, DiffMode};
 use crate::form::{self, Form};
 use crate::gh::{self, Data, FilesData, Item, Kind, Tab};
+use crate::global::{self, Scope, Section};
 use crate::pool::{self, Prio};
 use crate::rate::{self, RateState};
 use crate::state::Viewed;
@@ -81,12 +82,83 @@ pub enum PK {
     /// Branches / Tags / Releases as list tabs.
     Repo,
     Notifs,
+    // global-home sections (searches across repos)
+    Review,
+    MyPrs,
+    Assigned,
+    Involved,
+    /// Favorites / Recent repos.
+    Repos,
 }
 
 impl PK {
     pub fn derived(self) -> bool {
         matches!(self, PK::Files | PK::Commits | PK::Checks | PK::Comments)
     }
+
+    /// Lists whose rows are pull requests (the Files panel follows the one you were last in).
+    pub fn is_pr_list(self) -> bool {
+        matches!(self, PK::Prs | PK::Review | PK::MyPrs | PK::Involved)
+    }
+
+    /// The global sections: a GitHub search each, loaded when first focused, never counted in the background.
+    pub fn is_global_search(self) -> bool {
+        matches!(self, PK::Review | PK::MyPrs | PK::Assigned | PK::Involved)
+    }
+}
+
+/// The home that is not on screen (repo or global) with what it needs to come back as it was:
+/// cursor, tab, filter, and for a repo its name and facts. Empty `panels` means "not built yet".
+struct Side {
+    panels: Vec<Panel>,
+    focus: usize,
+    repo: String,
+    meta: Option<gh::RepoMeta>,
+    counts: HashMap<CountKey, (usize, bool)>,
+    branch: String,
+    cwd_branch: Option<String>,
+    filter: String,
+    pr_src: usize,
+    from_global: bool,
+}
+
+impl Side {
+    fn empty(repo: String) -> Side {
+        Side {
+            panels: vec![],
+            focus: 0,
+            repo,
+            meta: None,
+            counts: HashMap::new(),
+            branch: String::new(),
+            cwd_branch: None,
+            filter: String::new(),
+            pr_src: 0,
+            from_global: false,
+        }
+    }
+}
+
+/// What choosing a row in the scope picker does.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScopeChoice {
+    Set(Scope),
+    Stage(ScopeStage),
+}
+
+/// The `s` picker for the global home's scope.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ScopeStage {
+    Top,
+    Orgs,
+    Repos,
+}
+
+pub struct ScopePicker {
+    pub stage: ScopeStage,
+    pub cursor: usize,
+    /// Type-ahead in the Orgs and Repos stages.
+    pub query: String,
 }
 
 /// "Drill-in" mode: the left column shows the PR's own Files / Checks / Comments.
@@ -111,6 +183,10 @@ pub struct Panel {
     stamp: Arc<AtomicU64>,
     /// Not loaded yet: the REST-backed panels wait for their first focus (saves startup calls).
     pub unloaded: bool,
+    /// Rows left out because their repo is hidden (global sections).
+    pub hidden: usize,
+    /// Favorites a favorites-scoped search could not include.
+    pub not_shown: usize,
 }
 
 impl Panel {
@@ -127,13 +203,15 @@ impl Panel {
             seq: 0,
             stamp: Arc::new(AtomicU64::new(0)),
             unloaded: false,
+            hidden: 0,
+            not_shown: 0,
         }
     }
 
     /// Searches (GitHub's search API / GraphQL search) are the tightest-limited lists: their counts
     /// are never fetched in the background.
     fn search_backed(kind: PK, id: usize) -> bool {
-        matches!((kind, id), (PK::Prs | PK::Issues, 0 | 1))
+        kind.is_global_search() || matches!((kind, id), (PK::Prs | PK::Issues, 0 | 1))
     }
 
     /// The `gh::list` id of the active tab.
@@ -248,6 +326,7 @@ pub enum Modal {
     },
     Confirm(Confirm),
     Form(Box<Form>),
+    Scope(ScopePicker),
 }
 
 /// Screen regions recorded by the last draw, for mouse hit-testing.
@@ -423,6 +502,10 @@ enum Msg {
     Dropped(String, Tab, u64),
     /// The batched startup request failed (not a rate limit): load the panels one by one instead.
     StartupFallback(u64),
+    /// A global section's side facts, sent just before its list: (panel, seq, hidden rows, favorites left out).
+    GMeta(PK, u64, usize, usize),
+    /// Your organizations, for the scope picker.
+    Orgs(Result<Vec<String>, String>),
     /// Who reacted to one comment: (item key, comment id, names or the error).
     Reactors(String, String, u64, Result<Vec<gh::Reaction>, String>),
 }
@@ -482,7 +565,21 @@ pub struct App {
     pub help_scroll: usize,
     /// Set by the renderer: how far the help popup can scroll.
     pub help_max: Cell<usize>,
+    /// The global home is on screen (otherwise a repo).
     pub global: bool,
+    /// The other home, parked.
+    other: Option<Side>,
+    /// What the global sections are narrowed to.
+    pub scope: Scope,
+    /// Reached the repo from the global home: the header says so and `G` goes back.
+    pub from_global: bool,
+    /// Where the scope and the recent repos are persisted (None in tests).
+    state_dir: Option<PathBuf>,
+    recent: crate::state::Recent,
+    /// Your organizations once fetched (scope picker).
+    pub orgs: Option<Vec<String>>,
+    /// The PR list the Files panel follows (the one you were last in).
+    pr_src: usize,
     pub show_log: bool,
     pub modal: Option<Modal>,
     pub status: String,
@@ -631,7 +728,15 @@ fn derive_items(kind: PK, pr: &Item, d: &Data) -> Vec<Item> {
 }
 
 fn build_panels(cfg: &PanelsCfg) -> Vec<Panel> {
-    cfg.layout()
+    panels_from(cfg.layout())
+}
+
+fn build_global_panels(cfg: &PanelsCfg) -> Vec<Panel> {
+    panels_from(cfg.global_layout())
+}
+
+fn panels_from(specs: Vec<config::PanelSpec>) -> Vec<Panel> {
+    specs
         .into_iter()
         .map(|s| {
             let (kind, title) = match s.name {
@@ -643,6 +748,11 @@ fn build_panels(cfg: &PanelsCfg) -> Vec<Panel> {
                 PanelName::Repo => (PK::Repo, ""),
                 PanelName::Notifications => (PK::Notifs, "Notifications"),
                 PanelName::Status => (PK::Status, "Status"),
+                PanelName::Repos => (PK::Repos, "Repos"),
+                PanelName::Review => (PK::Review, "Review requested"),
+                PanelName::Mine => (PK::MyPrs, "My PRs"),
+                PanelName::Assigned => (PK::Assigned, "Issues"),
+                PanelName::Involved => (PK::Involved, "Involved"),
             };
             let mut p = Panel::new(kind, title, s.tabs);
             p.tab = s.tab;
@@ -657,9 +767,15 @@ fn step(cur: usize, d: isize, max: usize) -> usize {
 
 impl App {
     /// The real entry point: config and keymap come from the user's config file.
-    pub fn from_config(repo: String, theme: Theme, cfg: Config, keys: Keymap) -> Self {
+    pub fn from_config(
+        repo: Option<String>,
+        global: bool,
+        theme: Theme,
+        cfg: Config,
+        keys: Keymap,
+    ) -> Self {
         gh::set_sync_viewed(cfg.sync_viewed);
-        let mut app = Self::build(repo, theme, true, cfg);
+        let mut app = Self::build_start(repo, global, theme, true, cfg);
         (app.keys, app.cfg_path) = (keys, config::path());
         let (viewed, warn) = Viewed::load(crate::state::path());
         app.viewed = viewed;
@@ -673,9 +789,26 @@ impl App {
         Self::build(repo, theme, load, Config::default())
     }
 
+    #[cfg(test)]
     pub fn build(repo: String, theme: Theme, load: bool, cfg: Config) -> Self {
+        Self::build_start(Some(repo), false, theme, load, cfg)
+    }
+
+    /// `repo`: the repo context (the one shown, or the one `G` leads to); `global`: open the home.
+    pub fn build_start(
+        repo: Option<String>,
+        global: bool,
+        theme: Theme,
+        load: bool,
+        cfg: Config,
+    ) -> Self {
         let (tx, rx) = channel();
-        let panels = build_panels(&cfg.panels);
+        let panels = if global {
+            build_global_panels(&cfg.panels)
+        } else {
+            build_panels(&cfg.panels)
+        };
+        let repo_name = repo.clone().unwrap_or_default();
         let mut app = App {
             cfg,
             cfg_path: None,
@@ -685,8 +818,12 @@ impl App {
             hit: RefCell::default(),
             tick: 0,
             hl: RefCell::new(None),
-            header: format!(" {repo}"),
-            repo,
+            header: if global {
+                " all repos".to_string()
+            } else {
+                format!(" {repo_name}")
+            },
+            repo: if global { String::new() } else { repo_name.clone() },
             meta: None,
             panels,
             counts: HashMap::new(),
@@ -717,7 +854,14 @@ impl App {
             help: false,
             help_scroll: 0,
             help_max: Cell::new(0),
-            global: false,
+            global,
+            other: (global && repo.is_some()).then(|| Side::empty(repo_name)),
+            scope: Scope::All,
+            from_global: false,
+            state_dir: None,
+            recent: crate::state::Recent::new(&gh::host()),
+            orgs: None,
+            pr_src: 0,
             show_log: false,
             modal: None,
             status: String::new(),
@@ -753,24 +897,75 @@ impl App {
             tx,
             rx,
         };
+        app.pr_src = app
+            .panels
+            .iter()
+            .position(|p| p.kind.is_pr_list())
+            .unwrap_or(0);
         if load {
             rate::set_limits(app.cfg.api.low_quota_percent, app.cfg.api.pause_percent);
             crate::cache::set_enabled(app.cfg.api.cache);
             pool::init(app.cfg.api.max_concurrent);
             gh::set_timeout(app.cfg.api.timeout_s);
-            // REST-backed panels load when first focused; the focused one (and PRs/Issues) now
-            for p in &mut app.panels {
-                p.unloaded = !matches!(p.kind, PK::Prs | PK::Issues | PK::Files);
+            if let Some(d) = crate::state::dir() {
+                app.scope = crate::state::load_scope(&d.join("scope.json"))
+                    .and_then(|s| Scope::parse(&s))
+                    .unwrap_or(Scope::All);
+                app.recent = crate::state::Recent::load(&d.join("recent.json"), &gh::host());
+                app.state_dir = Some(d);
             }
-            let f = app.focus;
-            app.panels[f].unloaded = false;
-            app.spawn_header();
-            app.start_load(false);
-            app.load_unfocused_lazy_marks();
+            if app.global {
+                app.load_global_side();
+            } else {
+                app.load_repo_side();
+            }
             app.spawn_unread(Prio::Background);
             app.spawn_rate_poll();
         }
         app
+    }
+
+    /// The repo home's first load: PRs and Issues in one request, the rest when first focused.
+    fn load_repo_side(&mut self) {
+        // REST-backed panels load when first focused; the focused one (and PRs/Issues) now
+        for p in &mut self.panels {
+            p.unloaded = !matches!(p.kind, PK::Prs | PK::Issues | PK::Files | PK::Repos);
+        }
+        let f = self.focus;
+        self.panels[f].unloaded = false;
+        self.spawn_header();
+        self.start_load(false);
+        self.load_unfocused_lazy_marks();
+        self.touch_recent();
+        for i in 0..self.panels.len() {
+            if self.panels[i].kind == PK::Repos {
+                self.load_panel(i, false);
+            }
+        }
+    }
+
+    /// The global home's first load: only the focused section searches; the others wait for focus.
+    fn load_global_side(&mut self) {
+        for p in &mut self.panels {
+            p.unloaded = true;
+        }
+        let f = self.focus;
+        self.panels[f].unloaded = false;
+        // who you are comes from gh's own config (no API call) when it is recorded there
+        if let Some((_, login)) = gh::identity() {
+            self.user = login;
+        } else if self.net {
+            let (tx, g) = (self.tx.clone(), self.hgen);
+            self.user_job(move || {
+                let _ = tx.send(Msg::User(g, gh::user()));
+            });
+        }
+        self.rebuild_header();
+        for i in 0..self.panels.len() {
+            if i == f || self.panels[i].kind == PK::Repos {
+                self.load_panel(i, false);
+            }
+        }
     }
 
     /// Panels the user hasn't looked at keep their placeholder; the focused one loads now.
@@ -856,7 +1051,27 @@ impl App {
         } else {
             format!("  user: {}", self.user)
         };
-        self.header = format!(" {}  branch: {}{user}", self.repo, self.branch);
+        self.header = if self.global {
+            format!(" all repos  scope: {}{user}", self.scope.label())
+        } else if self.from_global {
+            format!(
+                " all repos \u{203a} {}  branch: {}{user}",
+                self.repo, self.branch
+            )
+        } else {
+            format!(" {}  branch: {}{user}", self.repo, self.branch)
+        };
+    }
+
+    /// Remember the repo you are in (Recent, newest first), persisted next to the other state.
+    fn touch_recent(&mut self) {
+        if self.repo.is_empty() {
+            return;
+        }
+        self.recent.touch(&self.repo.clone());
+        if let Some(d) = &self.state_dir {
+            let _ = self.recent.save(&d.join("recent.json"));
+        }
     }
 
     /// One GraphQL request for the PR and Issues lists, the viewer and the repo facts (cached for
@@ -1052,6 +1267,11 @@ impl App {
     }
 
     fn load_panel(&mut self, i: usize, fresh: bool) {
+        match self.panels[i].kind {
+            k if k.is_global_search() => return self.load_global(i),
+            PK::Repos => return self.load_repos_panel(i),
+            _ => {}
+        }
         let p = &mut self.panels[i];
         let Some((src, tab_id)) = p.source() else {
             return;
@@ -1065,12 +1285,7 @@ impl App {
             return;
         }
         let (seq, kind, tab, stamp) = (p.seq, p.kind, p.tab, p.stamp.clone());
-        let (tx, tx2, repo, global) = (
-            self.tx.clone(),
-            self.tx.clone(),
-            self.repo.clone(),
-            self.global,
-        );
+        let (tx, tx2, repo) = (self.tx.clone(), self.tx.clone(), self.repo.clone());
         // a list the user already moved past (another tab, a newer load) never starts
         self.queue(
             Prio::User,
@@ -1080,7 +1295,7 @@ impl App {
                     kind,
                     tab,
                     seq,
-                    gh::list(&repo, global, src, tab_id, fresh),
+                    gh::list(&repo, src, tab_id, fresh),
                 ));
             },
             // lost (queue full, panic): the panel must not sit on "loading..."
@@ -1093,6 +1308,78 @@ impl App {
                 ));
             },
         );
+    }
+
+    /// A global section: one search per scope chunk, run at user priority when the section is focused,
+    /// reloaded or its scope changed. Hidden repos are dropped inside the job.
+    fn load_global(&mut self, i: usize) {
+        let p = &mut self.panels[i];
+        p.loading = true;
+        p.unloaded = false;
+        p.error = None;
+        p.seq += 1;
+        p.stamp.store(p.seq, Relaxed);
+        let sec = match p.kind {
+            PK::Review => Section::Review,
+            PK::MyPrs => Section::MyPrs,
+            PK::Assigned => Section::Assigned,
+            _ => Section::Involved,
+        };
+        let (seq, kind, tab, tab_id, stamp) = (p.seq, p.kind, p.tab, p.tab_id(), p.stamp.clone());
+        if !self.net {
+            return;
+        }
+        let (scope, favs, hidden) = (
+            self.scope.clone(),
+            self.cfg.repos.favorites.clone(),
+            self.cfg.repos.clone(),
+        );
+        // the search API allows 30 requests a minute: say so before spending one when it is nearly gone
+        if self.rate.search.is_some_and(|b| b.remaining < 5 && rate::now() < b.reset) {
+            self.status = format!(
+                "search quota low ({} left): this list may be slow to load",
+                self.rate.search.map_or(0, |b| b.remaining)
+            );
+        } else if scope == Scope::Favorites && !self.cfg.repos.favorites.iter().any(|f| crate::state::valid_repo(f)) {
+            self.status = "no favorites yet: press f on a repo in the Repos panel".into();
+        }
+        let (tx, tx2) = (self.tx.clone(), self.tx.clone());
+        self.queue(
+            Prio::User,
+            move || stamp.load(Relaxed) != seq,
+            move || match global::fetch_section(sec, tab_id, &scope, &favs, &hidden) {
+                Ok(l) => {
+                    let _ = tx.send(Msg::GMeta(kind, seq, l.hidden, l.not_shown));
+                    let _ = tx.send(Msg::List(kind, tab, seq, Ok(l.items)));
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::List(kind, tab, seq, Err(e)));
+                }
+            },
+            move || {
+                let _ = tx2.send(Msg::List(
+                    kind,
+                    tab,
+                    seq,
+                    Err("could not load; try again (r)".into()),
+                ));
+            },
+        );
+    }
+
+    /// The Repos panel is local: favorites from the config, recent repos from the state file, details
+    /// from the cached repo list. No API call.
+    fn load_repos_panel(&mut self, i: usize) {
+        let known = read_repos().map(|(c, _)| c.rows).unwrap_or_default();
+        let names: Vec<String> = if self.panels[i].tab_id() == 0 {
+            self.cfg.repos.favorites.clone()
+        } else {
+            self.recent.repos.clone()
+        };
+        let items = global::repo_items(&names, &known, &self.cfg.repos, rate::now() as i64);
+        let p = &mut self.panels[i];
+        p.cursor = p.cursor.min(items.len().saturating_sub(1));
+        (p.items, p.loading, p.unloaded, p.error) = (items, false, false, None);
     }
 
     /// Counts for tabs that aren't showing. `lazy` (default): the focused panel's other tabs once
@@ -1138,12 +1425,12 @@ impl App {
             self.repo.clone(),
             self.cgen,
         );
-        let (gen_a, global) = (self.cgen_a.clone(), self.global);
+        let gen_a = self.cgen_a.clone();
         self.queue(
             Prio::Background,
             move || gen_a.load(Relaxed) != g,
             move || {
-                let _ = tx.send(Msg::Count(g, key, gh::count(&repo, global, src, tab)));
+                let _ = tx.send(Msg::Count(g, key, gh::count(&repo, src, tab)));
             },
             move || {
                 let _ = tx2.send(Msg::Count(g, key, Err("dropped".into())));
@@ -1154,9 +1441,11 @@ impl App {
     /// The panel of this kind, in the active set or the one parked while drilled in.
     fn panel_mut(&mut self, k: PK) -> Option<&mut Panel> {
         let parked = self.ctx.as_mut().map(|c| &mut c.saved);
+        let other = self.other.as_mut().map(|s| &mut s.panels);
         self.panels
             .iter_mut()
             .chain(parked.into_iter().flatten())
+            .chain(other.into_iter().flatten())
             .find(|p| p.kind == k)
     }
 
@@ -1433,6 +1722,25 @@ impl App {
                         (b.loading, b.error) = (false, Some(e));
                     }
                 }
+                Msg::GMeta(kind, seq, hidden, not_shown) => {
+                    if let Some(p) = self.panel_mut(kind)
+                        && p.seq == seq
+                    {
+                        (p.hidden, p.not_shown) = (hidden, not_shown);
+                        if not_shown > 0 {
+                            self.status = format!(
+                                "(+{not_shown} favorites not shown \u{2014} narrow the scope with s)"
+                            );
+                        }
+                    }
+                }
+                Msg::Orgs(res) => match res {
+                    Ok(v) => self.orgs = Some(v),
+                    Err(e) => {
+                        self.orgs = Some(vec![]);
+                        self.status = format!("could not list your organizations: {e}");
+                    }
+                },
                 Msg::User(g, u) => {
                     if g == self.hgen && !u.is_empty() {
                         self.user = u;
@@ -1615,12 +1923,13 @@ impl App {
             return;
         }
         self.cache.insert(key.clone(), Load::Loading);
-        let (tx, tx2, repo, g) = (
-            self.tx.clone(),
-            self.tx.clone(),
-            self.repo.clone(),
-            self.dgen,
-        );
+        // an item carries its repo (every row of the global home does): that, not the app's repo
+        let repo = if it.repo.is_empty() {
+            self.repo.clone()
+        } else {
+            it.repo.clone()
+        };
+        let (tx, tx2, g) = (self.tx.clone(), self.tx.clone(), self.dgen);
         let (wanted, gen_a, k2) = (self.wanted.clone(), self.dgen_a.clone(), key.clone());
         let key3 = key.clone();
         self.queue(
@@ -1704,7 +2013,7 @@ impl App {
         let kind = self.panels[self.focus].kind;
         // The PR behind Files/Checks/Comments: only fetched while the user is working on PRs.
         if let Some(pr) = self.pr_item().filter(|p| p.kind == Kind::Pr).cloned()
-            && (self.ctx.is_some() || matches!(kind, PK::Prs | PK::Files))
+            && (self.ctx.is_some() || kind.is_pr_list() || kind == PK::Files)
         {
             self.fetch(pr.clone(), Tab::Diff);
             if self.ctx.is_some() {
@@ -1852,12 +2161,21 @@ impl App {
             .copied()
     }
 
+    /// The PR list the Files panel follows: the one last focused, else the first there is.
+    fn pr_panel(&self) -> Option<usize> {
+        self.panels
+            .get(self.pr_src)
+            .filter(|p| p.kind.is_pr_list())
+            .map(|_| self.pr_src)
+            .or_else(|| self.panels.iter().position(|p| p.kind.is_pr_list()))
+    }
+
     /// The pull request the Files/Checks/Comments panels describe.
     pub fn pr_item(&self) -> Option<&Item> {
         match &self.ctx {
             Some(c) => Some(&c.pr),
             None => self
-                .panel_idx(PK::Prs)
+                .pr_panel()
                 .and_then(|i| self.selected_in(i))
                 .filter(|p| p.kind == Kind::Pr),
         }
@@ -1957,7 +2275,7 @@ impl App {
     /// Selecting another PR restarts the Files panel at its first file.
     fn after_select(&mut self) {
         match self.panels[self.focus].kind {
-            PK::Prs => {
+            k if k.is_pr_list() => {
                 self.set_file(0);
                 self.sync_derived();
             }
@@ -2114,6 +2432,9 @@ impl App {
     fn set_focus(&mut self, i: usize) {
         self.focus = i % self.panels.len();
         self.detail_focus = false;
+        if self.panels[self.focus].kind.is_pr_list() && self.ctx.is_none() {
+            self.pr_src = self.focus;
+        }
         if self.panels[self.focus].unloaded && self.ctx.is_none() {
             self.load_panel(self.focus, false);
         }
@@ -2270,6 +2591,7 @@ impl App {
             KeyCode::Esc => self.filter.clear(),
             KeyCode::Char('w') if self.diff_active() => self.wrap = !self.wrap,
             KeyCode::Char('v') if self.cur_tab() == Tab::Diff => self.toggle_viewed(),
+            KeyCode::Char('H') if self.on_repo_row() => self.toggle_hide(),
             KeyCode::Char('l') | KeyCode::Right if self.selected().is_some() => {
                 self.detail_focus = true
             }
@@ -2441,6 +2763,7 @@ impl App {
             Act::Open => self.open(),
             Act::CopyUrl => self.copy(),
             Act::Checkout => self.checkout(),
+            Act::Zoom if self.on_repo_row() => self.toggle_favorite(),
             Act::Zoom => self.zoom = !self.zoom,
             Act::Browser => self.open_browser(false),
             Act::Inbox => self.open_inbox(),
@@ -2450,16 +2773,39 @@ impl App {
                     && self.ctx.is_none()
                     && self.dk().is_none()
                 {
-                    self.global = !self.global;
-                    self.reload(false);
+                    self.toggle_home();
                 } else if k.code == KeyCode::Char('G') {
                     // Derived panels and drill-in: G is "last row" like End; say why it isn't the toggle.
                     self.nav(isize::MAX);
                     if !self.detail_focus && self.log.is_none() {
-                        self.status = "G jumps to the last row here; the global view toggles from the PR/Issues lists".into();
+                        self.status = "G jumps to the last row here; the global home toggles from the lists".into();
                     }
                 } else {
-                    self.status = "the global view toggles from the PR/Issues lists".into();
+                    self.status = "the global home toggles from the lists".into();
+                }
+            }
+            Act::Scope => {
+                if self.on_repo_row() {
+                    let r = self.selected_in(self.focus).map(|i| i.repo.clone()).unwrap_or_default();
+                    self.set_scope(Scope::Repo(r));
+                    if !self.global {
+                        self.toggle_home();
+                    }
+                } else if self.global {
+                    self.modal = Some(Modal::Scope(ScopePicker {
+                        stage: ScopeStage::Top,
+                        cursor: 0,
+                        query: String::new(),
+                    }));
+                } else {
+                    self.status = "scope narrows the global home: press G, or s on a repo in the Repos panel".into();
+                }
+            }
+            Act::SwitchRepoContext => {
+                if self.on_repo_row() {
+                    self.open_repo_row();
+                } else {
+                    self.open_repo_context();
                 }
             }
         }
@@ -2577,15 +2923,16 @@ impl App {
         if it.number == 0 {
             return self.open_url(it.url);
         }
+        self.inbox = None;
+        // from the global home (or another repo) the item's repo becomes the app's repo first
+        if self.global || !it.repo.eq_ignore_ascii_case(&self.repo) {
+            self.go_repo(it.repo.clone());
+        }
         let Some(idx) = self.panel_idx(pk) else {
             self.status =
                 "that panel is hidden in [panels]; press o to open it in the browser".into();
             return;
         };
-        self.inbox = None;
-        if !it.repo.eq_ignore_ascii_case(&self.repo) {
-            self.switch_repo(it.repo.clone());
-        }
         // the lists only hold open items: look in the broadest open tab
         self.pending_select = Some((pk, it.number, self.repo.clone()));
         let p = &mut self.panels[idx];
@@ -2610,7 +2957,7 @@ impl App {
             Out::None => {}
             Out::Close => self.browser = None,
             Out::Reload => self.open_browser(true),
-            Out::Switch(r) => self.switch_repo(r),
+            Out::Switch(r) => self.go_repo(r),
             Out::Fav(r) => {
                 let on = self.cfg.repos.toggle_fav(&r);
                 self.status = format!(
@@ -2637,8 +2984,8 @@ impl App {
         self.browser = None;
         self.exit_ctx();
         self.repo = repo;
+        self.touch_recent();
         (self.cwd_branch, self.pending_select) = (None, None);
-        self.global = false;
         (self.branch, self.meta) = (String::new(), None);
         self.rebuild_header();
         let focus = self.focus;
@@ -2650,6 +2997,315 @@ impl App {
         self.reset_view();
         self.spawn_header();
         self.reload(false);
+    }
+
+    /// Park the home on screen so the other can take its place.
+    fn take_side(&mut self) -> Side {
+        Side {
+            panels: std::mem::take(&mut self.panels),
+            focus: self.focus,
+            repo: std::mem::take(&mut self.repo),
+            meta: self.meta.take(),
+            counts: std::mem::take(&mut self.counts),
+            branch: std::mem::take(&mut self.branch),
+            cwd_branch: self.cwd_branch.take(),
+            filter: std::mem::take(&mut self.filter),
+            pr_src: self.pr_src,
+            from_global: self.from_global,
+        }
+    }
+
+    /// Show `side`, building its panels first when it has none yet; true when it was built.
+    fn put_side(&mut self, side: Side, to_global: bool) -> bool {
+        let built = side.panels.is_empty();
+        self.panels = match (built, to_global) {
+            (false, _) => side.panels,
+            (true, true) => build_global_panels(&self.cfg.panels),
+            (true, false) => build_panels(&self.cfg.panels),
+        };
+        self.focus = if built { 0 } else { side.focus.min(self.panels.len() - 1) };
+        self.repo = side.repo;
+        self.meta = side.meta;
+        self.counts = side.counts;
+        self.branch = side.branch;
+        self.cwd_branch = side.cwd_branch;
+        self.filter = side.filter;
+        self.from_global = side.from_global;
+        self.pr_src = if built {
+            self.panels.iter().position(|p| p.kind.is_pr_list()).unwrap_or(0)
+        } else {
+            side.pr_src
+        };
+        self.global = to_global;
+        built
+    }
+
+    /// `G`: swap between the repo and the global home, each exactly as it was left (cursor, tab, filter).
+    fn toggle_home(&mut self) {
+        let to_global = !self.global;
+        let next = match self.other.take() {
+            Some(s) if to_global || !s.repo.is_empty() => s,
+            Some(s) => {
+                self.other = Some(s);
+                self.status = "no repo yet: press S on an item, or Enter on a repo".into();
+                return;
+            }
+            None if to_global => Side::empty(String::new()),
+            None => {
+                self.status = "no repo yet: press S on an item, or Enter on a repo".into();
+                return;
+            }
+        };
+        self.browser = None;
+        let cur = self.take_side();
+        let built = self.put_side(next, to_global);
+        self.other = Some(cur);
+        // counts in flight belong to the home that just left
+        self.cgen += 1;
+        self.cgen_a.store(self.cgen, Relaxed);
+        (self.cpending, self.count_failed) = (HashSet::new(), HashSet::new());
+        self.detail_focus = false;
+        self.reset_view();
+        self.rebuild_header();
+        if built && to_global {
+            self.load_global_side();
+        } else if built {
+            self.load_repo_side();
+        } else {
+            let f = self.focus;
+            if self.panels[f].unloaded {
+                self.load_panel(f, false);
+            }
+        }
+    }
+
+    /// Open `repo` as the app's repo (from the browser, an inbox item, `S`, a Repos row). From the
+    /// global home that puts the repo on screen with `G` leading back; from a repo it just switches.
+    fn go_repo(&mut self, repo: String) {
+        if !self.global {
+            return self.switch_repo(repo);
+        }
+        let keep = self
+            .other
+            .as_ref()
+            .is_some_and(|s| s.repo.eq_ignore_ascii_case(&repo) && !s.panels.is_empty());
+        if !keep {
+            self.other = Some(Side::empty(repo));
+        }
+        self.toggle_home();
+        self.from_global = true;
+        self.rebuild_header();
+    }
+
+    /// `S`: the selected item's repo as the app's repo.
+    fn open_repo_context(&mut self) {
+        if !self.global {
+            self.status = "already in a repo; G goes to the global home".into();
+            return;
+        }
+        match self.selected().map(|i| i.repo.clone()) {
+            Some(r) if crate::state::valid_repo(&r) => self.go_repo(r),
+            _ => self.status = "nothing selected to open".into(),
+        }
+    }
+
+    /// Narrow the global home. Persisted (state dir, not config); sections reload when next focused.
+    fn set_scope(&mut self, scope: Scope) {
+        self.scope = scope;
+        if let Some(d) = &self.state_dir {
+            let _ = crate::state::save_scope(&d.join("scope.json"), &self.scope.key());
+        }
+        let stale = |panels: &mut Vec<Panel>| {
+            for p in panels.iter_mut().filter(|p| p.kind.is_global_search()) {
+                (p.unloaded, p.cursor, p.hidden, p.not_shown) = (true, 0, 0, 0);
+                p.items.clear();
+            }
+        };
+        if self.global {
+            stale(&mut self.panels);
+            let f = self.focus;
+            if self.panels[f].kind.is_global_search() {
+                self.load_panel(f, false);
+            }
+        } else if let Some(o) = self.other.as_mut() {
+            stale(&mut o.panels);
+        }
+        self.reset_view();
+        self.rebuild_header();
+    }
+
+    fn fetch_orgs(&mut self) {
+        if self.orgs.is_some() {
+            return;
+        }
+        let tx = self.tx.clone();
+        let tx2 = tx.clone();
+        self.user_job_or(
+            move || {
+                let _ = tx.send(Msg::Orgs(global::orgs()));
+            },
+            move || {
+                let _ = tx2.send(Msg::Orgs(Err("request lost".into())));
+            },
+        );
+    }
+
+    /// Rows the picker offers at its current stage: (label, what choosing it does).
+    pub fn scope_choices(&self, p: &ScopePicker) -> Vec<(String, ScopeChoice)> {
+        let q = p.query.to_lowercase();
+        let has = |s: &str| q.is_empty() || s.to_lowercase().contains(&q);
+        match p.stage {
+            ScopeStage::Top => vec![
+                ("All repos".into(), ScopeChoice::Set(Scope::All)),
+                (
+                    format!("Favorites ({})", self.cfg.repos.favorites.len()),
+                    ScopeChoice::Set(Scope::Favorites),
+                ),
+                ("Org...".into(), ScopeChoice::Stage(ScopeStage::Orgs)),
+                ("Repo...".into(), ScopeChoice::Stage(ScopeStage::Repos)),
+            ],
+            ScopeStage::Orgs => self
+                .orgs
+                .iter()
+                .flatten()
+                .filter(|o| has(o))
+                .map(|o| (o.clone(), ScopeChoice::Set(Scope::Org(o.clone()))))
+                .collect(),
+            ScopeStage::Repos => {
+                let known = read_repos().map(|(c, _)| c.rows).unwrap_or_default();
+                let mut names: Vec<String> = vec![];
+                let all = self
+                    .cfg
+                    .repos
+                    .favorites
+                    .iter()
+                    .chain(self.recent.repos.iter())
+                    .chain(known.iter().map(|r| &r.name));
+                for n in all {
+                    if crate::state::valid_repo(n)
+                        && has(n)
+                        && !names.iter().any(|x| x.eq_ignore_ascii_case(n))
+                    {
+                        names.push(n.clone());
+                    }
+                }
+                names.truncate(50);
+                let mut v: Vec<(String, ScopeChoice)> = names
+                    .into_iter()
+                    .map(|n| (n.clone(), ScopeChoice::Set(Scope::Repo(n))))
+                    .collect();
+                // a full owner/name typed in is accepted even when no list knows it
+                if crate::state::valid_repo(&p.query)
+                    && !v.iter().any(|(n, _)| n.eq_ignore_ascii_case(&p.query))
+                {
+                    v.insert(
+                        0,
+                        (
+                            format!("use {}", p.query),
+                            ScopeChoice::Set(Scope::Repo(p.query.clone())),
+                        ),
+                    );
+                }
+                v
+            }
+        }
+    }
+
+    fn scope_key(&mut self, mut p: ScopePicker, k: KeyEvent) -> Option<Modal> {
+        let typing = p.stage != ScopeStage::Top;
+        let n = self.scope_choices(&p).len();
+        match k.code {
+            KeyCode::Esc => return None,
+            KeyCode::Down => p.cursor = (p.cursor + 1).min(n.saturating_sub(1)),
+            KeyCode::Up => p.cursor = p.cursor.saturating_sub(1),
+            KeyCode::Char('j') if !typing => p.cursor = (p.cursor + 1).min(n.saturating_sub(1)),
+            KeyCode::Char('k') if !typing => p.cursor = p.cursor.saturating_sub(1),
+            KeyCode::Backspace if typing && p.query.is_empty() => {
+                (p.stage, p.cursor) = (ScopeStage::Top, 0)
+            }
+            KeyCode::Backspace if typing => {
+                p.query.pop();
+                p.cursor = 0;
+            }
+            KeyCode::Char(c) if typing && !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                p.query.push(c);
+                p.cursor = 0;
+            }
+            KeyCode::Enter => {
+                let choices = self.scope_choices(&p);
+                match choices.get(p.cursor).map(|c| c.1.clone()) {
+                    Some(ScopeChoice::Set(s)) => {
+                        self.set_scope(s);
+                        return None;
+                    }
+                    Some(ScopeChoice::Stage(st)) => {
+                        (p.stage, p.cursor, p.query) = (st, 0, String::new());
+                        if st == ScopeStage::Orgs {
+                            self.fetch_orgs();
+                        }
+                    }
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+        Some(Modal::Scope(p))
+    }
+
+    /// `Enter` / `S` on a Repos row: that repo becomes the app's repo.
+    fn open_repo_row(&mut self) {
+        if let Some(r) = self.selected_in(self.focus).map(|i| i.repo.clone()) {
+            self.go_repo(r);
+        }
+    }
+
+    /// `f` on a Repos row: add or remove the favorite (the same list the repo browser edits).
+    fn toggle_favorite(&mut self) {
+        let Some(r) = self.selected_in(self.focus).map(|i| i.repo.clone()) else {
+            return;
+        };
+        let on = self.cfg.repos.toggle_fav(&r);
+        if self.save_cfg() {
+            self.status = format!("{} {r} {} favorites", if on { "added" } else { "removed" }, if on { "to" } else { "from" });
+            self.refresh_repos_panels();
+            if self.scope == Scope::Favorites {
+                let s = self.scope.clone();
+                self.set_scope(s);
+            }
+        } else {
+            self.cfg.repos.toggle_fav(&r); // refused: keep memory and file in agreement
+        }
+    }
+
+    /// `H` on a Repos row: hide or unhide the repo everywhere.
+    fn toggle_hide(&mut self) {
+        let Some(r) = self.selected_in(self.focus).map(|i| i.repo.clone()) else {
+            return;
+        };
+        let on = self.cfg.repos.toggle_hidden(&r);
+        if self.save_cfg() {
+            self.status = format!("{} {r}", if on { "hidden:" } else { "unhidden:" });
+            let s = self.scope.clone();
+            self.set_scope(s); // sections filter on load
+        } else {
+            self.cfg.repos.toggle_hidden(&r);
+        }
+    }
+
+    fn refresh_repos_panels(&mut self) {
+        for i in 0..self.panels.len() {
+            if self.panels[i].kind == PK::Repos {
+                self.load_repos_panel(i);
+            }
+        }
+    }
+
+    /// The selected row is a repo in the Repos panel (list focus).
+    fn on_repo_row(&self) -> bool {
+        self.panels[self.focus].kind == PK::Repos
+            && !self.detail_focus
+            && self.ctx.is_none()
+            && self.selected_in(self.focus).is_some()
     }
 
     /// `r`: just the selected item (its cached details) and the list tab it sits in.
@@ -2695,6 +3351,7 @@ impl App {
             }
         };
         match m {
+            Modal::Scope(p) => self.scope_key(p, k),
             Modal::Menu(mut items, i) => match k.code {
                 KeyCode::Esc | KeyCode::Char('q') => None,
                 KeyCode::Enter => self.pick(items.swap_remove(i)),
@@ -3004,8 +3661,11 @@ impl App {
             self.toggle_card(false);
             return;
         }
+        if self.on_repo_row() {
+            return self.open_repo_row();
+        }
         if !self.detail_focus {
-            if self.ctx.is_none() && self.panels[self.focus].kind == PK::Prs {
+            if self.ctx.is_none() && self.panels[self.focus].kind.is_pr_list() {
                 self.enter_ctx();
             } else {
                 self.detail_focus = self.selected().is_some();

@@ -869,6 +869,50 @@ pub fn parse_startup(body: &str, repo: &str, want: &StartupWant) -> Result<Start
     })
 }
 
+/// `owner/name` of the first GitHub remote in `git remote -v` output (`origin` first). Offline: no API.
+pub fn repo_from_remotes(remotes: &str, host: &str) -> Option<String> {
+    let parse = |url: &str| {
+        let rest = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))
+            .or_else(|| url.strip_prefix("ssh://"))
+            .unwrap_or(url);
+        let rest = rest.split_once('@').map_or(rest, |(_, r)| r); // user@host
+        let path = rest
+            .strip_prefix(host)?
+            .trim_start_matches([':', '/'])
+            .trim_end_matches('/');
+        let path = path.strip_suffix(".git").unwrap_or(path);
+        crate::state::valid_repo(path).then(|| path.to_string())
+    };
+    let mut fetch: Vec<(&str, &str)> = remotes
+        .lines()
+        .filter(|l| l.ends_with("(fetch)"))
+        .filter_map(|l| {
+            let mut w = l.split_whitespace();
+            Some((w.next()?, w.next()?))
+        })
+        .collect();
+    fetch.sort_by_key(|(name, _)| *name != "origin");
+    fetch.into_iter().find_map(|(_, url)| parse(url))
+}
+
+/// The cwd's repo judged from its git remotes (no API call), if it has a GitHub one.
+pub fn local_repo() -> Option<String> {
+    let o = Command::new("git").args(["remote", "-v"]).output().ok()?;
+    o.status
+        .success()
+        .then(|| repo_from_remotes(&String::from_utf8_lossy(&o.stdout), &host()))?
+}
+
+/// The cwd is inside a git work tree at all (so asking GitHub which repo it is can make sense).
+pub fn in_git_repo() -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
 /// The GitHub host `gh` talks to by default.
 pub fn host() -> String {
     std::env::var("GH_HOST")
@@ -2646,6 +2690,26 @@ pub fn checkout(repo: &str, n: u64) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_local_repo_comes_from_git_remotes_without_an_api_call() {
+        let r = |s: &str| repo_from_remotes(s, "github.com");
+        assert_eq!(
+            r("origin\thttps://github.com/cli/cli.git (fetch)\norigin\thttps://github.com/cli/cli.git (push)\n"),
+            Some("cli/cli".into())
+        );
+        assert_eq!(r("origin\tgit@github.com:o/r.git (fetch)\n"), Some("o/r".into()));
+        assert_eq!(r("origin\tssh://git@github.com/o/r (fetch)\n"), Some("o/r".into()));
+        assert_eq!(
+            r("up\thttps://github.com/up/stream (fetch)\norigin\thttps://github.com/me/fork (fetch)\n"),
+            Some("me/fork".into()),
+            "origin first"
+        );
+        assert_eq!(r("origin\thttps://gitlab.com/o/r (fetch)\n"), None);
+        assert_eq!(r("origin\thttps://github.com/o/r/extra (fetch)\n"), None);
+        assert_eq!(r(""), None);
+        assert_eq!(repo_from_remotes("origin\thttps://ghe.corp/o/r (fetch)\n", "ghe.corp"), Some("o/r".into()));
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_hung_gh_is_killed_at_the_deadline_and_on_quit() {
@@ -2867,8 +2931,8 @@ mod tests {
     fn slow_lookups_are_cached_privately_and_refresh_skips_the_cache() {
         let shim = crate::testshim::Shim::new();
         shim.set("rest.out", r#"[{"name":"v1","commit":{"sha":"abc1234"}}]"#);
-        list("o/r", false, 7, 0, false).unwrap();
-        list("o/r", false, 7, 0, true).unwrap();
+        list("o/r", 7, 0, false).unwrap();
+        list("o/r", 7, 0, true).unwrap();
         form_data("o/r", None, None);
         let calls = shim.calls();
         assert!(
