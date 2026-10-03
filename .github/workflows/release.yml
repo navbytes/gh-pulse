@@ -1,0 +1,127 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and upload workflow artifacts only; never creates a release
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned for reproducible release binaries; keep >= Cargo.toml rust-version.
+  RELEASE_TOOLCHAIN: 1.89.0
+  TAG_RE: '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'
+
+jobs:
+  build:
+    name: build ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, runner: macos-latest, asset: gh-pulse-darwin-arm64 }
+          # cross-compiled on the arm64 runner; macos-13 (Intel) runners are deprecated
+          - { target: x86_64-apple-darwin, runner: macos-latest, asset: gh-pulse-darwin-amd64 }
+          # glibc builds on the oldest hosted image so the binaries run on older distros;
+          # musl was not chosen because it is unverified with this dependency tree.
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-22.04, asset: gh-pulse-linux-amd64 }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm, asset: gh-pulse-linux-arm64 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate tag and Cargo.toml version
+        if: github.event_name == 'push'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          [[ "$TAG" =~ $TAG_RE ]] || { echo "bad tag: $TAG" >&2; exit 1; }
+          ver=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          [ "v$ver" = "$TAG" ] || { echo "tag $TAG does not match Cargo.toml version $ver" >&2; exit 1; }
+      - name: Install toolchain
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install "$RELEASE_TOOLCHAIN" --profile minimal --target "$TARGET" --no-self-update
+          rustup default "$RELEASE_TOOLCHAIN"
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          cargo build --release --locked --target "$TARGET"
+          mkdir dist
+          cp "target/$TARGET/release/gh-pulse" "dist/$ASSET"
+          strip "dist/$ASSET"
+          chmod +x "dist/$ASSET"
+          ls -l dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  package:
+    name: checksums and provenance
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: gh-pulse-*
+          merge-multiple: true
+          path: dist
+      - name: SHA256SUMS
+        working-directory: dist
+        run: |
+          chmod +x gh-pulse-*
+          sha256sum gh-pulse-* | tee SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        if: github.event_name == 'push'
+        with:
+          subject-path: dist/gh-pulse-*
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: package
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: dist
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          [[ "$TAG" =~ $TAG_RE ]] || { echo "bad tag: $TAG" >&2; exit 1; }
+          flags=()
+          [[ "$TAG" == *-* ]] && flags+=(--prerelease)
+          gh release create "$TAG" --verify-tag --generate-notes --title "$TAG" "${flags[@]}" dist/*

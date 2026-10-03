@@ -113,6 +113,27 @@ Regenerate with `GH_PULSE_SHOT_BLOCKLIST=word,word python3 scripts/screenshots.p
 
 ## Installation
 
+### As a GitHub CLI extension
+
+```sh
+gh extension install navbytes/gh-pulse
+gh pulse                      # same flags as the standalone binary
+gh extension upgrade pulse
+```
+
+This downloads a precompiled binary from a GitHub release, so it needs a published release. No release exists
+yet (the release workflow has not run); until the first one is published, use cargo below.
+
+Prebuilt platforms: macOS (arm64, amd64) and Linux (arm64, amd64; glibc). Windows is unsupported and untested.
+The Linux binaries are built on Ubuntu 22.04, so they need glibc 2.35 or newer. The release build is not yet
+tested end to end.
+
+Each release carries a `SHA256SUMS` file and, once a release has been cut, build provenance attestations. To verify
+a downloaded binary: `sha256sum -c SHA256SUMS --ignore-missing`, or
+`gh attestation verify gh-pulse-linux-amd64 --repo navbytes/gh-pulse`.
+
+### With cargo
+
 ```sh
 # from GitHub
 cargo install --git https://github.com/navbytes/gh-pulse
