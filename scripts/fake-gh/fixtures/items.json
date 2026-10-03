@@ -1,0 +1,334 @@
+[
+ {
+  "k": "pr",
+  "r": "octo-org/api",
+  "n": 482,
+  "t": "Add rate limiting middleware to public endpoints",
+  "a": "hubot",
+  "age_h": 0.3,
+  "st": "open",
+  "labels": [
+   "enhancement",
+   "api"
+  ],
+  "rev": true,
+  "body": "Adds a token-bucket limiter in front of the public routes.\n\n## What changed\n- New `middleware.RateLimit` keyed by API token (falls back to client IP)\n- Limits come from `RATE_LIMIT_RPS` / `RATE_LIMIT_BURST`\n- Responds `429` with a `Retry-After` header\n\n## Testing\n- [x] Unit tests for the bucket refill\n- [x] Manual run with `hey -n 2000 -c 50`\n- [ ] Load test on staging\n\nCloses #431."
+ },
+ {
+  "k": "pr",
+  "r": "octo-org/web",
+  "n": 1207,
+  "t": "Fix focus trap in modal dialogs",
+  "a": "monalisa",
+  "age_h": 1.5,
+  "st": "open",
+  "labels": [
+   "bug",
+   "a11y"
+  ],
+  "rev": true,
+  "body": "Focus escaped the dialog when the last control was disabled.\n\nThe trap now skips disabled elements and restores focus to the opener on close."
+ },
+ {
+  "k": "pr",
+  "r": "acme-labs/rocket",
+  "n": 96,
+  "t": "Switch telemetry batching to an async channel",
+  "a": "octocat",
+  "age_h": 4,
+  "st": "open",
+  "labels": [
+   "performance"
+  ],
+  "rev": true,
+  "draft": true,
+  "body": "Replaces the mutex-guarded `Vec` with a bounded `tokio::sync::mpsc` channel.\n\nDraft: benchmarks still to come."
+ },
+ {
+  "k": "pr",
+  "r": "octo-org/cli",
+  "n": 318,
+  "t": "Support --json output for `repo list`",
+  "a": "hubot",
+  "age_h": 9,
+  "st": "open",
+  "labels": [
+   "enhancement"
+  ],
+  "rev": true,
+  "body": "`repo list --json name,stars` mirrors the other list commands."
+ },
+ {
+  "k": "pr",
+  "r": "hubot/dotfiles",
+  "n": 12,
+  "t": "Add zsh completion for gh",
+  "a": "hubot",
+  "age_h": 27,
+  "st": "open",
+  "labels": [],
+  "rev": true,
+  "body": "Sources the generated completion lazily so shell startup stays fast."
+ },
+ {
+  "k": "pr",
+  "r": "octo-org/hello-world",
+  "n": 57,
+  "t": "Bump actions/checkout to v5",
+  "a": "dependabot[bot]",
+  "age_h": 50,
+  "st": "open",
+  "labels": [
+   "dependencies"
+  ],
+  "rev": true,
+  "body": "Bumps actions/checkout from 4 to 5."
+ },
+ {
+  "k": "pr",
+  "r": "acme-labs/ledger",
+  "n": 203,
+  "t": "Reconcile pending entries in a single transaction",
+  "a": "octocat",
+  "age_h": 73,
+  "st": "open",
+  "labels": [
+   "bug"
+  ],
+  "rev": true,
+  "body": "Fixes double-posting when two reconcilers race."
+ },
+ {
+  "k": "pr",
+  "r": "octo-org/api",
+  "n": 490,
+  "t": "WIP: cursor pagination for /v2/repos",
+  "a": "you",
+  "age_h": 0.8,
+  "st": "open",
+  "labels": [
+   "enhancement"
+  ],
+  "me": true,
+  "draft": true,
+  "body": "Replaces offset pagination with opaque cursors.\n\nStill to do: docs and a migration note."
+ },
+ {
+  "k": "pr",
+  "r": "octo-org/web",
+  "n": 1215,
+  "t": "Dark mode tokens for the settings page",
+  "a": "you",
+  "age_h": 2.2,
+  "st": "open",
+  "labels": [
+   "design"
+  ],
+  "me": true,
+  "body": "Moves the settings page to the shared colour tokens.\n\nScreenshots in the thread below."
+ },
+ {
+  "k": "pr",
+  "r": "you/spoon-knife",
+  "n": 9,
+  "t": "Replace deprecated stylesheet",
+  "a": "you",
+  "age_h": 6,
+  "st": "open",
+  "labels": [],
+  "me": true,
+  "body": "Swaps the old `styles.css` for the current one."
+ },
+ {
+  "k": "pr",
+  "r": "acme-labs/pipeline",
+  "n": 77,
+  "t": "Retry flaky upload step with backoff",
+  "a": "you",
+  "age_h": 20,
+  "st": "open",
+  "labels": [
+   "reliability"
+  ],
+  "me": true,
+  "body": "Retries the upload up to 4 times with exponential backoff and jitter."
+ },
+ {
+  "k": "pr",
+  "r": "hubot/dotfiles",
+  "n": 14,
+  "t": "Tidy tmux config",
+  "a": "you",
+  "age_h": 45,
+  "st": "open",
+  "labels": [],
+  "me": true,
+  "body": "Groups the key bindings and drops unused plugins."
+ },
+ {
+  "k": "pr",
+  "r": "octo-org/api",
+  "n": 471,
+  "t": "Return 404 for unknown API versions",
+  "a": "you",
+  "age_h": 30,
+  "st": "merged",
+  "labels": [
+   "bug"
+  ],
+  "me": true,
+  "body": "Unknown versions used to fall through to v1."
+ },
+ {
+  "k": "pr",
+  "r": "octo-org/web",
+  "n": 1198,
+  "t": "Lazy-load the charts bundle",
+  "a": "you",
+  "age_h": 100,
+  "st": "merged",
+  "labels": [
+   "performance"
+  ],
+  "me": true,
+  "body": "Cuts the initial bundle by 90 KB."
+ },
+ {
+  "k": "pr",
+  "r": "octo-org/docs",
+  "n": 305,
+  "t": "Fix broken link in the quickstart",
+  "a": "you",
+  "age_h": 150,
+  "st": "merged",
+  "labels": [
+   "docs"
+  ],
+  "me": true,
+  "body": "One link pointed at the old docs site."
+ },
+ {
+  "k": "pr",
+  "r": "octo-org/hello-world",
+  "n": 44,
+  "t": "Try a different greeting",
+  "a": "you",
+  "age_h": 400,
+  "st": "closed",
+  "labels": [],
+  "me": true,
+  "body": "Superseded by #52."
+ },
+ {
+  "k": "pr",
+  "r": "you/tiny-http",
+  "n": 5,
+  "t": "Drop the vendored router",
+  "a": "you",
+  "age_h": 800,
+  "st": "closed",
+  "labels": [],
+  "me": true,
+  "body": "Not needed any more."
+ },
+ {
+  "k": "issue",
+  "r": "octo-org/api",
+  "n": 476,
+  "t": "Timeout on /v2/search with large result sets",
+  "a": "hubot",
+  "age_h": 3,
+  "st": "open",
+  "labels": [
+   "bug",
+   "performance"
+  ],
+  "asg": true,
+  "body": "Queries matching more than 10k rows hit the 30s gateway timeout.\n\nRepro: `GET /v2/search?q=language:go&per_page=100`."
+ },
+ {
+  "k": "issue",
+  "r": "octo-org/web",
+  "n": 1190,
+  "t": "Tab order skips the save button",
+  "a": "monalisa",
+  "age_h": 18,
+  "st": "open",
+  "labels": [
+   "bug",
+   "a11y"
+  ],
+  "asg": true,
+  "body": "After editing the title, Tab jumps from the description straight to Cancel."
+ },
+ {
+  "k": "issue",
+  "r": "acme-labs/rocket",
+  "n": 88,
+  "t": "Crash on empty telemetry batch",
+  "a": "octocat",
+  "age_h": 36,
+  "st": "open",
+  "labels": [
+   "bug"
+  ],
+  "asg": true,
+  "body": "The flusher indexes `batch[0]` without checking the length."
+ },
+ {
+  "k": "issue",
+  "r": "you/spoon-knife",
+  "n": 7,
+  "t": "Fork button label is misleading",
+  "a": "you",
+  "age_h": 60,
+  "st": "open",
+  "labels": [
+   "docs"
+  ],
+  "mine": true,
+  "body": "The page says Fork but the button says Clone."
+ },
+ {
+  "k": "issue",
+  "r": "octo-org/web",
+  "n": 1180,
+  "t": "Add keyboard shortcut help dialog",
+  "a": "you",
+  "age_h": 90,
+  "st": "open",
+  "labels": [
+   "enhancement"
+  ],
+  "mine": true,
+  "body": "`?` should open a list of shortcuts."
+ },
+ {
+  "k": "issue",
+  "r": "octo-org/docs",
+  "n": 310,
+  "t": "Document the new pagination cursors",
+  "a": "hubot",
+  "age_h": 2,
+  "st": "open",
+  "labels": [
+   "docs"
+  ],
+  "men": true,
+  "body": "@you can you review the wording once #490 lands?"
+ },
+ {
+  "k": "issue",
+  "r": "octo-org/cli",
+  "n": 301,
+  "t": "`repo list` ignores --limit above 100",
+  "a": "monalisa",
+  "age_h": 14,
+  "st": "open",
+  "labels": [
+   "bug"
+  ],
+  "men": true,
+  "body": "cc @you"
+ }
+]

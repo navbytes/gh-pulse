@@ -1,0 +1,5 @@
+theme = "dark"
+
+[repos]
+favorites = ["octo-org/api", "octo-org/web", "octo-org/cli", "hubot/dotfiles", "you/spoon-knife"]
+hidden = ["you/old-experiments", "octo-org/legacy-monolith"]

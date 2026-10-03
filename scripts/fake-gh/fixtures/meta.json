@@ -1,0 +1,9 @@
+{
+  "login": "you",
+  "orgs": ["octo-org", "acme-labs"],
+  "repo_facts": {
+    "octo-org/api": {"description": "Public REST and GraphQL API for the Octo platform", "stars": 1840, "forks": 212, "license": "MIT", "branch": "main", "topics": ["api", "go", "rest"]},
+    "octo-org/web": {"description": "The Octo web app", "stars": 960, "forks": 88, "license": "Apache-2.0", "branch": "main", "topics": ["typescript", "react"]},
+    "acme-labs/rocket": {"description": "Telemetry agent for flight software", "stars": 410, "forks": 31, "license": "MIT", "branch": "main", "topics": ["rust", "telemetry"]}
+  }
+}

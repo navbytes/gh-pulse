@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Drive the real gh-pulse binary in a pty (pyte) against public repos and render docs/img/*.svg|png.
 
-Usage: GH_PULSE_SHOT_BLOCKLIST=a,b scripts/screenshots.py [shot ...]   (needs `pip install pyte`,
+Usage: GH_PULSE_SHOT_BLOCKLIST=a,b scripts/screenshots.py [--fake] [shot ...]   (needs `pip install pyte`,
 `cargo build --release`; PNG conversion uses rsvg-convert if present). Read-only: never confirms an action.
 The header login becomes `you`, the unread badge is blanked, and a shot is aborted if a blocklisted string shows.
+`--fake` renders the global-home shots (11-17) offline against scripts/fake-gh, a `gh` stub with synthetic data,
+in a throwaway HOME/config/state; your own account is never read.
 """
 import fcntl, html, os, pty, re, select, shutil, signal, struct, subprocess, sys, tempfile, termios, time
 import pyte
@@ -31,11 +33,12 @@ pyte.Screen.display = property(_disp)
 
 
 class T:
-    def __init__(s, args, env):
+    def __init__(s, args, env, cwd=None, clean=False):
         s.scr = pyte.Screen(COLS, ROWS); s.st = pyte.ByteStream(s.scr)
-        e = dict(os.environ, TERM='xterm-256color', COLORTERM='truecolor', **env)
+        e = dict(env, TERM='xterm-256color', COLORTERM='truecolor') if clean else dict(os.environ, TERM='xterm-256color', COLORTERM='truecolor', **env)
         s.pid, s.fd = pty.fork()
         if s.pid == 0:
+            if cwd: os.chdir(cwd)
             os.execve(BIN, [BIN] + args, e)
         fcntl.ioctl(s.fd, termios.TIOCSWINSZ, struct.pack('HHHH', ROWS, COLS, 0, 0))
         os.kill(s.pid, signal.SIGWINCH)
@@ -112,8 +115,9 @@ def render_svg(t, path, title):
         subprocess.run(['rsvg-convert', '-z', '2', path, '-o', path[:-4] + '.png'], check=True)
 
 
-def scrub(t):
-    """Replace the login with `you`, blank the unread badge/spinner; abort if anything private is visible."""
+def scrub(t, fake=False):
+    """Replace the login with `you`, blank the unread badge/spinner; abort if anything private is visible.
+    With `fake` the data is synthetic: the badge stays, and "rate limit" is just text in a PR title."""
     m = re.search(r'user: (\S+)', t.text())
     if m:
         login = m.group(1)
@@ -125,11 +129,11 @@ def scrub(t):
                 i = t.scr.display[y].find(login, i + 1)
     hdr = t.scr.buffer[0]  # the badge is the user's real unread count
     line = ''.join(hdr[x].data or ' ' for x in range(COLS))
-    for mm in re.finditer(r'✉\s*\d+|[⠀-⣿]', line):
+    for mm in ([] if fake else re.finditer(r'✉\s*\d+|[⠀-⣿]', line)):
         for x in range(mm.start(), mm.end()):
             hdr[x] = hdr[x]._replace(data=' ')
     low = t.text().lower()
-    if 'rate limit' in low: raise RateLimited()
+    if 'rate limit' in low and not fake: raise RateLimited()
     for s in SECRETS:
         if s.lower() in low: raise SystemExit(f'private string {s!r} on screen')
 
@@ -218,22 +222,73 @@ SHOTS = {  # name -> (repo, steps, (cols, rows))
     '10-compact': ('charmbracelet/bubbletea', s_compact, (80, 24)),
 }
 
+FAKE = os.path.join(ROOT, 'scripts/fake-gh')
+
+
+def launch_fake(tmp):
+    """Start gh-pulse from a non-git cwd with a hermetic environment: fake `gh` first on PATH, empty gh config,
+    and a config/state seeded with synthetic favorites, hidden repos and recent repos."""
+    fx = os.path.join(FAKE, 'fixtures')
+    cfg, state, cwd = (os.path.join(tmp, d) for d in ('config', 'state', 'cwd'))
+    for d in ('config/gh-pulse', 'state/gh-pulse', 'gh', 'cwd', 'log'): os.makedirs(os.path.join(tmp, d))
+    shutil.copy(os.path.join(fx, 'config.toml'), os.path.join(cfg, 'gh-pulse/config.toml'))
+    shutil.copy(os.path.join(fx, 'recent.json'), os.path.join(state, 'gh-pulse/recent.json'))
+    os.chmod(os.path.join(state, 'gh-pulse'), 0o700)
+    open(os.path.join(tmp, 'gh/hosts.yml'), 'w').write('github.com:\n    user: you\n')  # what gh-pulse keys its disk cache by; no token
+    env = {'PATH': f'{FAKE}:/usr/bin:/bin', 'HOME': tmp, 'LANG': 'en_US.UTF-8', 'XDG_CONFIG_HOME': cfg, 'XDG_STATE_HOME': state,
+           'XDG_CACHE_HOME': os.path.join(tmp, 'cache'), 'GH_CONFIG_DIR': os.path.join(tmp, 'gh'), 'FAKE_GH_LOG': os.path.join(tmp, 'log')}
+    for warm in (True, False):  # the first run only opens the repo browser, which fills the on-disk repo list the Repos panel reads
+        t = T(['--theme', 'dark'], env, cwd=cwd, clean=True)
+        t.wait_for(r'octo-org/api#482', 20)
+        if not warm: return t
+        t.send('B', 2); t.wait_for(r'Repositories \d+ of', 20); t.close()
+
+
+def g_home(t): t.send('2', 2); t.send('3', 2); t.send('1', 2)  # sections search when first focused; load all, end on Review requested
+def g_diff(t):  # first review request, Diff tab zoomed, split layout
+    t.send(']]]', 2); t.send('f', .8); set_layout(t, 'auto:split')
+def g_scope(t): g_home(t); t.send('s', 1)
+def g_repos(t): g_home(t); t.send('4', 2); t.send('j', .8)
+def g_browser(t): t.send('B', 3); t.send('\r', .8); t.send('.', 1)  # Enter leaves the search box; `.` shows the hidden repos
+def g_inbox(t): t.send('N', 3)
+
+
+FAKE_SHOTS = {  # name -> (steps, (cols, rows)); synthetic data from scripts/fake-gh
+    '11-global-home': (g_home, (140, 40)),
+    '12-global-diff': (g_diff, (140, 40)),
+    '13-scope-picker': (g_scope, (140, 40)),
+    '14-repos-panel': (g_repos, (140, 40)),
+    '15-repo-browser': (g_browser, (140, 40)),
+    '16-inbox': (g_inbox, (140, 40)),
+    '17-global-compact': (g_home, (80, 24)),
+}
+
+
+def shoot(name, launch_fn, steps, title, fake):
+    for attempt in range(6):
+        with tempfile.TemporaryDirectory() as tmp:
+            t = launch_fn(tmp)
+            try:
+                t.pump(3); steps(t); t.pump(1)
+                scrub(t, fake)
+                render_svg(t, os.path.join(OUT, name + '.svg'), title)
+                print(f'== {name}'); print('\n'.join(l.rstrip() for l in t.scr.display))
+                return
+            except RateLimited:
+                print(f'{name}: rate limited, waiting', file=sys.stderr); time.sleep(120)
+            finally:
+                t.close()
+    raise SystemExit(f'{name}: still rate limited')
+
+
 if __name__ == '__main__':
     os.makedirs(OUT, exist_ok=True)
-    for name in sys.argv[1:] or SHOTS:
-        repo, steps, (COLS, ROWS) = SHOTS[name]
-        for attempt in range(6):
-            with tempfile.TemporaryDirectory() as tmp:
-                t = launch(repo, tmp)
-                try:
-                    t.pump(3); steps(t); t.pump(1)
-                    scrub(t)
-                    render_svg(t, os.path.join(OUT, name + '.svg'), f'gh-pulse · {repo}')
-                    print(f'== {name}'); print('\n'.join(l.rstrip() for l in t.scr.display))
-                    break
-                except RateLimited:
-                    print(f'{name}: rate limited, waiting', file=sys.stderr); time.sleep(120)
-                finally:
-                    t.close()
-        else:
-            raise SystemExit(f'{name}: still rate limited')
+    args = [a for a in sys.argv[1:] if a != '--fake']
+    if '--fake' in sys.argv:
+        for name in args or FAKE_SHOTS:
+            steps, (COLS, ROWS) = FAKE_SHOTS[name]
+            shoot(name, launch_fake, steps, 'gh-pulse · global home (synthetic data)', True)
+    else:
+        for name in args or SHOTS:
+            repo, steps, (COLS, ROWS) = SHOTS[name]
+            shoot(name, lambda tmp: launch(repo, tmp), steps, f'gh-pulse · {repo}', False)
