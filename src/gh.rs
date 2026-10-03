@@ -293,15 +293,20 @@ pub struct Label {
     pub name: String,
 }
 
-static TIMEOUT_S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(60);
+static TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(60_000);
 
 /// `[api] timeout_s`: how long a read may take (pagination gets double).
 pub fn set_timeout(secs: u64) {
-    TIMEOUT_S.store(secs.max(1), std::sync::atomic::Ordering::Relaxed);
+    TIMEOUT_MS.store(secs.max(1) * 1000, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn set_timeout_ms(ms: u64) {
+    TIMEOUT_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn timeout() -> std::time::Duration {
-    std::time::Duration::from_secs(TIMEOUT_S.load(std::sync::atomic::Ordering::Relaxed))
+    std::time::Duration::from_millis(TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Processes we started and are still waiting for, so quitting can end them.
@@ -386,9 +391,13 @@ fn run_child(
             Ok(None) if start.elapsed() >= limit => {
                 let _ = child.kill();
                 let _ = child.wait();
-                break Err(format!("{prog} timed out after {}s", limit.as_secs()));
+                break Err(format!("{prog} timed out after {limit:?}"));
             }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(if cfg!(test) {
+                1
+            } else {
+                5
+            })),
             Err(e) => break Err(format!("cannot run {prog}: {e}")),
         }
     };
@@ -2740,29 +2749,34 @@ mod tests {
     fn a_hung_gh_is_killed_at_the_deadline_and_on_quit() {
         let shim = crate::testshim::Shim::new();
         shim.set("sleep", "30");
-        set_timeout(1);
+        set_timeout_ms(100);
         let t = std::time::Instant::now();
         let e = gh(["api", "x"]).unwrap_err();
-        assert!(e.contains("timed out after 1s"), "{e}");
+        assert!(e.contains("timed out after 100ms"), "{e}");
         assert!(
             t.elapsed().as_secs() < 25,
             "killed at the deadline, not after the 30 s sleep"
         );
         // the killed child really is gone (not left sleeping)
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let alive = Command::new("pgrep")
-            .args(["-f", "sleep 30"])
-            .output()
-            .unwrap();
-        assert!(
-            String::from_utf8_lossy(&alive.stdout).trim().is_empty(),
-            "orphan left behind"
-        );
+        let gone = || {
+            let alive = Command::new("pgrep")
+                .args(["-f", "sleep 30"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&alive.stdout).trim().is_empty()
+        };
+        for _ in 0..200 {
+            if gone() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(gone(), "orphan left behind");
         assert!(cmd_log().iter().any(|l| l.contains("error: gh timed out")));
         // pagination gets double, writes five times
         let a = |s: &str| vec![OsString::from(s)];
-        assert_eq!(limit_for(&a("api")).as_secs(), 1);
-        assert_eq!(limit_for(&a("--paginate")).as_secs(), 2);
+        assert_eq!(limit_for(&a("api")).as_millis(), 100);
+        assert_eq!(limit_for(&a("--paginate")).as_millis(), 200);
         // quitting ends whatever is still running
         set_timeout(60);
         let h = std::thread::spawn(|| gh(["api", "y"]));
