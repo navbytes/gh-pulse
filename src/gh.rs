@@ -161,6 +161,8 @@ pub enum Kind {
     Branch,
     Release,
     Tag,
+    /// A row of the Repos panel (favorites / recent): `repo` is the name, the card text is in `body`.
+    Repo,
     Other,
     /// Rows of the derived Files / Checks / Comments panels.
     File,
@@ -224,6 +226,9 @@ pub struct Item {
     pub author: Author,
     pub labels: Vec<Label>,
     pub is_draft: bool,
+    /// ISO timestamp of the last update (search results), for merging and sorting.
+    #[serde(rename = "updatedAt")]
+    pub updated: String,
     pub repository: RepoRef,
     #[serde(skip)]
     pub repo: String,
@@ -521,43 +526,6 @@ struct Workflow {
 
 const PR_FIELDS: &str = "number,title,url,state,isDraft,author,labels,body";
 const ISSUE_FIELDS: &str = "number,title,url,state,author,labels,body";
-
-fn search(panel: usize, tab: usize) -> Result<Vec<Item>, String> {
-    let (sub, kind, fields, f): (_, _, _, &[&str]) = if panel == 1 {
-        let f: &[&str] = match tab {
-            0 => &["--author=@me"],
-            1 => &["--review-requested=@me"],
-            2 => &["--involves=@me"],
-            _ => &["--author=@me", "--merged"],
-        };
-        (
-            "prs",
-            Kind::Pr,
-            "number,title,url,state,isDraft,author,labels,body,repository",
-            f,
-        )
-    } else {
-        let f: &[&str] = match tab {
-            0 => &["--assignee=@me"],
-            1 => &["--author=@me"],
-            _ => &["--involves=@me"],
-        };
-        (
-            "issues",
-            Kind::Issue,
-            "number,title,url,state,author,labels,body,repository",
-            f,
-        )
-    };
-    let limit = format!("--limit={LIMIT}");
-    // `gh search` has no --state=merged (it is --merged), and it conflicts with --state=open.
-    let mut a = vec!["search", sub, &limit, "--json", fields];
-    if !f.contains(&"--merged") {
-        a.push("--state=open");
-    }
-    a.extend(f);
-    parse_items(&gh(a)?, kind, "")
-}
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -1004,48 +972,29 @@ fn remotes_include(remotes: &str, repo: &str) -> bool {
 }
 
 /// (rows, more than that) of one list tab, for the panel titles.
-pub fn count(repo: &str, global: bool, panel: usize, tab: usize) -> Result<(usize, bool), String> {
-    let n = list(repo, global, panel, tab, false)?.len();
+pub fn count(repo: &str, panel: usize, tab: usize) -> Result<(usize, bool), String> {
+    let n = list(repo, panel, tab, false)?.len();
     Ok((n, n >= cap(panel)))
 }
 
 /// Panels: 0 Status, 1 Pull requests, 2 Issues, 3 Actions, 4 Branches, 5 Releases, 6 Notifications, 7 Tags.
 /// In the global view panels 1-2 search across all repos and the repo-only ones are empty.
 /// `fresh` skips the on-disk cache (the user asked for a refresh).
-pub fn list(
-    repo: &str,
-    global: bool,
-    panel: usize,
-    tab: usize,
-    fresh: bool,
-) -> Result<Vec<Item>, String> {
-    let mut v = list_raw(repo, global, panel, tab, fresh)?;
+pub fn list(repo: &str, panel: usize, tab: usize, fresh: bool) -> Result<Vec<Item>, String> {
+    let mut v = list_raw(repo, panel, tab, fresh)?;
     v.iter_mut().for_each(clean_item);
     Ok(v)
 }
 
-fn list_raw(
-    repo: &str,
-    global: bool,
-    panel: usize,
-    tab: usize,
-    fresh: bool,
-) -> Result<Vec<Item>, String> {
+fn list_raw(repo: &str, panel: usize, tab: usize, fresh: bool) -> Result<Vec<Item>, String> {
     let limit = format!("--limit={LIMIT}");
     if panel == 6 {
         let all = parse_notifications(&gh(["api", "notifications"])?)?;
         // Scoped to the current repo unless in the global view.
         return Ok(all
             .into_iter()
-            .filter(|n| global || n.repo.eq_ignore_ascii_case(repo))
+            .filter(|n| n.repo.eq_ignore_ascii_case(repo))
             .collect());
-    }
-    if global {
-        return if matches!(panel, 1 | 2) {
-            search(panel, tab)
-        } else {
-            Ok(vec![])
-        };
     }
     match panel {
         0 => Ok(vec![Item {
@@ -1922,7 +1871,7 @@ pub fn needs_fetch(kind: Kind, tab: Tab) -> bool {
     !matches!(
         (kind, tab),
         (
-            Kind::Issue | Kind::Workflow | Kind::Branch | Kind::Other,
+            Kind::Issue | Kind::Workflow | Kind::Branch | Kind::Repo | Kind::Other,
             Tab::Overview
         )
     )
@@ -3505,7 +3454,7 @@ mod tests {
             (3, 1),
             (4, 0),
         ] {
-            let items = list(&repo, false, panel, tab, true)
+            let items = list(&repo, panel, tab, true)
                 .unwrap_or_else(|e| panic!("list {panel}/{tab}: {e}"));
             println!("list {panel}/{tab}: {} items", items.len());
             for it in items.iter().take(2) {

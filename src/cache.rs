@@ -223,7 +223,7 @@ impl Store {
     }
 }
 
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut o = std::fs::OpenOptions::new();
     // create_new = O_CREAT|O_EXCL: it fails on anything already there, a symlink included

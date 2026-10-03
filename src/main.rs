@@ -7,6 +7,7 @@ mod diff;
 mod dispatch;
 mod form;
 mod gh;
+mod global;
 mod md;
 mod pool;
 mod rate;

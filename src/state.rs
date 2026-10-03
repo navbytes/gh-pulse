@@ -168,6 +168,177 @@ impl Viewed {
     }
 }
 
+/// The state directory (`$XDG_STATE_HOME/gh-pulse`, default `~/.local/state/gh-pulse`); only absolute
+/// paths are honored.
+pub fn dir() -> Option<PathBuf> {
+    let abs = |k: &str| {
+        std::env::var_os(k)
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+    };
+    let base = abs("XDG_STATE_HOME").or_else(|| abs("HOME").map(|h| h.join(".local/state")))?;
+    Some(base.join("gh-pulse"))
+}
+
+/// Writes `body` to `path` through a unique, exclusively created `0600` temp file and a rename.
+fn write_private_atomic(path: &Path, body: &str) -> Result<(), String> {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = path.parent().ok_or("bad state path")?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{}.{n}.tmp", std::process::id()));
+    crate::cache::write_private(&tmp, body.as_bytes()).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })
+}
+
+/// Reads a regular file (never a symlink); anything else is "no file".
+fn read_regular(path: &Path) -> Option<String> {
+    let m = std::fs::symlink_metadata(path).ok()?;
+    m.is_file().then(|| std::fs::read_to_string(path).ok())?
+}
+
+/// The last global-home scope (`all`, `favorites`, `org:x`, `repo:a/b`), kept out of config.toml.
+pub fn load_scope(path: &Path) -> Option<String> {
+    #[derive(Deserialize)]
+    struct S {
+        scope: String,
+    }
+    let s: S = serde_json::from_str(&read_regular(path)?).ok()?;
+    Some(s.scope)
+}
+
+pub fn save_scope(path: &Path, scope: &str) -> Result<(), String> {
+    write_private_atomic(path, &serde_json::json!({ "scope": scope }).to_string())
+}
+
+/// The repos you entered last, newest first (at most [`RECENT_MAX`]), per host so hosts never mix.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Recent {
+    pub host: String,
+    pub repos: Vec<String>,
+}
+
+pub const RECENT_MAX: usize = 20;
+
+impl Recent {
+    pub fn new(host: &str) -> Recent {
+        Recent {
+            host: host.into(),
+            repos: vec![],
+        }
+    }
+
+    /// A missing, corrupt or other-host file is simply empty (and replaced on the next save).
+    pub fn load(path: &Path, host: &str) -> Recent {
+        let mut r: Recent = read_regular(path)
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .filter(|r: &Recent| r.host == host)
+            .unwrap_or_else(|| Recent::new(host));
+        r.repos.retain(|x| valid_repo(x));
+        r.repos.truncate(RECENT_MAX);
+        r
+    }
+
+    /// Moves `repo` to the front.
+    pub fn touch(&mut self, repo: &str) {
+        self.repos.retain(|r| !r.eq_ignore_ascii_case(repo));
+        self.repos.insert(0, repo.to_string());
+        self.repos.truncate(RECENT_MAX);
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        write_private_atomic(path, &serde_json::to_string(self).map_err(|e| e.to_string())?)
+    }
+}
+
+/// `owner/name` with only the characters GitHub allows: the one check every name that reaches a
+/// search query or a path goes through.
+pub fn valid_repo(s: &str) -> bool {
+    let ok = |p: &str| {
+        !p.is_empty()
+            && p.len() <= 100
+            && p.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+    };
+    s.split_once('/')
+        .is_some_and(|(o, n)| ok(o) && ok(n) && !n.contains('/'))
+}
+
+#[cfg(test)]
+mod tests_recent {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("gh-pulse-state-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn recent_keeps_twenty_newest_first_without_duplicates() {
+        let mut r = Recent::new("github.com");
+        for i in 0..25 {
+            r.touch(&format!("o/r{i}"));
+        }
+        r.touch("O/R20");
+        assert_eq!(r.repos.len(), RECENT_MAX);
+        assert_eq!(r.repos[0], "O/R20");
+        assert_eq!(r.repos.iter().filter(|x| x.eq_ignore_ascii_case("o/r20")).count(), 1);
+        assert_eq!(r.repos[1], "o/r24");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recent_and_scope_files_are_private_atomic_and_forgiving() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("files");
+        let p = d.join("recent.json");
+        let mut r = Recent::new("github.com");
+        r.touch("o/a");
+        r.save(&p).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(Recent::load(&p, "github.com"), r);
+        assert!(
+            Recent::load(&p, "ghe.example.com").repos.is_empty(),
+            "another host's list is not mixed in"
+        );
+        // no temp files left behind; a second save replaces the first
+        r.touch("o/b");
+        r.save(&p).unwrap();
+        let names: Vec<_> = std::fs::read_dir(&d).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        // corrupt or hostile content is ignored
+        std::fs::write(&p, "{ not json").unwrap();
+        assert!(Recent::load(&p, "github.com").repos.is_empty());
+        std::fs::write(&p, r#"{"host":"github.com","repos":["o/ok","a b/c","../x/y","o/r --repo=z"]}"#).unwrap();
+        assert_eq!(Recent::load(&p, "github.com").repos, ["o/ok"]);
+        // a symlink where the file should be is not read
+        let target = d.join("elsewhere.json");
+        std::fs::write(&target, r#"{"host":"github.com","repos":["o/planted"]}"#).unwrap();
+        let link = d.join("link.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(Recent::load(&link, "github.com").repos.is_empty());
+        // scope round trip
+        let sp = d.join("scope.json");
+        assert_eq!(load_scope(&sp), None);
+        save_scope(&sp, "org:cli").unwrap();
+        assert_eq!(load_scope(&sp).as_deref(), Some("org:cli"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn repo_names_are_checked_before_they_reach_a_query() {
+        for ok in ["cli/cli", "a-b/c_d.e", "o/r"] {
+            assert!(valid_repo(ok), "{ok}");
+        }
+        for bad in ["", "cli", "a/b/c", "a b/c", "o/r label:bug", "o/", "/r", "o/r\n", "o/r;x"] {
+            assert!(!valid_repo(bad), "{bad:?}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
