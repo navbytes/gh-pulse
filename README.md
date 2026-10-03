@@ -129,7 +129,7 @@ The Linux binaries are built on Ubuntu 22.04, so they need glibc 2.35 or newer. 
 tested end to end.
 
 Each release carries a `SHA256SUMS` file and, once a release has been cut, build provenance attestations. To verify
-a downloaded binary: `sha256sum -c SHA256SUMS --ignore-missing`, or
+a downloaded binary: `sha256sum -c SHA256SUMS --ignore-missing` (Linux) or `shasum -a 256 -c SHA256SUMS --ignore-missing` (macOS), or
 `gh attestation verify gh-pulse-linux-amd64 --repo navbytes/gh-pulse`.
 
 ### With cargo

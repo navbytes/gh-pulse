@@ -30,6 +30,10 @@ GH_PULSE_HUGE_PR=owner/repo#123 cargo test -- --ignored --nocapture
 cargo test --release perf_5k -- --ignored --nocapture
 ```
 
+CI runs clippy on `stable`, so a newer toolchain can flag lints your local one does not; fix them rather than
+silencing them. The `msrv` job also runs clippy on the `rust-version` toolchain, and releases build with a pinned
+toolchain.
+
 ## Guidelines
 
 - Shell out to `gh`; no tokens, no async runtime, no new dependency unless a few lines can't do it.
@@ -49,8 +53,8 @@ cargo test --release perf_5k -- --ignored --nocapture
 3. The `Release` workflow builds `gh-pulse-<os>-<arch>` for macOS and Linux (arm64, amd64), writes `SHA256SUMS`,
    attests provenance and creates the GitHub release. It fails if the tag does not match the `Cargo.toml` version.
 
-To rehearse without publishing, run the workflow manually (Actions, Release, `dry_run` on): it uploads the binaries
-as workflow artifacts and creates no release. `gh extension install` needs the tagged release to exist, and the
+To rehearse without publishing, run the workflow manually (Actions, Release): it builds and uploads artifacts only
+and never publishes. `gh extension install` needs the tagged release to exist, and the
 extension repo needs the `gh-extension` topic to be discoverable.
 
 ## Reporting bugs
