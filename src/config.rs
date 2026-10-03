@@ -56,12 +56,57 @@ impl StartMode {
 #[serde(default, deny_unknown_fields)]
 pub struct UiCfg {
     pub start: StartMode,
+    /// How far back the global PR sections look (`W` cycles it): `24h`, `7d`, `30d` or `all`.
+    pub window: Window,
 }
 
 impl Default for UiCfg {
     fn default() -> Self {
         UiCfg {
             start: StartMode::Auto,
+            window: Window::Week,
+        }
+    }
+}
+
+/// The `updated:` window of the global PR sections (Review requested, My PRs, Involved).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum Window {
+    #[serde(rename = "24h")]
+    Day,
+    #[serde(rename = "7d")]
+    Week,
+    #[serde(rename = "30d")]
+    Month,
+    #[serde(rename = "all")]
+    All,
+}
+
+impl Window {
+    pub fn label(self) -> &'static str {
+        match self {
+            Window::Day => "24h",
+            Window::Week => "7d",
+            Window::Month => "30d",
+            Window::All => "all",
+        }
+    }
+
+    pub fn secs(self) -> Option<u64> {
+        match self {
+            Window::Day => Some(86_400),
+            Window::Week => Some(7 * 86_400),
+            Window::Month => Some(30 * 86_400),
+            Window::All => None,
+        }
+    }
+
+    pub fn next(self) -> Window {
+        match self {
+            Window::Day => Window::Week,
+            Window::Week => Window::Month,
+            Window::Month => Window::All,
+            Window::All => Window::Day,
         }
     }
 }
@@ -1159,6 +1204,31 @@ impl Keymap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pr_window_parses_cycles_and_rejects_nonsense() {
+        assert_eq!(
+            parse("", "t").unwrap().ui.window,
+            Window::Week,
+            "7d default"
+        );
+        for (txt, w) in [
+            ("24h", Window::Day),
+            ("7d", Window::Week),
+            ("30d", Window::Month),
+            ("all", Window::All),
+        ] {
+            let c = parse(&format!("[ui]\nwindow = \"{txt}\"\n"), "t").unwrap();
+            assert_eq!((c.ui.window, w.label()), (w, txt));
+        }
+        assert!(parse("[ui]\nwindow = \"3d\"\n", "t").is_err());
+        let mut w = Window::Day;
+        for _ in 0..4 {
+            w = w.next();
+        }
+        assert_eq!(w, Window::Day, "24h > 7d > 30d > all > 24h");
+        assert_eq!(Window::All.secs(), None);
+    }
 
     #[test]
     fn doc_toml_examples_parse() {

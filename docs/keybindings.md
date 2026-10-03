@@ -57,6 +57,8 @@ and `s` applies to those whose filter has no `repo:` / `org:` / `user:` of its o
 | Key | Action |
 |---|---|
 | `s` | Scope picker: `j` `k` / arrows, `Enter` picks, typing filters Org... and Repo... lists (a full `owner/name` is accepted; in Org... any valid org or user name offers `Use org 'name'`, member or not), `Backspace` goes back, `Esc` cancels |
+| `g` | Group the list: flat, by PR author, by repo. Each heading shows the count and the longest wait; the group that has waited longest comes first. (Elsewhere `g` still jumps to the top; `Home` always does.) |
+| `W` | Cycle the pull request window: 24h, 7d (default, `[ui] window`), 30d, all. The PR sections search again |
 | `S` | Open the row's repo as the app's repo; `G` leads back |
 | `r` | Search this section again |
 | Repos panel: `Enter` | Open the repo (`S` too) |

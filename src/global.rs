@@ -210,11 +210,55 @@ pub fn calls(
     favorites: &[String],
     limit: usize,
 ) -> (Calls, usize) {
+    calls_since(sec, tab, scope, favorites, limit, None)
+}
+
+/// `ts` (`updated:>=` timestamp) narrows the pull request searches only: issues keep their full history.
+pub fn calls_since(
+    sec: Section,
+    tab: usize,
+    scope: &Scope,
+    favorites: &[String],
+    limit: usize,
+    since: Option<&str>,
+) -> (Calls, usize) {
     let base = base(sec, tab)
         .into_iter()
-        .map(|(k, t)| (k, t.into_iter().map(String::from).collect()))
+        .map(|(k, t)| {
+            let mut t: Vec<String> = t.into_iter().map(String::from).collect();
+            if let (Search::Prs, Some(ts)) = (k, since) {
+                t.push(format!("updated:>={ts}"));
+            }
+            (k, t)
+        })
         .collect();
     build_calls(base, scope, favorites, FAV_CHUNK, limit)
+}
+
+/// `2026-10-03T16:20:58Z` for a unix time (the format of the `updated:` qualifier).
+pub fn iso_utc(secs: u64) -> String {
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    // civil-from-days (proleptic Gregorian)
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+/// The `updated:>=` timestamp for a window ending at `now`, or None for all time.
+pub fn since(window: config::Window, now: u64) -> Option<String> {
+    window.secs().map(|w| iso_utc(now.saturating_sub(w)))
 }
 
 /// A `[[sections]]` search, ready to run: the user's terms plus the defaults we add.
@@ -278,13 +322,15 @@ impl Custom {
 #[derive(Clone, Debug)]
 pub enum Query {
     Section(Section, usize),
+    /// A section whose pull request searches only look at what was updated since the timestamp.
+    Recent(Section, usize, String),
     Custom(Custom),
 }
 
 impl Query {
     pub fn uses_scope(&self) -> bool {
         match self {
-            Query::Section(..) => true,
+            Query::Section(..) | Query::Recent(..) => true,
             Query::Custom(c) => c.scoped,
         }
     }
@@ -292,7 +338,9 @@ impl Query {
     /// Searches one refresh needs (before any top-up).
     pub fn searches_needed(&self, scope: &Scope, favorites: &[String]) -> usize {
         match self {
-            Query::Section(sec, tab) => searches_needed(*sec, *tab, scope, favorites),
+            Query::Section(sec, tab) | Query::Recent(sec, tab, _) => {
+                searches_needed(*sec, *tab, scope, favorites)
+            }
             Query::Custom(c) => c.calls(scope, favorites, PAGE).0.len(),
         }
     }
@@ -306,6 +354,15 @@ impl Query {
     ) -> Result<GlobalList, String> {
         match self {
             Query::Section(sec, tab) => fetch_section(*sec, *tab, scope, favorites, hidden, quota),
+            Query::Recent(sec, tab, ts) => fetch_section_since(
+                *sec,
+                *tab,
+                scope,
+                favorites,
+                hidden,
+                quota,
+                Some(ts.as_str()),
+            ),
             Query::Custom(c) => {
                 let page = c.limit;
                 let mut l = fetch_with(
@@ -386,8 +443,20 @@ pub fn fetch_section(
     hidden: &ReposCfg,
     quota: Option<Quota>,
 ) -> Result<GlobalList, String> {
+    fetch_section_since(sec, tab, scope, favorites, hidden, quota, None)
+}
+
+pub fn fetch_section_since(
+    sec: Section,
+    tab: usize,
+    scope: &Scope,
+    favorites: &[String],
+    hidden: &ReposCfg,
+    quota: Option<Quota>,
+    since: Option<&str>,
+) -> Result<GlobalList, String> {
     fetch_with(
-        |n| calls(sec, tab, scope, favorites, n),
+        |n| calls_since(sec, tab, scope, favorites, n, since),
         (PAGE, TOP_UP),
         scope_chunks(scope, favorites).0.len() <= 1,
         hidden,
@@ -624,6 +693,40 @@ mod tests {
             scope_chunks(&Scope::Repo("a/b".into()), &[]).0,
             [["repo:a/b"]]
         );
+    }
+
+    #[test]
+    fn iso_timestamps_and_windows() {
+        assert_eq!(iso_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso_utc(1_791_044_458), "2026-10-03T16:20:58Z");
+        assert_eq!(iso_utc(1_709_164_800), "2024-02-29T00:00:00Z", "leap day");
+        let now = 1_791_044_458;
+        assert_eq!(
+            since(config::Window::Week, now).as_deref(),
+            Some("2026-09-26T16:20:58Z")
+        );
+        assert_eq!(
+            since(config::Window::Day, now).as_deref(),
+            Some("2026-10-02T16:20:58Z")
+        );
+        assert_eq!(since(config::Window::All, now), None);
+    }
+
+    #[test]
+    fn the_window_narrows_pull_request_searches_only() {
+        let ts = Some("2026-09-26T16:20:58Z");
+        let (c, _) = calls_since(Section::Review, 0, &Scope::All, &[], 100, ts);
+        assert!(c[0].1.join(" ").ends_with(
+            "review-requested:@me is:open archived:false updated:>=2026-09-26T16:20:58Z"
+        ));
+        let (c, _) = calls_since(Section::Assigned, 0, &Scope::All, &[], 100, ts);
+        assert!(
+            !c[0].1.join(" ").contains("updated:>="),
+            "issues keep their history"
+        );
+        let (c, _) = calls_since(Section::Involved, 0, &Scope::All, &[], 100, ts);
+        let has = |i: usize| c[i].1.join(" ").contains("updated:>=");
+        assert!(c[0].1[1] == "prs" && has(0) && c[1].1[1] == "issues" && !has(1));
     }
 
     #[test]

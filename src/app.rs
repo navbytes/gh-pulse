@@ -363,11 +363,48 @@ pub enum Modal {
 }
 
 /// Screen regions recorded by the last draw, for mouse hit-testing.
+/// How the global lists are sectioned (`g` cycles): flat, by PR author, by repo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupBy {
+    None,
+    Author,
+    Repo,
+}
+
+impl GroupBy {
+    pub fn next(self) -> GroupBy {
+        match self {
+            GroupBy::None => GroupBy::Author,
+            GroupBy::Author => GroupBy::Repo,
+            GroupBy::Repo => GroupBy::None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            GroupBy::None => "none",
+            GroupBy::Author => "author",
+            GroupBy::Repo => "repo",
+        }
+    }
+
+    /// The heading an item falls under; empty when not grouped.
+    pub fn key(self, it: &Item) -> String {
+        match self {
+            GroupBy::None => String::new(),
+            GroupBy::Author => it.author.login.clone(),
+            GroupBy::Repo => it.repo.clone(),
+        }
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct Hit {
     pub panels: Vec<Rect>,
     pub list: Rect,
     pub list_off: usize,
+    /// Grouped lists: the item behind each list row (None for a heading). Empty when rows are items.
+    pub list_rows: Vec<Option<usize>>,
     pub detail: Rect,
     pub body: Rect,
     pub tab_y: u16,
@@ -606,6 +643,9 @@ pub struct App {
     /// The `?` menu: cursor over the visible rows, its filter, whether `/` is typing, first line shown.
     pub help_scroll: usize,
     pub help_filter: String,
+    /// How far back the global PR sections look (`W`), and how global lists are grouped (`g`).
+    pub window: config::Window,
+    pub group: GroupBy,
     pub help_typing: bool,
     pub help_top: Cell<usize>,
     /// Set by the renderer: how far the help popup can scroll.
@@ -891,6 +931,7 @@ impl App {
             build_panels(&cfg)
         };
         let repo_name = repo.clone().unwrap_or_default();
+        let window = cfg.ui.window;
         let mut app = App {
             cfg,
             cfg_path: None,
@@ -940,6 +981,8 @@ impl App {
             help: false,
             help_scroll: 0,
             help_filter: String::new(),
+            window,
+            group: GroupBy::None,
             help_typing: false,
             help_top: Cell::new(0),
             help_max: Cell::new(0),
@@ -1148,7 +1191,15 @@ impl App {
             format!("  user: {}", self.user)
         };
         self.header = if self.global {
-            format!(" all repos  scope: {}{user}", self.scope.label())
+            let group = match self.group {
+                GroupBy::None => String::new(),
+                g => format!("  group: {}", g.label()),
+            };
+            format!(
+                " all repos  scope: {}  PRs: {}{group}{user}",
+                self.scope.label(),
+                self.window.label()
+            )
         } else if self.from_global {
             format!(
                 " all repos \u{203a} {}  branch: {}{user}",
@@ -1408,14 +1459,62 @@ impl App {
         );
     }
 
+    /// A built-in section's search, narrowed to the window for its pull requests.
+    fn section_query(&self, sec: Section, tab: usize) -> Query {
+        match global::since(self.window, rate::now()) {
+            Some(ts) => Query::Recent(sec, tab, ts),
+            None => Query::Section(sec, tab),
+        }
+    }
+
+    /// `W`: the next window. Only the sections that search pull requests are looked at again.
+    fn cycle_window(&mut self) {
+        self.window = self.window.next();
+        let pr_section = |p: &Panel| matches!(p.kind, PK::Review | PK::MyPrs | PK::Involved);
+        for p in self.panels.iter_mut().filter(|p| pr_section(p)) {
+            (p.unloaded, p.cursor, p.hidden, p.not_shown) = (true, 0, 0, 0);
+            p.items.clear();
+        }
+        if let Some(o) = self.other.as_mut() {
+            for p in o.panels.iter_mut().filter(|p| pr_section(p)) {
+                (p.unloaded, p.cursor, p.hidden, p.not_shown) = (true, 0, 0, 0);
+                p.items.clear();
+            }
+        }
+        let f = self.focus;
+        if pr_section(&self.panels[f]) {
+            self.load_panel(f, false);
+        }
+        self.status = format!("pull requests updated in: {}", self.window.label());
+        self.reset_view();
+        self.rebuild_header();
+    }
+
+    /// `g`: flat, by author, by repo.
+    fn cycle_group(&mut self) {
+        self.group = self.group.next();
+        self.panels[self.focus].cursor = 0;
+        self.status = format!("group by: {}", self.group.label());
+        self.reset_view();
+        self.rebuild_header();
+    }
+
+    /// A list `g` and `W` apply to: a global search section with the list focused.
+    fn on_global_list(&self) -> bool {
+        self.global
+            && self.panels[self.focus].kind.is_global_search()
+            && !self.detail_focus
+            && self.ctx.is_none()
+    }
+
     /// A global section: one search per scope chunk, run at user priority when the section is focused,
     /// reloaded or its scope changed. Hidden repos are dropped inside the job.
     fn load_global(&mut self, i: usize) {
         let kind = self.panels[i].kind;
         let tab_id = self.panels[i].tab_id();
         let query = match kind {
-            PK::Review => Ok(Query::Section(Section::Review, tab_id)),
-            PK::MyPrs => Ok(Query::Section(Section::MyPrs, tab_id)),
+            PK::Review => Ok(self.section_query(Section::Review, tab_id)),
+            PK::MyPrs => Ok(self.section_query(Section::MyPrs, tab_id)),
             PK::Assigned => Ok(Query::Section(Section::Assigned, tab_id)),
             k if k.custom().is_some() => self
                 .cfg
@@ -1427,7 +1526,7 @@ impl App {
                     global::Custom::new(c, repo)
                 })
                 .map(Query::Custom),
-            _ => Ok(Query::Section(Section::Involved, tab_id)),
+            _ => Ok(self.section_query(Section::Involved, tab_id)),
         };
         let query = match query {
             Ok(q) => q,
@@ -2266,7 +2365,32 @@ impl App {
                 // "123" or "#123" finds a PR/issue by number
                 || (it.number > 0 && !num.is_empty() && it.number.to_string().contains(num))
         };
-        p.items.iter().filter(hit).collect()
+        let mut v: Vec<&Item> = p.items.iter().filter(hit).collect();
+        if self.global && self.group != GroupBy::None && p.kind.is_global_search() {
+            self.group_sort(&mut v);
+        }
+        v
+    }
+
+    /// Items of one group together, the group with the longest-waiting item first (ISO times sort as
+    /// text); inside a group the search's newest-first order is kept.
+    fn group_sort(&self, v: &mut [&Item]) {
+        let mut oldest: std::collections::HashMap<String, &str> = Default::default();
+        for it in v.iter() {
+            let e = oldest
+                .entry(self.group.key(it).to_lowercase())
+                .or_insert(&it.updated);
+            if it.updated.as_str() < *e {
+                *e = &it.updated;
+            }
+        }
+        v.sort_by(|a, b| {
+            let (ka, kb) = (
+                self.group.key(a).to_lowercase(),
+                self.group.key(b).to_lowercase(),
+            );
+            (oldest[&ka], &ka).cmp(&(oldest[&kb], &kb))
+        });
     }
 
     /// (rows, more than that) of the panel's showing tab; None while its first load is out.
@@ -2602,7 +2726,16 @@ impl App {
                         self.set_focus(i);
                     }
                     if was_list && hit.list.contains(pos) {
-                        let r = hit.list_off + (pos.y - hit.list.y) as usize;
+                        let mut r = hit.list_off + (pos.y - hit.list.y) as usize;
+                        if !hit.list_rows.is_empty() {
+                            // a grouped list has heading rows: click maps to the item behind the row
+                            r = hit
+                                .list_rows
+                                .get(r)
+                                .copied()
+                                .flatten()
+                                .unwrap_or(usize::MAX);
+                        }
                         if r < self.visible(i).len() {
                             self.panels[i].cursor = r;
                             self.after_select();
@@ -2843,6 +2976,8 @@ impl App {
             KeyCode::Char('e') if self.cur_tab() == Tab::Comments => self.toggle_card(true),
             KeyCode::Char('d') if ctrl => self.nav((self.view_h.get() / 2) as isize),
             KeyCode::Char('u') if ctrl => self.nav(-((self.view_h.get() / 2) as isize)),
+            KeyCode::Char('g') if self.on_global_list() => self.cycle_group(),
+            KeyCode::Char('W') if self.on_global_list() => self.cycle_window(),
             KeyCode::Char('g') => self.nav(isize::MIN),
             KeyCode::Char('G') => self.nav(isize::MAX),
             _ => {}
@@ -6456,6 +6591,65 @@ mod tests {
         }];
         (b.typing, b.loading, b.show_hidden) = (false, false, true);
         a.browser = Some(b);
+    }
+
+    fn mk(repo: &str, n: u64, who: &str, updated: &str) -> Item {
+        let mut i = gitem(repo, n);
+        (i.author.login, i.updated) = (who.into(), updated.into());
+        i
+    }
+
+    #[test]
+    fn g_groups_a_global_list_and_the_longest_waiting_group_comes_first() {
+        let mut a = home();
+        a.panels[0].items = vec![
+            mk("a/b", 1, "bob", "2026-10-02T10:00:00Z"),
+            mk("a/b", 2, "Alice", "2026-10-03T10:00:00Z"),
+            mk("c/d", 3, "bob", "2026-09-30T10:00:00Z"),
+            mk("c/d", 4, "alice", "2026-10-01T10:00:00Z"),
+        ];
+        (a.panels[0].unloaded, a.focus) = (false, 0);
+        let order = |a: &App| a.visible(0).iter().map(|i| i.number).collect::<Vec<_>>();
+        assert_eq!(order(&a), [1, 2, 3, 4], "flat: the search's order");
+        press(&mut a, 'g');
+        // bob has waited since 09-30, alice (any case) since 10-01
+        assert_eq!((a.group, order(&a)), (GroupBy::Author, vec![1, 3, 2, 4]));
+        assert!(a.header.contains("group: author"), "{}", a.header);
+        press(&mut a, 'g');
+        // c/d's oldest is 09-30, a/b's 10-02
+        assert_eq!((a.group, order(&a)), (GroupBy::Repo, vec![3, 4, 1, 2]));
+        press(&mut a, 'g');
+        assert_eq!((a.group, order(&a)), (GroupBy::None, vec![1, 2, 3, 4]));
+        assert!(!a.header.contains("group:"));
+        // g still jumps to the top where it is not a global list
+        a.focus = 0;
+        a.detail_focus = true;
+        press(&mut a, 'g');
+        assert_eq!(a.group, GroupBy::None);
+    }
+
+    #[test]
+    fn w_cycles_the_window_and_searches_pull_request_sections_again() {
+        let _shim = crate::testshim::Shim::new();
+        let mut a = home();
+        a.focus = 0; // Review requested
+        a.panels[0].items = vec![gitem("a/b", 1)];
+        a.panels[0].unloaded = false;
+        a.panels[2].unloaded = false; // Issues: not a pull request search
+        a.panels[2].items = vec![gitem("a/b", 9)];
+        assert_eq!(a.window, config::Window::Week, "7d by default");
+        press(&mut a, 'W');
+        assert_eq!(a.window, config::Window::Month);
+        assert!(
+            a.panels[0].loading && a.panels[0].items.is_empty(),
+            "Review searches again"
+        );
+        assert_eq!(a.panels[2].items.len(), 1, "issues keep their rows");
+        assert!(a.header.contains("PRs: 30d"), "{}", a.header);
+        for _ in 0..3 {
+            press(&mut a, 'W');
+        }
+        assert_eq!(a.window, config::Window::Week, "all, 24h, 7d");
     }
 
     #[test]

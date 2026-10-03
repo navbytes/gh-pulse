@@ -1,4 +1,4 @@
-use crate::app::{App, Hit, Load, Modal, PK};
+use crate::app::{App, GroupBy, Hit, Load, Modal, PK};
 use crate::browse::{self, Browser};
 use crate::config::Act;
 use crate::diff::{self, DLine, DiffMode, Op, Row};
@@ -808,6 +808,13 @@ fn label(app: &App, it: &Item, show_repo: bool, w: usize) -> Line<'static> {
         _ => {}
     }
     let prefixed = matches!(it.kind, Kind::Pr | Kind::Issue);
+    if prefixed && app.global && show_repo {
+        // how long since the last activity, so what has been waiting stands out
+        let age = crate::browse::ago(&it.updated, now_secs());
+        if !age.is_empty() {
+            v.push(Span::styled(format!("{age:>4} "), muted));
+        }
+    }
     let repo = it.repo_display();
     if show_repo && !repo.is_empty() && !prefixed && it.kind != Kind::Repo {
         v.push(Span::styled(format!("{repo} "), muted));
@@ -1168,14 +1175,58 @@ fn panel(f: &mut Frame, app: &App, i: usize, area: Rect, compact: bool) {
         let cur = cur.map(|c| label(app, c, sr, lw)).unwrap_or_default();
         return f.render_widget(Paragraph::new(cur).block(block), area);
     }
-    let list = List::new(items.iter().map(|it| ListItem::new(label(app, it, sr, lw))))
+    let grouped = app.global && app.group != GroupBy::None && p.kind.is_global_search();
+    let cursor = p.cursor.min(items.len() - 1);
+    let (mut rows, mut map, mut sel) = (vec![], vec![], 0);
+    let mut i = 0;
+    while i < items.len() {
+        if grouped {
+            // items of one group are adjacent: one heading with the count and the longest wait
+            let key = app.group.key(items[i]);
+            let n = items[i..]
+                .iter()
+                .take_while(|x| app.group.key(x).eq_ignore_ascii_case(&key))
+                .count();
+            let oldest = items[i..i + n].iter().map(|x| x.updated.as_str()).min();
+            let wait = oldest
+                .map(|u| crate::browse::ago(u, now_secs()))
+                .filter(|a| !a.is_empty())
+                .map(|a| format!("  oldest {a}"))
+                .unwrap_or_default();
+            let name = if key.is_empty() { "(unknown)" } else { &key };
+            rows.push(ListItem::new(Line::from(vec![
+                Span::styled(format!("{name} ({n})"), Style::new().fg(th.accent).bold()),
+                Span::styled(wait, Style::new().fg(th.muted)),
+            ])));
+            map.push(None);
+        }
+        let end = if grouped {
+            let key = app.group.key(items[i]);
+            i + items[i..]
+                .iter()
+                .take_while(|x| app.group.key(x).eq_ignore_ascii_case(&key))
+                .count()
+        } else {
+            items.len()
+        };
+        for (j, it) in items.iter().enumerate().take(end).skip(i) {
+            if j == cursor {
+                sel = rows.len();
+            }
+            rows.push(ListItem::new(label(app, it, sr, lw)));
+            map.push(Some(j));
+        }
+        i = end;
+    }
+    let list = List::new(rows)
         .block(block)
         .highlight_style(Style::new().bg(th.sel_bg).bold());
-    let mut st = ListState::default().with_selected(Some(p.cursor.min(items.len() - 1)));
+    let mut st = ListState::default().with_selected(Some(sel));
     f.render_stateful_widget(list, area, &mut st);
     let mut h = app.hit.borrow_mut();
     h.list = inner;
     h.list_off = st.offset();
+    h.list_rows = if grouped { map } else { vec![] };
 }
 
 fn wrap(s: &str, w: usize) -> Vec<String> {
@@ -2931,6 +2982,61 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
         assert!(a.ctx.is_some(), "in drill-in");
         assert!(!a.global, "no toggle");
         assert_eq!(a.file(), 1, "{}", a.status);
+    }
+
+    #[test]
+    fn grouped_global_lists_show_headings_ages_and_clicks_land_on_items() {
+        use crate::gh::Item;
+        let mut a = crate::app::App::build_start(
+            Some("o/r".into()),
+            true,
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+            crate::config::Config::default(),
+        );
+        let ago = |d: u64| crate::global::iso_utc(crate::rate::now() - d * 86_400);
+        let mk = |n: u64, who: &str, d: u64| {
+            let mut i = Item {
+                number: n,
+                title: format!("title {n}"),
+                repo: "a/b".into(),
+                kind: Kind::Pr,
+                state: "open".into(),
+                ..Default::default()
+            };
+            (i.author.login, i.updated) = (who.into(), ago(d));
+            i
+        };
+        a.panels[0].items = vec![mk(1, "bob", 2), mk(2, "alice", 5), mk(3, "bob", 9)];
+        a.panels[0].unloaded = false;
+        let s = render_app(&a, 100, 30);
+        assert!(
+            s.contains("2d") && s.contains("5d") && s.contains("9d"),
+            "ages\n{s}"
+        );
+        assert!(!s.contains("bob (2)"), "flat by default\n{s}");
+        key(&mut a, KeyCode::Char('g'));
+        let s = render_app(&a, 100, 30);
+        assert!(
+            s.contains("bob (2)  oldest 9d") && s.contains("alice (1)  oldest 5d"),
+            "{s}"
+        );
+        assert!(s.lines().next().unwrap().contains("group: author"), "{s}");
+        // rows: [bob heading, #1, #3, alice heading, #2]; the second heading is not clickable
+        let click = |a: &mut App, row: u16| {
+            let y = a.hit.borrow().list.y + row;
+            let x = a.hit.borrow().list.x + 2;
+            a.on_mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            });
+        };
+        click(&mut a, 4); // alice's #2: the third item in the grouped order
+        assert_eq!(a.panels[0].cursor, 2);
+        click(&mut a, 3); // a heading: nothing moves
+        assert_eq!(a.panels[0].cursor, 2);
     }
 
     #[test]
