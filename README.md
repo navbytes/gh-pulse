@@ -13,7 +13,9 @@ see, gh-pulse can see.
 
 ## Screenshots
 
-Captured from the real binary against public repos (`scripts/screenshots.py`).
+Captured from the real binary against public repos (`scripts/screenshots.py`). They show the repo home; the global
+home (cross-repo review requests, your PRs, issues and repos) uses the same layout with `owner/repo#N` rows and is not
+pictured yet.
 
 ![Split diff with syntax highlighting](docs/img/2-diff-split.png)
 *Zoomed Diff tab (`f`): auto layout picks side-by-side at width, with syntax highlighting and intra-line highlights.*
