@@ -29,6 +29,8 @@ case "$*" in
     pick graphql;;
   *"api notifications"*) pick notifications;;
   *"api user"*) echo octocat; exit 0;;
+  *"search prs"*) pick searchprs;;
+  *"search issues"*) pick searchissues;;
   *"pr list"*) pick prlist;;
   *"issue list"*) pick issuelist;;
   *"run list"*) pick runlist;;
@@ -67,6 +69,7 @@ impl Shim {
         crate::cache::set_dir(Some(dir.join("cache")));
         crate::cache::set_enabled(true);
         crate::gh::set_identity(Some(("github.com".into(), "octocat".into())));
+        crate::state::set_dir(Some(dir.join("state")));
         Shim { dir, _guard: guard }
     }
 
@@ -105,6 +108,7 @@ impl Drop for Shim {
         crate::rate::set_limits(20, 10);
         crate::gh::set_timeout(60);
         crate::gh::clear_identity();
+        crate::state::set_dir(None);
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }

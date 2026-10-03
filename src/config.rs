@@ -960,7 +960,7 @@ mod tests {
         assert_eq!(tabs, [4, 0, 3, 2, 3]);
         assert!(!c.panels.hide_empty);
         // the inbox key is part of the closed key set
-        assert_eq!(Act::ALL.len(), 17);
+        assert_eq!(Act::ALL.len(), 19);
         assert_eq!(
             Keymap::build(&BTreeMap::new()).unwrap().label(Act::Inbox),
             "N"
@@ -1129,5 +1129,103 @@ mod tests {
         save_to(&path, &Config::default()).unwrap();
         assert!(!std::fs::read_to_string(&path).unwrap().contains("api"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ui_start_defaults_to_auto_and_rejects_unknown_modes() {
+        assert_eq!(parse("", "t").unwrap().ui.start, StartMode::Auto);
+        for (v, m) in [
+            ("auto", StartMode::Auto),
+            ("repo", StartMode::Repo),
+            ("global", StartMode::Global),
+        ] {
+            assert_eq!(
+                parse(&format!("[ui]\nstart = \"{v}\"\n"), "t")
+                    .unwrap()
+                    .ui
+                    .start,
+                m
+            );
+        }
+        let e = parse("ascii = true\n[ui]\nstart = \"home\"\n", "cfg").unwrap_err();
+        assert!(
+            e.starts_with("cfg:3:") && e.contains("auto") && e.contains("global"),
+            "{e}"
+        );
+        let e = parse("[ui]\nstat = \"auto\"\n", "cfg").unwrap_err();
+        assert!(e.starts_with("cfg:2:") && e.contains("stat"), "{e}");
+        // a non-default value survives the app's own saves; the default is not written
+        let dir = std::env::temp_dir().join(format!("gh-pulse-ui-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let c = parse("[ui]\nstart = \"global\"\n", "t").unwrap();
+        save_to(&path, &c).unwrap();
+        assert_eq!(load_from(&path).unwrap(), c);
+        save_to(&path, &Config::default()).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("[ui]"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_global_home_panels_are_configurable_and_validated() {
+        use PanelName::*;
+        let g = |c: &Config| -> Vec<PanelName> {
+            c.panels.global_layout().iter().map(|p| p.name).collect()
+        };
+        let c = parse("", "t").unwrap();
+        assert_eq!(
+            g(&c),
+            [Review, Mine, Assigned, Repos],
+            "Involved is off by default"
+        );
+        let tabs: Vec<_> = c
+            .panels
+            .global_layout()
+            .iter()
+            .map(|p| p.tabs.len())
+            .collect();
+        assert_eq!(tabs, [0, 3, 3, 2]);
+        let c = parse(
+            "[panels]\nglobal = [\"repos\", \"involved\", \"review\", \"files\"]\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(g(&c), [Repos, Involved, Review, Files]);
+        // files needs a PR section
+        let c = parse("[panels]\nglobal = [\"assigned\", \"files\"]\n", "t").unwrap();
+        assert_eq!(g(&c), [Assigned]);
+        // repo-mode lists may now include `repos`, but not the global sections (and vice versa)
+        let c = parse("[panels]\nshow = [\"prs\", \"repos\"]\n", "t").unwrap();
+        assert_eq!(
+            c.panels.layout().iter().map(|p| p.name).collect::<Vec<_>>(),
+            [Prs, Repos]
+        );
+        let e = parse("[panels]\nshow = [\"prs\", \"review\"]\n", "cfg").unwrap_err();
+        assert!(
+            e.starts_with("cfg:2:") && e.contains("global-home panel") && e.contains("repos"),
+            "{e}"
+        );
+        let e = parse("[panels]\nglobal = [\"review\", \"actions\"]\n", "cfg").unwrap_err();
+        assert!(
+            e.starts_with("cfg:2:") && e.contains("repo panel") && e.contains("involved"),
+            "{e}"
+        );
+        let e = parse("[panels]\nglobal = [\"mine\", \"mine\"]\n", "cfg").unwrap_err();
+        assert!(e.contains("mine listed twice"), "{e}");
+        let e = parse("[panels]\nglobal = []\n", "cfg").unwrap_err();
+        assert!(e.starts_with("cfg:2:") && e.contains("at least one"), "{e}");
+        let e = parse("[panels]\nglobal = [\"nope\"]\n", "cfg").unwrap_err();
+        assert!(
+            e.starts_with("cfg:2:") && e.contains("nope") && e.contains("review"),
+            "{e}"
+        );
+        // the new actions are part of the closed key set with their defaults
+        let km = Keymap::build(&BTreeMap::new()).unwrap();
+        assert_eq!(
+            (km.label(Act::Scope), km.label(Act::SwitchRepoContext)),
+            ("s".into(), "S".into())
+        );
+        let mut over = BTreeMap::new();
+        over.insert("scope".to_string(), Keys::One("z".into()));
+        assert_eq!(Keymap::build(&over).unwrap().label(Act::Scope), "z");
     }
 }

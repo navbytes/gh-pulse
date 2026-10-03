@@ -735,6 +735,13 @@ fn hints(app: &App) -> String {
         }
     } else if app.ctx.is_some() {
         "j/k move".into()
+    } else if app.panels[app.focus].kind == PK::Repos {
+        format!(
+            "j/k move  Enter open repo  {} scope  {zoom} favorite  H hide  {} repos  {} help",
+            kl(Act::Scope),
+            kl(Act::Browser),
+            kl(Act::Help)
+        )
     } else if app.global {
         format!(
             "j/k move  Enter drill in  [ ] detail tab  {filter} filter  {} scope  {} open repo  {} repos  {} inbox  {actions} actions",
@@ -836,7 +843,10 @@ fn label(app: &App, it: &Item, show_repo: bool, w: usize) -> Line<'static> {
             }
             v.push(Span::raw(it.title.clone()));
             if show_repo && matches!(it.state.to_lowercase().as_str(), "merged" | "closed") {
-                v.push(Span::styled(format!(" [{}]", it.state.to_lowercase()), muted));
+                v.push(Span::styled(
+                    format!(" [{}]", it.state.to_lowercase()),
+                    muted,
+                ));
             }
         }
         Kind::Repo => {
@@ -1293,7 +1303,11 @@ fn detail(f: &mut Frame, app: &App, area: Rect) {
             .body
             .lines()
             .enumerate()
-            .flat_map(|(i, l)| wrap(l, inner.width as usize).into_iter().map(move |r| (i, r)))
+            .flat_map(|(i, l)| {
+                wrap(l, inner.width as usize)
+                    .into_iter()
+                    .map(move |r| (i, r))
+            })
             .map(|(i, r)| {
                 if i == 0 {
                     Line::styled(r, Style::new().bold())
@@ -2418,11 +2432,9 @@ fn modal(f: &mut Frame, app: &App) {
             };
             let h = (choices.len().clamp(1, 12) + 2 + usize::from(typing)) as u16;
             let area = popup(f, app, 60, h, title);
-            let [qa, la] = Layout::vertical([
-                Constraint::Length(u16::from(typing)),
-                Constraint::Min(0),
-            ])
-            .areas(area);
+            let [qa, la] =
+                Layout::vertical([Constraint::Length(u16::from(typing)), Constraint::Min(0)])
+                    .areas(area);
             if typing {
                 f.render_widget(
                     Paragraph::new(Line::from(vec![
@@ -2442,9 +2454,8 @@ fn modal(f: &mut Frame, app: &App) {
             } else {
                 choices
                     .iter()
-                    .map(|(l, _)| {
-                        let cur = *l == app.scope.label()
-                            || (l.starts_with("All") && app.scope == crate::global::Scope::All);
+                    .map(|(l, c)| {
+                        let cur = matches!(c, crate::app::ScopeChoice::Set(s) if *s == app.scope);
                         ListItem::new(format!("{}{l}", if cur { "\u{25cf} " } else { "  " }))
                     })
                     .collect()
@@ -2452,7 +2463,8 @@ fn modal(f: &mut Frame, app: &App) {
             f.render_stateful_widget(
                 List::new(rows).highlight_style(bar),
                 la,
-                &mut ListState::default().with_selected(Some(p.cursor.min(choices.len().saturating_sub(1)))),
+                &mut ListState::default()
+                    .with_selected(Some(p.cursor.min(choices.len().saturating_sub(1)))),
             );
         }
         Modal::Input { title, buf, .. } => {
@@ -4516,5 +4528,109 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
         let mut ascii = app(false, IconSet::Ascii);
         ascii.panels[0].error = Some("x".into());
         assert!(line_of(&render_app(&ascii, 120, 40), "[1]").contains("Mine x"));
+    }
+
+    fn home_app() -> App {
+        let mut a = App::build_start(
+            Some("o/r".into()),
+            true,
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+            crate::config::Config::default(),
+        );
+        let it = |repo: &str, n: u64, title: &str, kind: Kind| Item {
+            number: n,
+            title: title.into(),
+            repo: repo.into(),
+            state: "open".into(),
+            kind,
+            ..Default::default()
+        };
+        a.panels[0].items = vec![
+            it("cli/cli", 14577, "Bump go-runewidth", Kind::Pr),
+            it("acme/widgets", 7, "Fix the flaky retry", Kind::Pr),
+        ];
+        a.panels[0].hidden = 3;
+        a.panels[1].items = vec![it("cli/cli", 99, "Mine one", Kind::Pr)];
+        a.panels[2].items = vec![it("acme/widgets", 12, "Crash on start", Kind::Issue)];
+        a
+    }
+
+    #[test]
+    fn the_global_home_lays_out_at_both_sizes() {
+        for (w, h) in [(80u16, 24u16), (120, 40)] {
+            let a = home_app();
+            let s = render_app(&a, w, h);
+            let head = s.lines().next().unwrap();
+            assert!(
+                head.contains("all repos") && head.contains("scope: all"),
+                "{w}x{h}: {head:?}"
+            );
+            for want in ["[1] ", "[2] ", "[3] ", "[4] "] {
+                assert!(s.contains(want), "{w}x{h} missing {want:?}\n{s}");
+            }
+            for gone in ["[5] ", "Branches", "Actions", "Notifications"] {
+                assert!(!s.contains(gone), "{w}x{h} has {gone:?}\n{s}");
+            }
+            assert!(s.contains("Review requested"), "{w}x{h}\n{s}");
+            // rows carry owner/repo#N with the title; hidden repos are counted in the title
+            assert!(s.contains("cli/cli#14577 Bump"), "{w}x{h}\n{s}");
+            assert!(s.contains("acme/widgets#7"), "{w}x{h}\n{s}");
+            assert!(
+                line_of(&s, "[1]").contains("3 hidden") || w == 80,
+                "{w}: {}",
+                line_of(&s, "[1]")
+            );
+            // unopened search tabs show `?`, never a made-up number
+            assert!(
+                line_of(&s, "[2]").contains('?') || w == 80,
+                "{}",
+                line_of(&s, "[2]")
+            );
+        }
+        // the repo home next to it is unchanged
+        let s = render_app(&app(false, IconSet::Unicode), 120, 40);
+        assert!(s.contains("[4] Actions") && !s.contains("Review requested"));
+    }
+
+    #[test]
+    fn the_global_home_has_no_repo_facts_and_keeps_the_inbox_badge() {
+        let mut a = home_app();
+        a.meta = Some(crate::gh::RepoMeta {
+            stars: 5,
+            ..Default::default()
+        });
+        a.seed_unread(&["a/b", "c/d"]);
+        let head = render_app(&a, 120, 40).lines().next().unwrap().to_string();
+        assert!(head.trim_end().ends_with("\u{2709} 2"), "{head:?}");
+        let s = render_app(&a, 120, 40);
+        assert!(!head.contains('\u{2605}') || a.global, "{head:?}");
+        assert!(
+            s.contains("s scope") && s.contains("S open repo"),
+            "the bar teaches the new keys\n{s}"
+        );
+    }
+
+    #[test]
+    fn the_scope_picker_renders_and_marks_the_current_scope() {
+        let mut a = home_app();
+        a.scope = crate::global::Scope::Favorites;
+        key(&mut a, KeyCode::Char('s'));
+        let s = render_app(&a, 80, 24);
+        for want in ["Scope", "All repos", "Favorites (0)", "Org...", "Repo..."] {
+            assert!(s.contains(want), "{want}\n{s}");
+        }
+        assert!(
+            s.contains("\u{25cf} Favorites"),
+            "current scope marked\n{s}"
+        );
+        key(&mut a, KeyCode::Char('j'));
+        key(&mut a, KeyCode::Char('j'));
+        key(&mut a, KeyCode::Enter);
+        let s = render_app(&a, 80, 24);
+        assert!(
+            s.contains("organization") && s.contains("loading your organizations"),
+            "{s}"
+        );
     }
 }

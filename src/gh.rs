@@ -2694,20 +2694,33 @@ mod tests {
     fn the_local_repo_comes_from_git_remotes_without_an_api_call() {
         let r = |s: &str| repo_from_remotes(s, "github.com");
         assert_eq!(
-            r("origin\thttps://github.com/cli/cli.git (fetch)\norigin\thttps://github.com/cli/cli.git (push)\n"),
+            r(
+                "origin\thttps://github.com/cli/cli.git (fetch)\norigin\thttps://github.com/cli/cli.git (push)\n"
+            ),
             Some("cli/cli".into())
         );
-        assert_eq!(r("origin\tgit@github.com:o/r.git (fetch)\n"), Some("o/r".into()));
-        assert_eq!(r("origin\tssh://git@github.com/o/r (fetch)\n"), Some("o/r".into()));
         assert_eq!(
-            r("up\thttps://github.com/up/stream (fetch)\norigin\thttps://github.com/me/fork (fetch)\n"),
+            r("origin\tgit@github.com:o/r.git (fetch)\n"),
+            Some("o/r".into())
+        );
+        assert_eq!(
+            r("origin\tssh://git@github.com/o/r (fetch)\n"),
+            Some("o/r".into())
+        );
+        assert_eq!(
+            r(
+                "up\thttps://github.com/up/stream (fetch)\norigin\thttps://github.com/me/fork (fetch)\n"
+            ),
             Some("me/fork".into()),
             "origin first"
         );
         assert_eq!(r("origin\thttps://gitlab.com/o/r (fetch)\n"), None);
         assert_eq!(r("origin\thttps://github.com/o/r/extra (fetch)\n"), None);
         assert_eq!(r(""), None);
-        assert_eq!(repo_from_remotes("origin\thttps://ghe.corp/o/r (fetch)\n", "ghe.corp"), Some("o/r".into()));
+        assert_eq!(
+            repo_from_remotes("origin\thttps://ghe.corp/o/r (fetch)\n", "ghe.corp"),
+            Some("o/r".into())
+        );
     }
 
     #[cfg(unix)]
@@ -3518,8 +3531,8 @@ mod tests {
             (3, 1),
             (4, 0),
         ] {
-            let items = list(&repo, panel, tab, true)
-                .unwrap_or_else(|e| panic!("list {panel}/{tab}: {e}"));
+            let items =
+                list(&repo, panel, tab, true).unwrap_or_else(|e| panic!("list {panel}/{tab}: {e}"));
             println!("list {panel}/{tab}: {} items", items.len());
             for it in items.iter().take(2) {
                 for t in tabs(it.kind) {

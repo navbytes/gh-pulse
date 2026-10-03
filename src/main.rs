@@ -117,11 +117,7 @@ fn main() -> std::io::Result<()> {
     let start = start::decide(
         mode,
         repo.clone(),
-        || {
-            gh::in_git_repo()
-                .then(|| gh::repo_here().ok())
-                .flatten()
-        },
+        || gh::in_git_repo().then(|| gh::repo_here().ok()).flatten(),
         gh::local_repo,
     )
     .unwrap_or_else(|e| die(&e));

@@ -168,9 +168,22 @@ impl Viewed {
     }
 }
 
+#[cfg(test)]
+static DIR_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Tests point the state directory at a temp directory instead of the user's.
+#[cfg(test)]
+pub fn set_dir(p: Option<PathBuf>) {
+    *DIR_OVERRIDE.lock().unwrap() = p;
+}
+
 /// The state directory (`$XDG_STATE_HOME/gh-pulse`, default `~/.local/state/gh-pulse`); only absolute
 /// paths are honored.
 pub fn dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(d) = DIR_OVERRIDE.lock().unwrap().clone() {
+        return Some(d);
+    }
     let abs = |k: &str| {
         std::env::var_os(k)
             .map(PathBuf::from)
@@ -250,7 +263,10 @@ impl Recent {
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        write_private_atomic(path, &serde_json::to_string(self).map_err(|e| e.to_string())?)
+        write_private_atomic(
+            path,
+            &serde_json::to_string(self).map_err(|e| e.to_string())?,
+        )
     }
 }
 
@@ -260,7 +276,8 @@ pub fn valid_repo(s: &str) -> bool {
     let ok = |p: &str| {
         !p.is_empty()
             && p.len() <= 100
-            && p.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+            && p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
     };
     s.split_once('/')
         .is_some_and(|(o, n)| ok(o) && ok(n) && !n.contains('/'))
@@ -285,7 +302,13 @@ mod tests_recent {
         r.touch("O/R20");
         assert_eq!(r.repos.len(), RECENT_MAX);
         assert_eq!(r.repos[0], "O/R20");
-        assert_eq!(r.repos.iter().filter(|x| x.eq_ignore_ascii_case("o/r20")).count(), 1);
+        assert_eq!(
+            r.repos
+                .iter()
+                .filter(|x| x.eq_ignore_ascii_case("o/r20"))
+                .count(),
+            1
+        );
         assert_eq!(r.repos[1], "o/r24");
     }
 
@@ -298,7 +321,10 @@ mod tests_recent {
         let mut r = Recent::new("github.com");
         r.touch("o/a");
         r.save(&p).unwrap();
-        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert_eq!(Recent::load(&p, "github.com"), r);
         assert!(
             Recent::load(&p, "ghe.example.com").repos.is_empty(),
@@ -307,12 +333,19 @@ mod tests_recent {
         // no temp files left behind; a second save replaces the first
         r.touch("o/b");
         r.save(&p).unwrap();
-        let names: Vec<_> = std::fs::read_dir(&d).unwrap().map(|e| e.unwrap().file_name()).collect();
+        let names: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
         assert_eq!(names.len(), 1, "{names:?}");
         // corrupt or hostile content is ignored
         std::fs::write(&p, "{ not json").unwrap();
         assert!(Recent::load(&p, "github.com").repos.is_empty());
-        std::fs::write(&p, r#"{"host":"github.com","repos":["o/ok","a b/c","../x/y","o/r --repo=z"]}"#).unwrap();
+        std::fs::write(
+            &p,
+            r#"{"host":"github.com","repos":["o/ok","a b/c","../x/y","o/r --repo=z"]}"#,
+        )
+        .unwrap();
         assert_eq!(Recent::load(&p, "github.com").repos, ["o/ok"]);
         // a symlink where the file should be is not read
         let target = d.join("elsewhere.json");
@@ -333,7 +366,17 @@ mod tests_recent {
         for ok in ["cli/cli", "a-b/c_d.e", "o/r"] {
             assert!(valid_repo(ok), "{ok}");
         }
-        for bad in ["", "cli", "a/b/c", "a b/c", "o/r label:bug", "o/", "/r", "o/r\n", "o/r;x"] {
+        for bad in [
+            "",
+            "cli",
+            "a/b/c",
+            "a b/c",
+            "o/r label:bug",
+            "o/",
+            "/r",
+            "o/r\n",
+            "o/r;x",
+        ] {
             assert!(!valid_repo(bad), "{bad:?}");
         }
     }

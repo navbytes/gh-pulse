@@ -17,9 +17,7 @@ pub enum Scope {
 
 /// A GitHub login or organization name.
 pub fn valid_owner(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 39
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    !s.is_empty() && s.len() <= 39 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 impl Scope {
@@ -271,7 +269,12 @@ pub fn orgs() -> Result<Vec<String>, String> {
 
 /// The Repos panel's rows: favorites (config order) or recent repos, with what the cached repo list
 /// knows about them (no API call).
-pub fn repo_items(names: &[String], known: &[RepoRow], favorites: &ReposCfg, now: i64) -> Vec<Item> {
+pub fn repo_items(
+    names: &[String],
+    known: &[RepoRow],
+    favorites: &ReposCfg,
+    now: i64,
+) -> Vec<Item> {
     names
         .iter()
         .filter(|n| valid_repo(n))
@@ -288,19 +291,32 @@ pub fn repo_items(names: &[String], known: &[RepoRow], favorites: &ReposCfg, now
                 if !r.pushed.is_empty() {
                     facts.push(crate::browse::ago(&r.pushed, now));
                 }
-                card.push(format!("visibility    {}", if r.private { "private" } else { "public" }));
+                card.push(format!(
+                    "visibility    {}",
+                    if r.private { "private" } else { "public" }
+                ));
                 if !r.lang.is_empty() {
                     card.push(format!("language      {}", r.lang));
                 }
                 card.push(format!("stars         {}", r.stars));
                 card.push(format!("open PRs      {}", r.prs));
                 card.push(format!("open issues   {}", r.issues));
-                card.push(format!("last push     {}", crate::browse::ago(&r.pushed, now)));
+                card.push(format!(
+                    "last push     {}",
+                    crate::browse::ago(&r.pushed, now)
+                ));
             } else {
                 card.push("(not in your cached repo list yet: open the repo browser, B)".into());
             }
             card.push(String::new());
-            card.push(format!("favorite      {}", if fav { "yes (f toggles)" } else { "no (f adds)" }));
+            card.push(format!(
+                "favorite      {}",
+                if fav {
+                    "yes (f toggles)"
+                } else {
+                    "no (f adds)"
+                }
+            ));
             card.push("Enter  open this repo   s  scope the global view to it   H  hide".into());
             Item {
                 title: name.clone(),
@@ -330,8 +346,16 @@ mod tests {
             assert_eq!(Scope::parse(s).unwrap().key(), s);
         }
         for bad in [
-            "", "org:", "org:a b", "org:a/b", "repo:cli", "repo:a/b c", "repo:a/b label:x",
-            "team:x", "all:", "ORG:cli",
+            "",
+            "org:",
+            "org:a b",
+            "org:a/b",
+            "repo:cli",
+            "repo:a/b c",
+            "repo:a/b label:x",
+            "team:x",
+            "all:",
+            "ORG:cli",
         ] {
             assert!(Scope::parse(bad).is_none(), "{bad:?} must not parse");
         }
@@ -345,23 +369,43 @@ mod tests {
         assert_eq!(left, 0);
         assert_eq!(c[2], ["repo:o/r8", "repo:o/r9"]);
         let (c, left) = scope_chunks(&Scope::Favorites, &favs(21));
-        assert_eq!((c.len(), left), (4, 5), "16 searched, 5 reported as not shown");
+        assert_eq!(
+            (c.len(), left),
+            (4, 5),
+            "16 searched, 5 reported as not shown"
+        );
         assert!(c.iter().all(|x| x.len() <= FAV_CHUNK));
         // config junk never reaches a query
-        let junk = vec!["o/ok".to_string(), "a b/c".into(), "o/r label:bug".into(), "nope".into()];
+        let junk = vec![
+            "o/ok".to_string(),
+            "a b/c".into(),
+            "o/r label:bug".into(),
+            "nope".into(),
+        ];
         let (c, left) = scope_chunks(&Scope::Favorites, &junk);
         assert_eq!((c, left), (vec![vec!["repo:o/ok".to_string()]], 0));
         assert_eq!(scope_chunks(&Scope::Favorites, &[]).0.len(), 0);
         assert_eq!(scope_chunks(&Scope::All, &[]), (vec![vec![]], 0));
-        assert_eq!(scope_chunks(&Scope::Org("cli".into()), &[]).0, [["org:cli"]]);
-        assert_eq!(scope_chunks(&Scope::Repo("a/b".into()), &[]).0, [["repo:a/b"]]);
+        assert_eq!(
+            scope_chunks(&Scope::Org("cli".into()), &[]).0,
+            [["org:cli"]]
+        );
+        assert_eq!(
+            scope_chunks(&Scope::Repo("a/b".into()), &[]).0,
+            [["repo:a/b"]]
+        );
     }
 
     #[test]
     fn section_searches_have_exact_arguments() {
         let one = |sec, tab, scope: &Scope, favs: &[String]| {
             let (c, n) = calls(sec, tab, scope, favs, 100);
-            (c.into_iter().map(|(k, a)| (k, a.join(" "))).collect::<Vec<_>>(), n)
+            (
+                c.into_iter()
+                    .map(|(k, a)| (k, a.join(" ")))
+                    .collect::<Vec<_>>(),
+                n,
+            )
         };
         let (c, _) = one(Section::Review, 0, &Scope::All, &[]);
         assert_eq!(c.len(), 1);
@@ -371,12 +415,26 @@ mod tests {
             "search prs --limit=100 --json number,title,url,state,isDraft,author,labels,body,repository,updatedAt --sort=updated --order=desc -- review-requested:@me is:open archived:false"
         );
         let (c, _) = one(Section::MyPrs, 1, &Scope::Org("cli".into()), &[]);
-        assert!(c[0].1.ends_with("-- author:@me is:merged archived:false org:cli"), "{}", c[0].1);
+        assert!(
+            c[0].1
+                .ends_with("-- author:@me is:merged archived:false org:cli"),
+            "{}",
+            c[0].1
+        );
         let (c, _) = one(Section::MyPrs, 2, &Scope::Repo("cli/cli".into()), &[]);
-        assert!(c[0].1.ends_with("-- author:@me is:closed is:unmerged archived:false repo:cli/cli"));
+        assert!(
+            c[0].1
+                .ends_with("-- author:@me is:closed is:unmerged archived:false repo:cli/cli")
+        );
         let (c, _) = one(Section::Assigned, 0, &Scope::All, &[]);
-        assert_eq!((c[0].0, c[0].1.starts_with("search issues ")), (Kind::Issue, true));
-        assert!(c[0].1.contains("--json number,title,url,state,author,labels,body,repository,updatedAt"));
+        assert_eq!(
+            (c[0].0, c[0].1.starts_with("search issues ")),
+            (Kind::Issue, true)
+        );
+        assert!(
+            c[0].1
+                .contains("--json number,title,url,state,author,labels,body,repository,updatedAt")
+        );
         assert!(c[0].1.ends_with("-- assignee:@me is:open archived:false"));
         let (c, _) = one(Section::Assigned, 2, &Scope::All, &[]);
         assert!(c[0].1.ends_with("-- mentions:@me is:open archived:false"));
@@ -385,7 +443,9 @@ mod tests {
         assert_eq!(c.len(), 4, "2 searches x 2 chunks");
         assert_eq!(n, 0);
         assert!(c[0].1.starts_with("search prs ") && c[2].1.starts_with("search issues "));
-        assert!(c[0].1.ends_with("-- involves:@me is:open archived:false repo:o/r0 repo:o/r1 repo:o/r2 repo:o/r3"));
+        assert!(c[0].1.ends_with(
+            "-- involves:@me is:open archived:false repo:o/r0 repo:o/r1 repo:o/r2 repo:o/r3"
+        ));
         assert!(c[1].1.ends_with("repo:o/r4 repo:o/r5"));
         // values only ever follow `--`, so a repo or org name can't become a flag
         for (_, a) in &c {
@@ -419,7 +479,11 @@ mod tests {
             hidden: vec!["O/Noisy".into()],
             ..Default::default()
         };
-        let items = vec![item("o/noisy", 1, ""), item("o/ok", 2, ""), item("o/noisy", 3, "")];
+        let items = vec![
+            item("o/noisy", 1, ""),
+            item("o/ok", 2, ""),
+            item("o/noisy", 3, ""),
+        ];
         let (kept, dropped) = without_hidden(items, &cfg);
         assert_eq!((kept.len(), dropped), (1, 2));
         assert_eq!(kept[0].repo, "o/ok");
@@ -443,9 +507,136 @@ mod tests {
         let rows = repo_items(&names, &known, &cfg, 1_800_000_000);
         assert_eq!(rows.len(), 2, "invalid names are skipped");
         assert_eq!((rows[0].state.as_str(), rows[0].kind), ("fav", Kind::Repo));
-        assert!(rows[0].meta.starts_with("private \u{b7} Go"), "{}", rows[0].meta);
+        assert!(
+            rows[0].meta.starts_with("private \u{b7} Go"),
+            "{}",
+            rows[0].meta
+        );
         assert!(rows[0].body.contains("stars         7"));
         assert!(rows[1].meta.is_empty() && rows[1].body.contains("not in your cached repo list"));
         assert_eq!(rows[1].state, "");
+    }
+
+    #[cfg(unix)]
+    fn search_json(repos: &[(&str, u64)]) -> String {
+        let rows: Vec<String> = repos
+            .iter()
+            .map(|(r, n)| {
+                format!(
+                    r#"{{"number":{n},"title":"t{n}","url":"https://github.com/{r}/pull/{n}","state":"open","isDraft":false,"author":{{"login":"a"}},"labels":[],"body":"","repository":{{"nameWithOwner":"{r}"}},"updatedAt":"2026-01-{:02}T00:00:00Z"}}"#,
+                    n % 28 + 1
+                )
+            })
+            .collect();
+        format!("[{}]", rows.join(","))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_section_runs_one_search_per_scope_chunk_with_exact_arguments() {
+        let shim = crate::testshim::Shim::new();
+        shim.set("searchprs.out", &search_json(&[("a/b", 1), ("c/d", 2)]));
+        let l = fetch_section(
+            Section::Review,
+            0,
+            &Scope::Favorites,
+            &favs(6),
+            &ReposCfg::default(),
+        )
+        .unwrap();
+        let calls = shim.calls();
+        assert_eq!(calls.len(), 2, "6 favorites: chunks of 4 and 2: {calls:?}");
+        let head = "search prs --limit=100 --json number,title,url,state,isDraft,author,labels,body,repository,updatedAt --sort=updated --order=desc -- review-requested:@me is:open archived:false";
+        assert_eq!(
+            calls[0],
+            format!("{head} repo:o/r0 repo:o/r1 repo:o/r2 repo:o/r3")
+        );
+        assert_eq!(calls[1], format!("{head} repo:o/r4 repo:o/r5"));
+        // the same two rows came back for both chunks: merged to one list, newest first
+        assert_eq!(l.items.len(), 2);
+        assert_eq!((l.hidden, l.not_shown), (0, 0));
+        assert!(l.items[0].updated >= l.items[1].updated);
+        assert_eq!(l.items[0].repo.split('/').count(), 2);
+        // 21 favorites: 16 searched in 4 calls, 5 reported as left out
+        shim.clear("calls.log");
+        let l = fetch_section(
+            Section::Review,
+            0,
+            &Scope::Favorites,
+            &favs(21),
+            &ReposCfg::default(),
+        )
+        .unwrap();
+        assert_eq!((shim.calls().len(), l.not_shown), (4, 5));
+        // no favorites: no search at all
+        shim.clear("calls.log");
+        let l = fetch_section(
+            Section::Review,
+            0,
+            &Scope::Favorites,
+            &[],
+            &ReposCfg::default(),
+        )
+        .unwrap();
+        assert!(shim.calls().is_empty() && l.items.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_list_the_hidden_filter_emptied_is_topped_up_once() {
+        let shim = crate::testshim::Shim::new();
+        let mut rows: Vec<(&str, u64)> = (0..95).map(|i| ("noisy/bot", i)).collect();
+        rows.extend((0..5).map(|i| ("keep/me", 1000 + i)));
+        shim.set("searchprs.out", &search_json(&rows));
+        let cfg = ReposCfg {
+            hidden: vec!["noisy/bot".into()],
+            ..Default::default()
+        };
+        let l = fetch_section(Section::MyPrs, 0, &Scope::All, &[], &cfg).unwrap();
+        let calls = shim.calls();
+        assert_eq!(
+            calls.len(),
+            2,
+            "a full page that mostly vanished is asked for again: {calls:?}"
+        );
+        assert!(calls[0].contains("--limit=100") && calls[1].contains("--limit=200"));
+        assert!(calls[1].ends_with("-- author:@me is:open archived:false"));
+        assert_eq!((l.items.len(), l.hidden), (5, 95));
+        // enough visible rows, or a page that wasn't full: one search
+        shim.clear("calls.log");
+        let l = fetch_section(Section::MyPrs, 0, &Scope::All, &[], &ReposCfg::default()).unwrap();
+        assert_eq!((shim.calls().len(), l.hidden), (1, 0));
+        shim.clear("calls.log");
+        shim.set(
+            "searchprs.out",
+            &search_json(&[("noisy/bot", 1), ("keep/me", 2)]),
+        );
+        let l = fetch_section(Section::MyPrs, 0, &Scope::All, &[], &cfg).unwrap();
+        assert_eq!((shim.calls().len(), l.items.len(), l.hidden), (1, 1, 1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn involved_asks_for_prs_and_issues_and_a_failure_is_an_error_not_a_blank() {
+        let shim = crate::testshim::Shim::new();
+        shim.set("searchprs.out", &search_json(&[("a/b", 1)]));
+        shim.set("searchissues.out", "[]");
+        let l = fetch_section(
+            Section::Involved,
+            0,
+            &Scope::Org("cli".into()),
+            &[],
+            &ReposCfg::default(),
+        )
+        .unwrap();
+        let c = shim.calls();
+        assert_eq!(c.len(), 2);
+        assert!(c[0].starts_with("search prs") && c[1].starts_with("search issues"));
+        assert!(c[1].ends_with("-- involves:@me is:open archived:false org:cli"));
+        assert_eq!(l.items[0].kind, Kind::Pr);
+        shim.set("searchprs.err", "HTTP 422: Validation Failed");
+        assert!(
+            fetch_section(Section::Involved, 0, &Scope::All, &[], &ReposCfg::default()).is_err()
+        );
     }
 }

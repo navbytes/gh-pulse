@@ -823,7 +823,11 @@ impl App {
             } else {
                 format!(" {repo_name}")
             },
-            repo: if global { String::new() } else { repo_name.clone() },
+            repo: if global {
+                String::new()
+            } else {
+                repo_name.clone()
+            },
             meta: None,
             panels,
             counts: HashMap::new(),
@@ -902,6 +906,9 @@ impl App {
             .iter()
             .position(|p| p.kind.is_pr_list())
             .unwrap_or(0);
+        if global {
+            app.rebuild_header();
+        }
         if load {
             rate::set_limits(app.cfg.api.low_quota_percent, app.cfg.api.pause_percent);
             crate::cache::set_enabled(app.cfg.api.cache);
@@ -1335,12 +1342,23 @@ impl App {
             self.cfg.repos.clone(),
         );
         // the search API allows 30 requests a minute: say so before spending one when it is nearly gone
-        if self.rate.search.is_some_and(|b| b.remaining < 5 && rate::now() < b.reset) {
+        if self
+            .rate
+            .search
+            .is_some_and(|b| b.remaining < 5 && rate::now() < b.reset)
+        {
             self.status = format!(
                 "search quota low ({} left): this list may be slow to load",
                 self.rate.search.map_or(0, |b| b.remaining)
             );
-        } else if scope == Scope::Favorites && !self.cfg.repos.favorites.iter().any(|f| crate::state::valid_repo(f)) {
+        } else if scope == Scope::Favorites
+            && !self
+                .cfg
+                .repos
+                .favorites
+                .iter()
+                .any(|f| crate::state::valid_repo(f))
+        {
             self.status = "no favorites yet: press f on a repo in the Repos panel".into();
         }
         let (tx, tx2) = (self.tx.clone(), self.tx.clone());
@@ -1735,7 +1753,9 @@ impl App {
                     }
                 }
                 Msg::Orgs(res) => match res {
-                    Ok(v) => self.orgs = Some(v),
+                    Ok(v) => {
+                        self.orgs = Some(v.into_iter().filter(|o| global::valid_owner(o)).collect())
+                    }
                     Err(e) => {
                         self.orgs = Some(vec![]);
                         self.status = format!("could not list your organizations: {e}");
@@ -2109,6 +2129,20 @@ impl App {
     /// Count of tab `ti` of panel `i`: live for the showing tab, as fetched for the others.
     pub fn tab_count(&self, i: usize, ti: usize) -> Option<(usize, bool)> {
         let p = &self.panels[i];
+        // the Repos panel is local: both of its counts are known without asking anyone
+        if p.kind == PK::Repos {
+            let n = match p.tabs.get(ti)?.id {
+                0 => self
+                    .cfg
+                    .repos
+                    .favorites
+                    .iter()
+                    .filter(|f| crate::state::valid_repo(f))
+                    .count(),
+                _ => self.recent.repos.len(),
+            };
+            return Some((n, false));
+        }
         if ti == p.tab {
             self.active_count(i)
         } else {
@@ -2778,7 +2812,9 @@ impl App {
                     // Derived panels and drill-in: G is "last row" like End; say why it isn't the toggle.
                     self.nav(isize::MAX);
                     if !self.detail_focus && self.log.is_none() {
-                        self.status = "G jumps to the last row here; the global home toggles from the lists".into();
+                        self.status =
+                            "G jumps to the last row here; the global home toggles from the lists"
+                                .into();
                     }
                 } else {
                     self.status = "the global home toggles from the lists".into();
@@ -2786,7 +2822,10 @@ impl App {
             }
             Act::Scope => {
                 if self.on_repo_row() {
-                    let r = self.selected_in(self.focus).map(|i| i.repo.clone()).unwrap_or_default();
+                    let r = self
+                        .selected_in(self.focus)
+                        .map(|i| i.repo.clone())
+                        .unwrap_or_default();
                     self.set_scope(Scope::Repo(r));
                     if !self.global {
                         self.toggle_home();
@@ -2798,7 +2837,9 @@ impl App {
                         query: String::new(),
                     }));
                 } else {
-                    self.status = "scope narrows the global home: press G, or s on a repo in the Repos panel".into();
+                    self.status =
+                        "scope narrows the global home: press G, or s on a repo in the Repos panel"
+                            .into();
                 }
             }
             Act::SwitchRepoContext => {
@@ -2923,9 +2964,15 @@ impl App {
         if it.number == 0 {
             return self.open_url(it.url);
         }
-        self.inbox = None;
         // from the global home (or another repo) the item's repo becomes the app's repo first
-        if self.global || !it.repo.eq_ignore_ascii_case(&self.repo) {
+        let switch = self.global || !it.repo.eq_ignore_ascii_case(&self.repo);
+        if !switch && self.panel_idx(pk).is_none() {
+            self.status =
+                "that panel is hidden in [panels]; press o to open it in the browser".into();
+            return;
+        }
+        self.inbox = None;
+        if switch {
             self.go_repo(it.repo.clone());
         }
         let Some(idx) = self.panel_idx(pk) else {
@@ -2992,8 +3039,10 @@ impl App {
         for (i, p) in self.panels.iter_mut().enumerate() {
             p.cursor = 0;
             // REST-backed panels are looked at again before they are fetched again
-            p.unloaded = i != focus && !matches!(p.kind, PK::Prs | PK::Issues | PK::Files);
+            p.unloaded =
+                i != focus && !matches!(p.kind, PK::Prs | PK::Issues | PK::Files | PK::Repos);
         }
+        self.refresh_repos_panels();
         self.reset_view();
         self.spawn_header();
         self.reload(false);
@@ -3023,7 +3072,11 @@ impl App {
             (true, true) => build_global_panels(&self.cfg.panels),
             (true, false) => build_panels(&self.cfg.panels),
         };
-        self.focus = if built { 0 } else { side.focus.min(self.panels.len() - 1) };
+        self.focus = if built {
+            0
+        } else {
+            side.focus.min(self.panels.len() - 1)
+        };
         self.repo = side.repo;
         self.meta = side.meta;
         self.counts = side.counts;
@@ -3032,7 +3085,10 @@ impl App {
         self.filter = side.filter;
         self.from_global = side.from_global;
         self.pr_src = if built {
-            self.panels.iter().position(|p| p.kind.is_pr_list()).unwrap_or(0)
+            self.panels
+                .iter()
+                .position(|p| p.kind.is_pr_list())
+                .unwrap_or(0)
         } else {
             side.pr_src
         };
@@ -3264,16 +3320,22 @@ impl App {
         let Some(r) = self.selected_in(self.focus).map(|i| i.repo.clone()) else {
             return;
         };
+        let before = self.cfg.repos.clone();
         let on = self.cfg.repos.toggle_fav(&r);
-        if self.save_cfg() {
-            self.status = format!("{} {r} {} favorites", if on { "added" } else { "removed" }, if on { "to" } else { "from" });
-            self.refresh_repos_panels();
-            if self.scope == Scope::Favorites {
-                let s = self.scope.clone();
-                self.set_scope(s);
-            }
+        if !self.save_cfg() {
+            self.cfg.repos = before; // refused: keep memory and file in agreement
+            return;
+        }
+        let (verb, prep) = if on {
+            ("added", "to")
         } else {
-            self.cfg.repos.toggle_fav(&r); // refused: keep memory and file in agreement
+            ("removed", "from")
+        };
+        self.status = format!("{verb} {r} {prep} favorites");
+        self.refresh_repos_panels();
+        if self.scope == Scope::Favorites {
+            let s = self.scope.clone();
+            self.set_scope(s);
         }
     }
 
@@ -3282,14 +3344,15 @@ impl App {
         let Some(r) = self.selected_in(self.focus).map(|i| i.repo.clone()) else {
             return;
         };
+        let before = self.cfg.repos.clone();
         let on = self.cfg.repos.toggle_hidden(&r);
-        if self.save_cfg() {
-            self.status = format!("{} {r}", if on { "hidden:" } else { "unhidden:" });
-            let s = self.scope.clone();
-            self.set_scope(s); // sections filter on load
-        } else {
-            self.cfg.repos.toggle_hidden(&r);
+        if !self.save_cfg() {
+            self.cfg.repos = before;
+            return;
         }
+        self.status = format!("{} {r}", if on { "hidden:" } else { "unhidden:" });
+        let s = self.scope.clone();
+        self.set_scope(s); // sections filter on load
     }
 
     fn refresh_repos_panels(&mut self) {
@@ -3314,7 +3377,12 @@ impl App {
         if let Some(k) = &key {
             self.cache.retain(|(ik, _), _| ik != k);
         }
-        if self.ctx.is_none() && self.panels[self.focus].source().is_some() {
+        let k = self.panels[self.focus].kind;
+        if self.ctx.is_none()
+            && (self.panels[self.focus].source().is_some()
+                || k.is_global_search()
+                || k == PK::Repos)
+        {
             self.load_panel(self.focus, true);
         }
         self.status = match key {
@@ -4899,5 +4967,594 @@ mod tests {
         // a reload forgets the failure
         a.reload(false);
         assert!(a.count_failed.is_empty());
+    }
+
+    fn gitem(repo: &str, n: u64) -> Item {
+        Item {
+            number: n,
+            title: format!("{repo} item {n}"),
+            repo: repo.into(),
+            state: "open".into(),
+            kind: Kind::Pr,
+            url: format!("https://github.com/{repo}/pull/{n}"),
+            ..Default::default()
+        }
+    }
+
+    /// The global home, with `o/r` as the repo `G` leads to; nothing is fetched.
+    fn home() -> App {
+        let mut a = App::build_start(
+            Some("o/r".into()),
+            true,
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+            Config::default(),
+        );
+        a.panels[0].items = vec![gitem("a/b", 1), gitem("c/d", 2), gitem("e/f", 3)];
+        a
+    }
+
+    fn press(a: &mut App, c: char) {
+        a.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn the_global_home_has_its_own_panels_and_header() {
+        let a = home();
+        assert!(a.global);
+        let kinds: Vec<_> = a.panels.iter().map(|p| p.kind).collect();
+        assert_eq!(kinds, [PK::Review, PK::MyPrs, PK::Assigned, PK::Repos]);
+        assert!(
+            a.header.contains("all repos") && a.header.contains("scope: all"),
+            "{}",
+            a.header
+        );
+        assert!(
+            !a.header.contains("o/r"),
+            "no repo facts in the global header"
+        );
+        // sections are searches: never counted in the background
+        assert!(a.panels.iter().take(3).all(|p| p.kind.is_global_search()));
+        assert!(!a.count_wanted(1, 1) && !a.count_wanted(2, 2));
+    }
+
+    #[test]
+    fn g_swaps_homes_and_each_remembers_its_cursor_tab_and_focus() {
+        let mut a = home();
+        a.panels[0].cursor = 2;
+        press(&mut a, '2'); // My PRs
+        press(&mut a, '}'); // its Merged tab
+        a.panels[1].items = vec![gitem("a/b", 9)];
+        assert_eq!((a.focus, a.panels[1].tab), (1, 1));
+        press(&mut a, 'G');
+        assert!(!a.global);
+        assert_eq!(a.repo, "o/r");
+        assert_eq!(a.panels[0].kind, PK::Prs);
+        assert!(
+            a.header.contains("o/r") && a.header.contains("branch"),
+            "{}",
+            a.header
+        );
+        a.panels[0].items = vec![gitem("o/r", 1), gitem("o/r", 2)];
+        a.panels[0].cursor = 1;
+        press(&mut a, '3'); // Issues
+        press(&mut a, 'G');
+        assert!(a.global);
+        assert_eq!(
+            (a.focus, a.panels[1].tab, a.panels[0].cursor),
+            (1, 1, 2),
+            "global as it was left"
+        );
+        assert_eq!(a.panels[1].items.len(), 1);
+        press(&mut a, 'G');
+        assert_eq!(
+            (a.focus, a.panels[0].cursor),
+            (2, 1),
+            "and the repo as it was left"
+        );
+        assert_eq!(a.panels[0].items.len(), 2);
+    }
+
+    #[test]
+    fn without_a_repo_there_is_nothing_for_g_to_lead_to() {
+        let mut a = App::build_start(
+            None,
+            true,
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+            Config::default(),
+        );
+        press(&mut a, 'G');
+        assert!(a.global && a.status.contains("no repo yet"), "{}", a.status);
+        // but an item's repo can be opened, and then G leads back
+        a.panels[0].items = vec![gitem("x/y", 4)];
+        press(&mut a, 'S');
+        assert!(!a.global && a.repo == "x/y" && a.from_global);
+        assert!(a.header.contains("all repos \u{203a} x/y"), "{}", a.header);
+        press(&mut a, 'G');
+        assert!(a.global && a.panels[0].items.len() == 1);
+    }
+
+    #[test]
+    fn s_in_a_repo_explains_and_s_in_the_home_opens_the_picker() {
+        let mut a = App::with(
+            "o/r".into(),
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+        );
+        press(&mut a, 's');
+        assert!(
+            a.modal.is_none() && a.status.contains("global home"),
+            "{}",
+            a.status
+        );
+        let mut h = home();
+        press(&mut h, 's');
+        assert!(matches!(h.modal, Some(Modal::Scope(_))));
+    }
+
+    #[test]
+    fn the_scope_picker_sets_persists_and_reloads_the_sections() {
+        let dir = std::env::temp_dir().join(format!("gh-pulse-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut a = home();
+        a.state_dir = Some(dir.clone());
+        a.cfg.repos.favorites = vec!["a/b".into()];
+        let saved = || crate::state::load_scope(&dir.join("scope.json"));
+        // Favorites
+        press(&mut a, 's');
+        press(&mut a, 'j');
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(a.modal.is_none() && a.scope == Scope::Favorites);
+        assert_eq!(saved().as_deref(), Some("favorites"));
+        assert!(a.header.contains("scope: favorites"));
+        assert!(
+            a.panels[0].loading && a.panels[0].items.is_empty(),
+            "the focused section reloads"
+        );
+        assert!(
+            a.panels[1].unloaded && a.panels[2].unloaded,
+            "the others when focused"
+        );
+        // Org: the list arrives from a message, typing filters it
+        press(&mut a, 's');
+        for _ in 0..2 {
+            a.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        a.tx.send(Msg::Orgs(Ok(vec![
+            "cli".into(),
+            "acme".into(),
+            "bad name".into(),
+        ])))
+        .unwrap();
+        a.poll();
+        let Some(Modal::Scope(p)) = &a.modal else {
+            panic!("still picking")
+        };
+        assert_eq!(p.stage, ScopeStage::Orgs);
+        press(&mut a, 'a');
+        let Some(Modal::Scope(p)) = &a.modal else {
+            panic!()
+        };
+        let names: Vec<_> = a.scope_choices(p).into_iter().map(|c| c.0).collect();
+        assert_eq!(names, ["acme"], "filtered by the typed text");
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(a.scope, Scope::Org("acme".into()));
+        assert_eq!(saved().as_deref(), Some("org:acme"));
+        // Repo: a typed owner/name is accepted; junk is not offered
+        press(&mut a, 's');
+        for _ in 0..3 {
+            a.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        for c in "x/y z".chars() {
+            press(&mut a, c);
+        }
+        let Some(Modal::Scope(p)) = &a.modal else {
+            panic!()
+        };
+        assert!(
+            a.scope_choices(p)
+                .iter()
+                .all(|c| !matches!(&c.1, ScopeChoice::Set(Scope::Repo(r)) if r.contains(' ')))
+        );
+        a.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        a.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(a.scope, Scope::Repo("x/y".into()));
+        assert_eq!(saved().as_deref(), Some("repo:x/y"));
+        assert!(a.header.contains("scope: repo:x/y"));
+        // Esc closes without changing anything
+        press(&mut a, 's');
+        a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(a.modal.is_none() && a.scope == Scope::Repo("x/y".into()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drilling_into_a_pr_keeps_the_global_context() {
+        let mut a = home();
+        a.panels[0].cursor = 1;
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(a.ctx.is_some() && a.global, "drill-in inside the home");
+        assert_eq!(a.ctx.as_ref().unwrap().pr.repo, "c/d");
+        a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(a.ctx.is_none() && a.global);
+        assert_eq!(
+            (a.focus, a.panels[0].cursor),
+            (0, 1),
+            "back at the same row"
+        );
+    }
+
+    #[test]
+    fn hidden_repos_are_counted_in_the_section_not_listed() {
+        let mut a = home();
+        a.panels[0].seq = 4;
+        a.tx.send(Msg::GMeta(PK::Review, 4, 3, 0)).unwrap();
+        a.tx.send(Msg::GMeta(PK::Review, 3, 99, 0)).unwrap(); // a stale answer
+        a.poll();
+        assert_eq!(a.panels[0].hidden, 3);
+        a.tx.send(Msg::GMeta(PK::Review, 4, 0, 5)).unwrap();
+        a.poll();
+        assert!(a.status.contains("+5 favorites not shown"), "{}", a.status);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detail_calls_for_a_row_of_the_home_carry_that_rows_repo() {
+        let shim = crate::testshim::Shim::new();
+        let mut a = home();
+        a.net = true;
+        a.panels[0].items = vec![gitem("other/repo", 7)];
+        a.last_input = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        a.ensure();
+        a.ensure(); // the Overview waits a tick
+        wait(&mut a, "the calls", |_| {
+            let c = shim.calls();
+            c.iter()
+                .any(|x| x.starts_with("pr view 7 -R other/repo --json isDraft"))
+                && c.iter()
+                    .any(|x| x.contains("pr view 7 -R other/repo --json headRefOid"))
+        });
+        assert!(
+            shim.calls()
+                .iter()
+                .filter(|c| c.starts_with("pr "))
+                .all(|c| c.contains("-R other/repo")),
+            "{:?}",
+            shim.calls()
+        );
+        // and the actions carry it too
+        let acts = crate::act::actions(a.selected(), 0, "", &a.sel());
+        let approve = acts
+            .iter()
+            .find(|x| x.label.starts_with("Approve"))
+            .unwrap();
+        assert_eq!(
+            &(approve.build)("")[..],
+            ["gh", "pr", "review", "7", "-R", "other/repo", "--approve"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_global_start_searches_only_the_focused_section_and_the_rest_on_focus() {
+        let shim = crate::testshim::Shim::new();
+        shim.set("searchprs.out", "[]");
+        shim.set("searchissues.out", "[]");
+        let mut a = App::build_start(
+            None,
+            true,
+            Theme::new(false, IconSet::Unicode, true),
+            true,
+            Config::default(),
+        );
+        wait(&mut a, "the first section", |a| !a.panels[0].loading);
+        let searches = |s: &crate::testshim::Shim| {
+            s.calls()
+                .into_iter()
+                .filter(|c| c.starts_with("search "))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(searches(&shim).len(), 1, "{:?}", shim.calls());
+        assert!(searches(&shim)[0].contains("review-requested:@me"));
+        assert!(
+            a.user == "octocat" && a.header.contains("user: octocat"),
+            "{}",
+            a.header
+        );
+        assert!(
+            !shim
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("repo view") || c.starts_with("api user")),
+            "no repo lookups: {:?}",
+            shim.calls()
+        );
+        press(&mut a, '3'); // Issues -> a search on first focus
+        wait(&mut a, "the third section", |a| !a.panels[2].loading);
+        assert_eq!(searches(&shim).len(), 2);
+        assert!(
+            searches(&shim)[1].starts_with("search issues")
+                && searches(&shim)[1].contains("assignee:@me")
+        );
+        // no background counting or polling of searches, however long it idles
+        for _ in 0..5 {
+            a.last_input = std::time::Instant::now() - std::time::Duration::from_secs(10);
+            a.ensure();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(searches(&shim).len(), 2);
+        // a changed scope reloads the focused section only
+        a.set_scope(Scope::Org("cli".into()));
+        wait(&mut a, "reload", |a| !a.panels[2].loading);
+        assert_eq!(searches(&shim).len(), 3);
+        assert!(searches(&shim)[2].ends_with("org:cli"));
+    }
+
+    #[test]
+    fn the_files_panel_follows_the_pr_list_you_were_last_in() {
+        let cfg = config::parse(
+            "[panels]\nglobal = [\"review\", \"mine\", \"files\"]\n",
+            "t",
+        )
+        .unwrap();
+        let mut a = App::build_start(
+            None,
+            true,
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+            cfg,
+        );
+        a.panels[0].items = vec![gitem("a/b", 1)];
+        a.panels[1].items = vec![gitem("c/d", 2), gitem("c/d", 3)];
+        assert_eq!(
+            a.pr_item().map(|i| i.number),
+            Some(1),
+            "the first PR list until you go elsewhere"
+        );
+        press(&mut a, '2');
+        a.panels[1].cursor = 1;
+        press(&mut a, '3'); // Files
+        assert_eq!(a.panels[a.focus].kind, PK::Files);
+        assert_eq!(
+            a.pr_item().map(|i| (i.repo.as_str(), i.number)),
+            Some(("c/d", 3))
+        );
+        // an issue row is not a PR: nothing for Files to show
+        let cfg = config::parse(
+            "[panels]\nglobal = [\"assigned\", \"review\", \"files\"]\n",
+            "t",
+        )
+        .unwrap();
+        let mut b = App::build_start(
+            None,
+            true,
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+            cfg,
+        );
+        b.panels[0].items = vec![Item {
+            kind: Kind::Issue,
+            ..gitem("a/b", 5)
+        }];
+        assert!(b.pr_item().is_none());
+    }
+
+    fn repo_row(name: &str, private: bool, lang: &str) -> RepoRow {
+        RepoRow {
+            name: name.into(),
+            owner: name.split('/').next().unwrap().into(),
+            private,
+            lang: lang.into(),
+            stars: 3,
+            pushed: "2026-01-01T00:00:00Z".into(),
+            ..Default::default()
+        }
+    }
+
+    /// The home with a config file to save to, favorites and recent repos, and a state directory.
+    fn repos_home(tag: &str) -> (App, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("gh-pulse-repos-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = home();
+        a.cfg_path = Some(dir.join("config.toml"));
+        a.state_dir = Some(dir.clone());
+        a.cfg.repos.favorites = vec!["a/b".into(), "c/d".into()];
+        a.recent.repos = vec!["e/f".into(), "a/b".into(), "g/h".into()];
+        a.refresh_repos_panels();
+        (a, dir)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_repos_panel_lists_favorites_and_recent_from_local_data_only() {
+        let shim = crate::testshim::Shim::new();
+        let store = crate::cache::Store::default_if_enabled().unwrap();
+        let c = CachedRepos {
+            host: "github.com".into(),
+            viewer: "octocat".into(),
+            rows: vec![repo_row("a/b", true, "Go")],
+            truncated: false,
+        };
+        store
+            .write(&repos_key("github.com", "octocat"), &c, rate::now())
+            .unwrap();
+        let (mut a, dir) = repos_home("local");
+        assert_eq!(a.panels[3].kind, PK::Repos);
+        let names = |a: &App| {
+            a.panels[3]
+                .items
+                .iter()
+                .map(|i| i.repo.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&a), ["a/b", "c/d"]);
+        assert_eq!(a.panels[3].items[0].state, "fav");
+        assert!(
+            a.panels[3].items[0].meta.starts_with("private \u{b7} Go"),
+            "{}",
+            a.panels[3].items[0].meta
+        );
+        assert!(
+            a.panels[3].items[1].meta.is_empty(),
+            "nothing is looked up for repos the cache doesn't know"
+        );
+        press(&mut a, '4');
+        press(&mut a, '}');
+        assert_eq!(names(&a), ["e/f", "a/b", "g/h"], "Recent, newest first");
+        assert_eq!(
+            a.panels[3].items[1].state, "fav",
+            "a favorite is starred in Recent too"
+        );
+        // both counts are known at once (title: Fav 2 / Rec 3)
+        assert_eq!(
+            (a.tab_count(3, 0), a.tab_count(3, 1)),
+            (Some((2, false)), Some((3, false)))
+        );
+        assert!(
+            shim.calls().is_empty(),
+            "no gh process for any of it: {:?}",
+            shim.calls()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enter_on_a_repo_opens_it_and_records_it_as_recent() {
+        let (mut a, dir) = repos_home("enter");
+        press(&mut a, '4');
+        a.panels[3].cursor = 1; // c/d
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!a.global && a.repo == "c/d" && a.from_global);
+        assert_eq!(a.recent.repos[0], "c/d");
+        let text = std::fs::read_to_string(dir.join("recent.json")).unwrap();
+        assert!(
+            text.contains("\"c/d\"")
+                && text.contains("github.com")
+                && !text.to_lowercase().contains("token"),
+            "{text}"
+        );
+        // S does the same from any row of the home
+        press(&mut a, 'G');
+        press(&mut a, '1');
+        press(&mut a, 'S');
+        assert_eq!(a.repo, "a/b", "the selected PR's repo");
+        assert_eq!(a.recent.repos[..2], ["a/b".to_string(), "c/d".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f_toggles_a_favorite_h_hides_and_s_scopes_the_home_to_a_repo() {
+        let (mut a, dir) = repos_home("keys");
+        press(&mut a, '4');
+        // f: the same favorites list the browser edits, saved to the config file
+        press(&mut a, 'f');
+        assert_eq!(a.cfg.repos.favorites, ["c/d"], "a/b was a favorite");
+        assert!(
+            std::fs::read_to_string(dir.join("config.toml"))
+                .unwrap()
+                .contains("c/d")
+        );
+        assert_eq!(a.panels[3].items.len(), 1);
+        assert!(
+            a.status.contains("removed a/b from favorites"),
+            "{}",
+            a.status
+        );
+        a.panels[3].tab = 1;
+        a.refresh_repos_panels();
+        a.panels[3].cursor = 0; // e/f
+        press(&mut a, 'f');
+        assert!(a.cfg.repos.is_fav("e/f"), "adding from Recent");
+        // H: hidden everywhere; the sections are searched again without it
+        a.panels[0].unloaded = false;
+        press(&mut a, 'H');
+        assert!(a.cfg.repos.is_hidden("e/f"));
+        assert!(
+            a.panels[0].unloaded,
+            "the sections reload when next focused"
+        );
+        // s: scope the home to that repo
+        a.panels[3].cursor = 1; // a/b
+        press(&mut a, 's');
+        assert!(
+            a.global && a.scope == Scope::Repo("a/b".into()),
+            "{:?}",
+            a.scope
+        );
+        assert!(a.header.contains("scope: repo:a/b"));
+        assert_eq!(
+            crate::state::load_scope(&dir.join("scope.json")).as_deref(),
+            Some("repo:a/b")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refused_config_save_leaves_favorites_alone() {
+        let (mut a, dir) = repos_home("refused");
+        std::fs::write(dir.join("config.toml"), "ascii = [broken\n").unwrap();
+        press(&mut a, '4');
+        press(&mut a, 'f');
+        assert_eq!(
+            a.cfg.repos.favorites,
+            ["a/b", "c/d"],
+            "memory and file agree"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_repos_panel_can_be_added_to_the_repo_layout_but_is_not_there_by_default() {
+        let a = App::with(
+            "o/r".into(),
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+        );
+        assert!(a.panels.iter().all(|p| p.kind != PK::Repos));
+        let cfg = config::parse("[panels]\nshow = [\"prs\", \"repos\"]\n", "t").unwrap();
+        let mut b = App::build(
+            "o/r".into(),
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+            cfg,
+        );
+        b.cfg.repos.favorites = vec!["x/y".into()];
+        b.refresh_repos_panels();
+        assert_eq!(b.panels[1].kind, PK::Repos);
+        press(&mut b, '2');
+        b.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            b.repo, "x/y",
+            "Enter switches the repo, right where you are"
+        );
+        assert!(!b.global && !b.from_global);
+    }
+
+    #[test]
+    fn an_inbox_item_opens_its_repo_from_the_global_home() {
+        let mut a = home();
+        let mut n = gitem("x/y", 9);
+        n.cmd = "77".into();
+        a.seed_inbox(vec![n]);
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(a.inbox.is_none() && !a.global && a.repo == "x/y" && a.from_global);
+        assert_eq!(a.pending_select, Some((PK::Prs, 9, "x/y".into())));
+    }
+
+    #[test]
+    fn r_reloads_the_focused_global_section_and_the_repos_panel() {
+        let mut a = home();
+        a.panels[0].seq = 3;
+        press(&mut a, 'r');
+        assert!(a.panels[0].loading && a.panels[0].seq == 4);
+        press(&mut a, '4');
+        a.cfg.repos.favorites = vec!["a/b".into()];
+        press(&mut a, 'r');
+        assert_eq!(a.panels[3].items.len(), 1, "the local list is rebuilt");
     }
 }

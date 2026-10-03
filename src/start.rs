@@ -67,19 +67,37 @@ mod tests {
     fn start_decision_table() {
         use StartMode::*;
         let repo = |r: &str| Ok(Start::Repo(r.into()));
-        let global = |r: Option<&str>| Ok(Start::Global { repo: r.map(String::from) });
+        let global = |r: Option<&str>| {
+            Ok(Start::Global {
+                repo: r.map(String::from),
+            })
+        };
         // auto: a flag or a clone means the repo; otherwise the global home, never an error
-        assert_eq!(run(Auto, Some("o/r"), Some("x/y"), None), (repo("o/r"), 0, 0), "-R wins, no lookup");
+        assert_eq!(
+            run(Auto, Some("o/r"), Some("x/y"), None),
+            (repo("o/r"), 0, 0),
+            "-R wins, no lookup"
+        );
         assert_eq!(run(Auto, None, Some("x/y"), None), (repo("x/y"), 1, 0));
-        assert_eq!(run(Auto, None, None, Some("never/used")), (global(None), 1, 0));
+        assert_eq!(
+            run(Auto, None, None, Some("never/used")),
+            (global(None), 1, 0)
+        );
         // repo: like today; outside a clone it is an error
         assert_eq!(run(Repo, Some("o/r"), None, None), (repo("o/r"), 0, 0));
         assert_eq!(run(Repo, None, Some("x/y"), None), (repo("x/y"), 1, 0));
         let (e, _, _) = run(Repo, None, None, None);
         assert_eq!(e, Err(NOT_A_REPO.to_string()));
         // global: always the home, even in a clone or with -R; the repo is only the context for G
-        assert_eq!(run(Global, None, Some("x/y"), Some("x/y")), (global(Some("x/y")), 0, 1), "no API lookup");
-        assert_eq!(run(Global, Some("o/r"), Some("x/y"), Some("x/y")), (global(Some("o/r")), 0, 0));
+        assert_eq!(
+            run(Global, None, Some("x/y"), Some("x/y")),
+            (global(Some("x/y")), 0, 1),
+            "no API lookup"
+        );
+        assert_eq!(
+            run(Global, Some("o/r"), Some("x/y"), Some("x/y")),
+            (global(Some("o/r")), 0, 0)
+        );
         assert_eq!(run(Global, None, None, None), (global(None), 0, 1));
     }
 
