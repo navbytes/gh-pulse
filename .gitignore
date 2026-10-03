@@ -3,3 +3,5 @@ target/
 docs/img/*.svg
 *-E
 *.orig
+calls.log
+env.log
