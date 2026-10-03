@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.3.0] - Unreleased
+## [0.3.0]
 
 ### Changed
 - Renamed the project and GitHub CLI extension from gh-pulse (`gh pulse`) to gh-tui (`gh tui`).
@@ -12,7 +12,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Compatibility
 - Existing gh-pulse XDG directories continue to be used for reads and writes when the new directories are absent. Files are not moved or deleted automatically.
-- Whether `gh extension upgrade pulse` follows the repository redirect must be verified with the published release.
+- `gh extension upgrade pulse` was verified with GitHub CLI 2.100.0 on macOS arm64 against the published v0.3.0 release. It keeps the old `gh pulse` command; install the new extension for `gh tui`.
 
 ## [0.2.0]
 
