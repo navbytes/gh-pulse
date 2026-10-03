@@ -805,7 +805,9 @@ impl App {
         (app.keys, app.cfg_path) = (keys, config::path());
         let (viewed, warn) = Viewed::load(crate::state::path());
         app.viewed = viewed;
-        app.status = warn.unwrap_or_default();
+        if let Some(w) = warn {
+            app.status = w;
+        }
         app
     }
 
@@ -945,7 +947,11 @@ impl App {
                     .and_then(|s| Scope::parse(&s))
                     .unwrap_or(Scope::All);
                 app.recent = crate::state::Recent::load(&d.join("recent.json"), &gh::host());
-                app.state_dir = Some(d);
+                // an existing directory of ours is tightened to 0700 now; a foreign or linked one is refused
+                match crate::cache::ensure_dir(&d) {
+                    Ok(()) => app.state_dir = Some(d),
+                    Err(e) => app.status = format!("state not saved: {e}"),
+                }
             }
             if app.global {
                 app.load_global_side();
@@ -1942,7 +1948,7 @@ impl App {
         if self.last_more.is_some_and(|t| t.elapsed() < gh::PAGE_GAP) {
             return;
         }
-        let Some(it) = self.selected().cloned() else {
+        let Some(it) = self.selected().cloned().filter(Item::repo_ok) else {
             return;
         };
         let key = (it.key(), Tab::Comments);
@@ -2001,6 +2007,15 @@ impl App {
             return;
         }
         let key = (it.key(), tab);
+        // a repo name that isn't plain owner/name is shown (neutralized) but never sent to gh
+        if !it.repo_ok() {
+            self.cache.entry(key).or_insert_with(|| {
+                Load::Done(Err(
+                    "this repo's name looks unsafe: not contacting GitHub for it".into(),
+                ))
+            });
+            return;
+        }
         // added to what queued jobs still want right away; the set is replaced (never cleared first)
         // when the tick ends, so a job can't be judged stale in between
         self.want_now.insert(key.clone());
@@ -2786,6 +2801,10 @@ impl App {
 
     /// `filter` narrows to matching actions and jumps straight in when only one matches.
     fn open_menu(&mut self, filter: Option<&str>) {
+        if self.selected().is_some_and(|i| !i.repo_ok()) {
+            self.status = "this repo's name looks unsafe: actions are disabled for it".into();
+            return;
+        }
         let mut items = act::actions(
             self.selected(),
             self.panels[self.focus].source().map_or(99, |s| s.0),
@@ -3094,10 +3113,13 @@ impl App {
                 }
             }
             Out::Hide(r) => {
+                let before = self.cfg.repos.clone();
                 let on = self.cfg.repos.toggle_hidden(&r);
-                self.status = format!("{} {r}", if on { "hidden:" } else { "unhidden:" });
-                if !self.save_cfg() {
-                    self.cfg.repos.toggle_hidden(&r);
+                if self.save_cfg() {
+                    self.status = format!("{} {r}", if on { "hidden:" } else { "unhidden:" });
+                    self.hidden_changed(&r, on);
+                } else {
+                    self.cfg.repos = before;
                 }
             }
         }
@@ -3441,12 +3463,19 @@ impl App {
             return;
         }
         self.status = format!("{} {r}", if on { "hidden:" } else { "unhidden:" });
-        if on {
-            // already-loaded sections just lose the rows (no search to spend)
+        self.hidden_changed(&r, on);
+    }
+
+    /// The hidden list changed (here or in the repo browser): loaded sections lose a newly hidden
+    /// repo's rows in memory (no search spent). An unhidden repo's rows were filtered out of what we
+    /// hold, so the sections are searched again - the focused one now, the rest when focused - and
+    /// the quota check in `load_global` decides whether that may happen yet.
+    fn hidden_changed(&mut self, r: &str, now_hidden: bool) {
+        if now_hidden {
             let drop_rows = |panels: &mut Vec<Panel>| {
                 for p in panels.iter_mut().filter(|p| p.kind.is_global_search()) {
                     let before = p.items.len();
-                    p.items.retain(|i| !i.repo.eq_ignore_ascii_case(&r));
+                    p.items.retain(|i| !i.repo.eq_ignore_ascii_case(r));
                     p.hidden += before - p.items.len();
                     p.cursor = p.cursor.min(p.items.len().saturating_sub(1));
                 }
@@ -3457,7 +3486,6 @@ impl App {
             }
             self.reset_view();
         } else {
-            // the rows that were left out are gone from the lists: ask again, when next looked at
             let s = self.scope.clone();
             self.set_scope(s);
         }
@@ -3469,6 +3497,17 @@ impl App {
                 self.load_repos_panel(i);
             }
         }
+    }
+
+    /// The favorites scope is on but there is nothing to search for.
+    pub fn favorites_missing(&self) -> bool {
+        self.scope == Scope::Favorites
+            && !self
+                .cfg
+                .repos
+                .favorites
+                .iter()
+                .any(|f| crate::state::valid_repo(f))
     }
 
     /// The selected row is a repo in the Repos panel (list focus).
@@ -3936,6 +3975,9 @@ impl App {
 
     fn checkout(&mut self) {
         match self.selected() {
+            Some(it) if !it.repo_ok() => {
+                self.status = "this repo's name looks unsafe: not checking it out".into()
+            }
             Some(it) if it.kind == Kind::Pr => {
                 let (repo, n) = (it.repo.clone(), it.number);
                 self.bg(move || gh::checkout(&repo, n));
@@ -5942,5 +5984,168 @@ mod tests {
         .unwrap();
         a.poll();
         assert!(a.status.contains("1 of 4 searches failed"), "{}", a.status);
+    }
+
+    /// A repo browser with one hidden repo under the cursor, ready for `H`.
+    fn browser_on(a: &mut App, name: &str) {
+        let mut b = Browser::new();
+        b.rows = vec![RepoRow {
+            name: name.into(),
+            owner: "e".into(),
+            ..Default::default()
+        }];
+        (b.typing, b.loading, b.show_hidden) = (false, false, true);
+        a.browser = Some(b);
+    }
+
+    #[test]
+    fn unhiding_in_the_browser_refreshes_the_global_sections_and_hiding_trims_them() {
+        let dir = std::env::temp_dir().join(format!("gh-pulse-unhide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = home();
+        a.cfg_path = Some(dir.join("config.toml"));
+        a.cfg.repos.hidden = vec!["e/f".into()];
+        a.panels[0].items = vec![gitem("a/b", 1)];
+        (a.panels[0].hidden, a.panels[1].unloaded) = (1, false);
+        a.panels[1].items = vec![gitem("a/b", 2)];
+        browser_on(&mut a, "e/f");
+        press(&mut a, 'H'); // unhide
+        assert!(!a.cfg.repos.is_hidden("e/f"));
+        assert!(
+            a.panels[0].loading && a.panels[0].items.is_empty(),
+            "the focused section searches again"
+        );
+        assert_eq!(a.panels[0].hidden, 0, "the stale \"1 hidden\" is gone");
+        assert!(
+            a.panels[1].unloaded && a.panels[1].items.is_empty(),
+            "the others when next focused"
+        );
+        // hide it again: rows of that repo vanish in memory, the count follows, nothing is searched
+        a.panels[0].loading = false;
+        a.panels[0].items = vec![gitem("e/f", 5), gitem("a/b", 1)];
+        let seq = a.panels[0].seq;
+        browser_on(&mut a, "e/f");
+        press(&mut a, 'H');
+        assert!(a.cfg.repos.is_hidden("e/f"));
+        assert_eq!(a.panels[0].items.len(), 1);
+        assert_eq!(
+            (a.panels[0].hidden, a.panels[0].seq, a.panels[0].loading),
+            (1, seq, false)
+        );
+        // a refused config save changes nothing
+        std::fs::write(dir.join("config.toml"), "ascii = [broken\n").unwrap();
+        browser_on(&mut a, "e/f");
+        press(&mut a, 'H');
+        assert!(a.cfg.repos.is_hidden("e/f") && a.panels[0].items.len() == 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_repo_name_that_is_not_plain_owner_name_is_shown_neutralized_and_never_used() {
+        let hostile = "ev\u{202e}il/re\u{200b}po\u{2066}";
+        let mut a = home();
+        a.panels[0].items = vec![gitem(hostile, 7)];
+        let it = a.selected().unwrap().clone();
+        assert!(!it.repo_ok());
+        let shown = it.repo_display();
+        assert!(
+            shown.contains("<U+202E>") && shown.contains("<U+200B>") && shown.contains("<U+2066>"),
+            "{shown}"
+        );
+        assert!(!shown.contains('\u{202e}'));
+        // actions: none, with a reason; the menu key, approve/merge shortcuts, checkout, comments paging
+        assert!(crate::act::actions(Some(&it), 0, "", &a.sel()).is_empty());
+        press(&mut a, 'x');
+        assert!(
+            a.modal.is_none() && a.status.contains("unsafe"),
+            "{}",
+            a.status
+        );
+        a.status.clear();
+        press(&mut a, 'a');
+        assert!(a.modal.is_none() && a.status.contains("unsafe"));
+        press(&mut a, 'c');
+        assert!(a.status.contains("unsafe"), "{}", a.status);
+        // `S` refuses it too
+        a.status.clear();
+        press(&mut a, 'S');
+        assert!(a.global, "still in the home: {}", a.status);
+        // and nothing is fetched for it: the detail says why
+        a.net = true;
+        a.want_prev.insert((it.key(), Tab::Overview));
+        a.last_input = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        a.fetch(it.clone(), Tab::Overview);
+        assert!(
+            matches!(a.cache.get(&(it.key(), Tab::Overview)), Some(Load::Done(Err(e))) if e.contains("unsafe"))
+        );
+        // a well-formed one is fine
+        assert!(gitem("cli/cli", 1).repo_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nothing_is_sent_to_gh_for_an_unsafe_repo_name() {
+        let shim = crate::testshim::Shim::new();
+        let mut a = home();
+        a.net = true;
+        a.panels[0].items = vec![gitem("--repo=evil/x", 3), gitem("../..", 4)];
+        a.last_input = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        for _ in 0..3 {
+            a.ensure();
+            a.poll();
+        }
+        a.panels[0].cursor = 1;
+        for _ in 0..3 {
+            a.ensure();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            shim.calls()
+                .iter()
+                .all(|c| !c.contains("evil") && !c.contains("pr view") && !c.contains("pr diff")),
+            "{:?}",
+            shim.calls()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_loose_state_directory_is_tightened_at_start_and_a_linked_one_refused() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let shim = crate::testshim::Shim::new();
+        shim.set("searchprs.out", "[]");
+        let state = shim.dir.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let a = App::build_start(
+            None,
+            true,
+            Theme::new(false, IconSet::Unicode, true),
+            true,
+            Config::default(),
+        );
+        let mode = std::fs::metadata(&state).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "tightened because it is ours");
+        assert!(a.state_dir.is_some());
+        // a symlink where the directory should be: refused, with a notice, and nothing is saved there
+        let target = shim.dir.join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = shim.dir.join("linked-state");
+        symlink(&target, &link).unwrap();
+        crate::state::set_dir(Some(link));
+        let b = App::build_start(
+            None,
+            true,
+            Theme::new(false, IconSet::Unicode, true),
+            true,
+            Config::default(),
+        );
+        assert!(
+            b.state_dir.is_none() && b.status.starts_with("state not saved:"),
+            "{}",
+            b.status
+        );
+        assert!(std::fs::read_dir(&target).unwrap().next().is_none());
     }
 }

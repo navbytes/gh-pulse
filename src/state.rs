@@ -156,15 +156,9 @@ impl Viewed {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        let dir = path.parent().ok_or("bad state path")?;
-        std::fs::create_dir_all(dir).map_err(|e| format!("viewed marks not saved: {e}"))?;
         let body = serde_json::to_string_pretty(&self.map).map_err(|e| e.to_string())?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, body).map_err(|e| format!("viewed marks not saved: {e}"))?;
-        std::fs::rename(&tmp, path).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("viewed marks not saved: {e}")
-        })
+        // the same private directory and 0600 file as the other state files
+        write_private_atomic(path, &body).map_err(|e| format!("viewed marks not saved: {e}"))
     }
 }
 
@@ -403,6 +397,28 @@ mod tests_recent {
         assert!(crate::cache::read_nofollow(&link).is_none(), "a symlink");
         assert!(crate::cache::read_nofollow(&d).is_none(), "a directory");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn viewed_marks_are_saved_privately_like_the_other_state_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let d = tmp("viewed");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = d.join("viewed.json");
+        let (mut v, _) = Viewed::load(Some(path.clone()));
+        v.toggle("o/r#1", "sha", "a.rs").unwrap();
+        assert_eq!(
+            mode(&d),
+            0o700,
+            "an existing loose directory of ours is tightened"
+        );
+        assert_eq!(mode(&path), 0o600);
+        let (v2, _) = Viewed::load(Some(path));
+        assert!(v2.is_viewed("o/r#1", "sha", "a.rs"));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

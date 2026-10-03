@@ -133,6 +133,10 @@ searching is ignored; if some favorites chunks fail the others' rows still show,
 search queries (scope, favorites, recent) are held to a strict `owner/name` form (no `.`/`..` parts, no leading `-`).
 `[repos] favorites` and `hidden` are plain `owner/name` lists with no host: they apply to whichever host you run
 against (`GH_HOST`), while `scope.json` and `recent.json` remember their host and are ignored on another one.
+Hiding a repo (repo browser `H`, or `H` in the Repos panel) drops its rows from the loaded sections at once; unhiding
+searches the sections again (the focused one now, the others when focused, subject to the search quota). One-line
+fields from GitHub (titles, names, labels) show line breaks and tabs as a single space; repo names that are not plain
+`owner/name` are shown neutralized and never passed to `gh` (their actions are disabled).
 The `repos` panel (Favorites from `[repos] favorites`, Recent from `recent.json`) can also be listed in `[panels] show`
 for the repo home; it makes no API calls (details come from the cached repo list).
 

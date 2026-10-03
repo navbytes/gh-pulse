@@ -484,7 +484,7 @@ fn inbox_view(f: &mut Frame, app: &App, area: Rect) {
         ListItem::new(Line::from(vec![
             Span::styled(format!("{} ", th.ic.unread), Style::new().fg(th.accent)),
             Span::styled(format!("{what:<5} "), muted),
-            Span::styled(format!("{} ", it.repo), muted),
+            Span::styled(format!("{} ", it.repo_display()), muted),
             Span::styled(num, muted),
             Span::raw(it.title.clone()),
             Span::styled(format!("  {reason}"), muted),
@@ -737,10 +737,9 @@ fn hints(app: &App) -> String {
         "j/k move".into()
     } else if app.panels[app.focus].kind == PK::Repos {
         format!(
-            "j/k move  Enter open repo  {} scope  {zoom} favorite  H hide  {} repos  {} help",
+            "j/k move  Enter open repo  {} scope  {zoom} favorite  H hide  {} repos",
             kl(Act::Scope),
-            kl(Act::Browser),
-            kl(Act::Help)
+            kl(Act::Browser)
         )
     } else if app.global {
         format!(
@@ -824,13 +823,14 @@ fn label(app: &App, it: &Item, show_repo: bool, w: usize) -> Line<'static> {
         _ => {}
     }
     let prefixed = matches!(it.kind, Kind::Pr | Kind::Issue);
-    if show_repo && !it.repo.is_empty() && !prefixed {
-        v.push(Span::styled(format!("{} ", it.repo), muted));
+    let repo = it.repo_display();
+    if show_repo && !repo.is_empty() && !prefixed {
+        v.push(Span::styled(format!("{repo} "), muted));
     }
     match it.kind {
         Kind::Pr | Kind::Issue => {
             // `owner/repo#N` with the owner dimmed, when rows from several repos share a list
-            match it.repo.split_once('/').filter(|_| show_repo) {
+            match repo.split_once('/').filter(|_| show_repo) {
                 Some((owner, name)) => {
                     v.push(Span::styled(format!("{owner}/"), muted));
                     v.push(Span::raw(name.to_string()));
@@ -850,7 +850,7 @@ fn label(app: &App, it: &Item, show_repo: bool, w: usize) -> Line<'static> {
             }
         }
         Kind::Repo => {
-            let (owner, name) = it.repo.split_once('/').unwrap_or(("", &it.repo));
+            let (owner, name) = repo.split_once('/').unwrap_or(("", &repo));
             let star = if it.state == "fav" { th.ic.star } else { " " };
             v.push(Span::styled(format!("{star} "), Style::new().fg(th.warn)));
             v.push(Span::styled(format!("{owner}/"), muted));
@@ -1033,7 +1033,9 @@ fn simple_title(app: &App, i: usize, with_tab: bool, short_name: Option<bool>) -
         (_, Some((n, true))) => format!("({n}+)"),
         (_, Some((n, false))) => format!("({n})"),
         (_, None) if app.tab_failed(i, p.tab) => format!("({})", th.ic.fail),
-        (_, None) => format!("({})", th.ic.ell),
+        // `…` while a count is on its way, `?` when it is only fetched once the tab is opened
+        (_, None) if app.count_wanted(i, p.tab) => format!("({})", th.ic.ell),
+        (_, None) => "(?)".to_string(),
     };
     let note = if with_tab && short_name == Some(false) {
         extra_note(app, i, false)
@@ -1136,6 +1138,9 @@ fn panel(f: &mut Frame, app: &App, i: usize, area: Rect, compact: bool) {
             None if p.kind.derived() && app.pr_item().is_none() => {
                 Note::Empty("select a pull request")
             }
+            None if p.kind.is_global_search() && app.favorites_missing() => Note::Empty(
+                "No favorites yet \u{2014} press f in the Repos panel or B (repo browser) to add some",
+            ),
             None => Note::Empty(match p.kind {
                 PK::Files => "no files",
                 PK::Commits => "no commits",
@@ -1144,7 +1149,12 @@ fn panel(f: &mut Frame, app: &App, i: usize, area: Rect, compact: bool) {
                 _ => "nothing here",
             }),
         };
-        return f.render_widget(Paragraph::new(note(app, n)).block(block), area);
+        return f.render_widget(
+            Paragraph::new(note(app, n))
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .block(block),
+            area,
+        );
     };
     let sr = app.global || p.kind == PK::Notifs;
     let lw = inner.width as usize;
@@ -1795,7 +1805,7 @@ fn overview(
         String::new()
     };
     v.push(Line::from(vec![
-        Span::styled(format!("{}{id}  ", it.repo), muted),
+        Span::styled(format!("{}{id}  ", it.repo_display()), muted),
         Span::styled(
             format!("[{state}]"),
             Style::new().fg(state_color(th, &state)),
@@ -4634,5 +4644,93 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
             s.contains("organization") && s.contains("loading your organizations"),
             "{s}"
         );
+    }
+
+    #[test]
+    fn the_repos_panel_bar_names_help_once() {
+        for global in [true, false] {
+            let mut a = if global {
+                home_app()
+            } else {
+                let cfg =
+                    crate::config::parse("[panels]\nshow = [\"prs\", \"repos\"]\n", "t").unwrap();
+                App::build(
+                    "o/r".into(),
+                    Theme::new(false, IconSet::Unicode, true),
+                    false,
+                    cfg,
+                )
+            };
+            key(&mut a, KeyCode::Char(if global { '4' } else { '2' }));
+            let s = render_app(&a, 120, 30);
+            let bar = s.lines().last().unwrap();
+            assert_eq!(bar.matches("help").count(), 1, "global={global}: {bar:?}");
+            assert!(
+                bar.contains("Enter open repo") && bar.contains("H hide"),
+                "{bar:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_favorites_scope_without_favorites_says_what_to_do() {
+        let mut a = home_app();
+        a.scope = crate::global::Scope::Favorites;
+        a.panels[0].items.clear();
+        let s = render_app(&a, 120, 40);
+        assert!(
+            s.contains("No favorites yet") && s.contains("(repo browser) to add some"),
+            "wrapped, not cut off\n{s}"
+        );
+        a.cfg.repos.favorites = vec!["a/b".into()];
+        let s = render_app(&a, 120, 40);
+        assert!(s.contains("nothing here") && !s.contains("No favorites yet"));
+    }
+
+    #[test]
+    fn an_unopened_search_tab_reads_the_same_at_every_width() {
+        for (w, h) in [(80u16, 24u16), (120, 40)] {
+            let mut a = home_app();
+            a.panels[1].items.clear();
+            a.panels[1].unloaded = true;
+            let t = line_of(&render_app(&a, w, h), "[2]");
+            assert!(t.contains('?') && !t.contains('\u{2026}'), "{w}: {t}");
+        }
+    }
+
+    #[test]
+    fn hostile_repo_names_and_titles_keep_every_border_in_place() {
+        let mut a = home_app();
+        let mut bad = Item {
+            number: 1,
+            repo: "ev\u{202e}il/re\u{200b}po\u{2066}".into(),
+            title: "line1\r\nline2\u{00AD}\u{2028}\u{3164}\u{E0001}\u{FE00}tail".into(),
+            state: "open".into(),
+            kind: Kind::Pr,
+            ..Default::default()
+        };
+        crate::gh::clean_item(&mut bad);
+        a.panels[0].items = vec![bad];
+        for (w, h) in [(80u16, 24u16), (120, 40)] {
+            let s = render_app(&a, w, h);
+            let lines: Vec<Vec<char>> = s.lines().map(|l| l.chars().collect()).collect();
+            let top = lines.iter().find(|l| l.contains(&'\u{256e}')).unwrap();
+            let col = top
+                .iter()
+                .position(|c| *c == '\u{256e}')
+                .expect("the panel's top-right corner");
+            let row = lines
+                .iter()
+                .find(|l| l.iter().collect::<String>().contains("<U+202E>"))
+                .expect("the hostile row");
+            assert_eq!(
+                row[col], '\u{2502}',
+                "{w}x{h}: the border stayed in its column\n{s}"
+            );
+            assert!(
+                row.iter().collect::<String>().contains("line1 line2"),
+                "{w}x{h}\n{s}"
+            );
+        }
     }
 }

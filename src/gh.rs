@@ -258,6 +258,17 @@ impl Item {
         }
     }
 
+    /// The repo name for the screen: neutralized like every other GitHub text. `repo` itself stays
+    /// raw, because it goes into `-R`, and is only trusted for that when it passes `repo_ok`.
+    pub fn repo_display(&self) -> String {
+        crate::sanitize::line(&self.repo).into_owned()
+    }
+
+    /// A repo name safe to hand to `gh -R` (plain `owner/name`); empty (unknown) counts as fine.
+    pub fn repo_ok(&self) -> bool {
+        self.repo.is_empty() || crate::state::valid_repo(&self.repo)
+    }
+
     pub fn key(&self) -> String {
         format!(
             "{:?}|{}|{}|{}",
@@ -484,12 +495,13 @@ fn json<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, String> {
 }
 
 pub fn clean_item(i: &mut Item) {
-    use crate::sanitize::clean_in_place as c;
-    c(&mut i.title);
+    use crate::sanitize::{clean_in_place as c, line_in_place as l};
+    // one-line fields keep no line breaks; the body keeps its own
+    l(&mut i.title);
     c(&mut i.body);
-    c(&mut i.meta);
-    c(&mut i.author.login);
-    i.labels.iter_mut().for_each(|l| c(&mut l.name));
+    l(&mut i.meta);
+    l(&mut i.author.login);
+    i.labels.iter_mut().for_each(|x| l(&mut x.name));
 }
 
 pub fn parse_items(s: &str, kind: Kind, repo: &str) -> Result<Vec<Item>, String> {
