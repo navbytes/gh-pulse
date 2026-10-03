@@ -5517,7 +5517,8 @@ mod tests {
             "alice's facts were discarded: {:?}",
             shim.calls()
         );
-        assert!(b.meta.as_ref().is_some_and(|_| true));
+        // the facts follow the lists as a message of their own: wait for them, don't race the job
+        wait(&mut b, "bob's facts", |b| b.meta.is_some());
         b.open_browser(false);
         assert!(
             b.browser.as_ref().unwrap().rows.is_empty(),
