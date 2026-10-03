@@ -13,12 +13,16 @@ see, gh-pulse can see.
 
 ## Screenshots
 
-Captured from the real binary (`scripts/screenshots.py`). The repo-home shots use public repositories. The **global
-home** shots further down use **synthetic data**: the binary runs against a fake `gh` (`scripts/fake-gh`) serving made-up
-users, orgs, repos, PRs and notifications, so nothing of a real account appears.
+Captured from the real binary (`scripts/screenshots.py`) on public repositories: gh-pulse itself (its own merged PRs, CI runs
+and v0.1.0 release) and [cli/cli](https://github.com/cli/cli) for the comment thread. The **global home** shots further down
+use **synthetic data**: the binary runs against a fake `gh` (`scripts/fake-gh`) serving made-up users, orgs, repos, PRs and
+notifications, so nothing of a real account appears.
+
+![Five panels with a merged PR's overview](docs/img/1-main.png)
+*The five panels: [1] PRs (Mine / Review / All / Merged), [2] Files, [3] Issues, [4] Actions, [5] Repo; the right pane shows the selected PR's Overview.*
 
 ![Split diff with syntax highlighting](docs/img/2-diff-split.png)
-*Zoomed Diff tab (`f`): auto layout picks side-by-side at width, with syntax highlighting and intra-line highlights.*
+*Zoomed Diff tab (`f`) of a Rust change: auto layout picks side-by-side at width, with syntax highlighting and intra-line highlights.*
 
 ![Unified diff of a Markdown file with wrap](docs/img/3-diff-prose.png)
 *Unified layout with soft wrap (`t` / `w`) keeps long prose lines readable.*
@@ -32,8 +36,11 @@ users, orgs, repos, PRs and notifications, so nothing of a real account appears.
 ![Actions panel](docs/img/6-actions.png)
 *[4] Actions: workflow runs with their jobs and steps.*
 
-![Repo panel, Tags tab](docs/img/7-tags.png)
-*[5] Repo: Branches / Tags / Releases tabs; a tag shows its commit, date and release.*
+![Checks tab](docs/img/6b-checks.png)
+*Checks in a PR drill-in: CI jobs with their duration; a failed check shows its failed-step log.*
+
+![Repo panel, Releases tab](docs/img/7-releases.png)
+*[5] Repo: Branches / Tags / Releases tabs; a release shows its notes and assets.*
 
 ![Action menu](docs/img/8-menu.png)
 ![Confirm popup](docs/img/8b-confirm.png)

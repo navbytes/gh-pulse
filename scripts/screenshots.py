@@ -122,11 +122,12 @@ def scrub(t, fake=False):
     if m:
         login = m.group(1)
         for y in range(ROWS):
-            i = t.scr.display[y].find(login)
+            line, i = t.scr.display[y], t.scr.display[y].find(login)
             while i >= 0:
-                for k, c in enumerate('you'.ljust(len(login))):
-                    t.scr.buffer[y][i + k] = t.scr.buffer[y][i + k]._replace(data=c)
-                i = t.scr.display[y].find(login, i + 1)
+                if line[i + len(login):i + len(login) + 1] != '/':  # keep `owner/repo` when the owner is the login
+                    for k, c in enumerate('you'.ljust(len(login))):
+                        t.scr.buffer[y][i + k] = t.scr.buffer[y][i + k]._replace(data=c)
+                i = line.find(login, i + 1)
     hdr = t.scr.buffer[0]  # the badge is the user's real unread count
     line = ''.join(hdr[x].data or ' ' for x in range(COLS))
     for mm in ([] if fake else re.finditer(r'✉\s*\d+|[⠀-⣿]', line)):
@@ -144,9 +145,9 @@ class RateLimited(Exception): pass
 def launch(repo, tmp):
     cfg = os.path.join(tmp, 'config'); os.makedirs(cfg)
     os.symlink(os.path.expanduser('~/.config/gh'), os.path.join(cfg, 'gh'))  # keep gh auth, nothing else
-    env = {'XDG_CONFIG_HOME': cfg, 'XDG_STATE_HOME': os.path.join(tmp, 'state')}
+    env = {'XDG_CONFIG_HOME': cfg, 'XDG_STATE_HOME': os.path.join(tmp, 'state'), 'XDG_CACHE_HOME': os.path.join(tmp, 'cache')}
     for attempt in range(8):  # gh occasionally hits API rate limits; back off and retry
-        t = T(['-R', repo, '--theme', 'dark'], env)
+        t = T(['-R', repo, '--theme', 'dark'], env, cwd=tmp)  # non-git cwd: no local branch name in the header
         try:
             t.wait_for(r'\[1\] (PRs|Pull requests)', 15); return t
         except SystemExit:
@@ -154,8 +155,8 @@ def launch(repo, tmp):
     raise SystemExit('gh-pulse never started (rate limited?)')
 
 
-def pr(t, nums, tab=2):
-    """Go to the `tab`-th list tab of panel 1 (2 = All open) and select the first PR of `nums` that is listed;
+def pr(t, nums, tab=3):
+    """Go to the `tab`-th list tab of panel 1 (2 = All open, 3 = Merged) and select the first PR of `nums` that is listed;
     falls back to the top row. Panel 1 is already focused at startup, so its number is not pressed."""
     t.send('}' * tab, 1)
     for _ in range(30):
@@ -185,41 +186,45 @@ def set_layout(t, want):  # cycle `t` until the diff header shows the wanted lay
 
 
 def s_main(t):
-    pr(t, [1829, 1826, 1816])
+    pr(t, [5])
 def s_diff_split(t):
-    pr(t, [14578]); ctx(t, 3); t.send('f', .8); set_layout(t, 'auto:split')
+    pr(t, [4]); ctx(t, 0); t.send('f', .8); set_layout(t, 'auto:split')
 def s_diff_prose(t):
-    pr(t, [14583]); ctx(t, 0); t.send('f', .8); set_layout(t, 'unified')
+    pr(t, [5]); ctx(t, 4); t.send('f', .8); set_layout(t, 'unified')
 def s_files(t):
-    pr(t, [14578]); ctx(t, 3)
+    pr(t, [5]); ctx(t, 5)
 def s_comments(t):
-    pr(t, [14583]); t.send('\r', 2); t.send(']' * 3, 2); t.pump(3)
+    pr(t, [14583], 2); t.send('\r', 2); t.send(']' * 3, 2); t.pump(3)
+def s_checks(t):
+    pr(t, [5]); t.send('\r', 2); t.send(']]', 2); t.pump(3)
 def s_actions(t):
-    t.send('4', 2); t.pump(3)
-def s_tags(t):
-    t.send('5', 1.5); t.send('}', 2); t.send('\r', 2); t.pump(2)
+    pr(t, [5]); t.send('4', 2); t.pump(3)
+def s_releases(t):
+    pr(t, [5]); t.send('5', 1.5); t.send('}}', 2); t.send('\r', 2); t.pump(2)
 def s_menu(t):
-    pr(t, [1829]); t.send('x', 1)
-def s_confirm(t):  # picks "Close PR" and stops at the confirm popup; 'y' is never sent
-    pr(t, [1829]); t.send('x', 1); t.send('j' * 7, .5); t.send('\r', 1)
+    pr(t, [5]); t.send('x', 1)
+def s_confirm(t):  # picks Approve and stops at the confirm popup; 'y' is never sent
+    pr(t, [5]); t.send('x', 1); t.send('j', .5); t.send('\r', 1); t.send('\x13', 1)  # Ctrl-S on the comment popup opens the confirm
 def s_help(t):
-    t.send('?', 1)
+    pr(t, [5]); t.send('?', 1)
 def s_compact(t):
-    pr(t, [1829])
+    pr(t, [])  # the narrow layout moves the detail pane, so the row search in pr() would never match
 
 
+GP, CLI = 'navbytes/gh-pulse', 'cli/cli'
 SHOTS = {  # name -> (repo, steps, (cols, rows))
-    '1-main': ('charmbracelet/bubbletea', s_main, (140, 40)),
-    '2-diff-split': ('cli/cli', s_diff_split, (140, 40)),
-    '3-diff-prose': ('cli/cli', s_diff_prose, (140, 40)),
-    '4-files': ('cli/cli', s_files, (140, 40)),
-    '5-comments': ('cli/cli', s_comments, (140, 40)),
-    '6-actions': ('charmbracelet/bubbletea', s_actions, (140, 40)),
-    '7-tags': ('charmbracelet/bubbletea', s_tags, (140, 40)),
-    '8-menu': ('charmbracelet/bubbletea', s_menu, (140, 40)),
-    '8b-confirm': ('charmbracelet/bubbletea', s_confirm, (140, 40)),
-    '9-help': ('charmbracelet/bubbletea', s_help, (140, 40)),
-    '10-compact': ('charmbracelet/bubbletea', s_compact, (80, 24)),
+    '1-main': (GP, s_main, (140, 40)),
+    '2-diff-split': (GP, s_diff_split, (140, 40)),
+    '3-diff-prose': (GP, s_diff_prose, (140, 40)),
+    '4-files': (GP, s_files, (140, 40)),
+    '5-comments': (CLI, s_comments, (140, 40)),
+    '6-actions': (GP, s_actions, (140, 40)),
+    '6b-checks': (GP, s_checks, (140, 40)),
+    '7-releases': (GP, s_releases, (140, 40)),
+    '8-menu': (GP, s_menu, (140, 40)),
+    '8b-confirm': (GP, s_confirm, (140, 40)),
+    '9-help': (GP, s_help, (140, 40)),
+    '10-compact': (GP, s_compact, (80, 24)),
 }
 
 FAKE = os.path.join(ROOT, 'scripts/fake-gh')
