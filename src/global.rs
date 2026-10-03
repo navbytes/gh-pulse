@@ -198,6 +198,8 @@ pub struct GlobalList {
     pub hidden: usize,
     /// Favorites that did not fit in the search calls.
     pub not_shown: usize,
+    /// Some searches failed but others answered.
+    pub note: Option<String>,
 }
 
 /// Newest update first; one row per item.
@@ -223,48 +225,79 @@ pub fn without_hidden(items: Vec<Item>, cfg: &ReposCfg) -> (Vec<Item>, usize) {
     (kept, dropped)
 }
 
-fn run(
-    sec: Section,
-    tab: usize,
-    scope: &Scope,
-    favorites: &[String],
-    limit: usize,
-) -> Result<(Vec<Item>, usize, bool), String> {
-    let (calls, not_shown) = calls(sec, tab, scope, favorites, limit);
-    let mut lists = vec![];
-    let mut full = false;
-    for (kind, args) in calls {
-        let items = gh::parse_items(&gh::gh(&args)?, kind, "")?;
-        full |= items.len() >= limit;
-        lists.push(items);
-    }
-    Ok((merge(lists), not_shown, full))
+/// What is left of the search API's budget (30 a minute), when known.
+#[derive(Clone, Copy, Debug)]
+pub struct Quota {
+    pub remaining: u32,
+    pub limit: u32,
 }
 
-/// One section's list: a page per search (per favorites chunk), hidden repos removed, and when that
-/// leaves few rows while more exist, one bigger request instead.
+impl Quota {
+    /// A bigger second request is only worth it with plenty left: at least 10 and a third of the window.
+    fn comfortable(q: Option<Quota>) -> bool {
+        q.is_none_or(|q| q.remaining >= 10 && u64::from(q.remaining) * 3 >= u64::from(q.limit))
+    }
+}
+
+/// Searches a section needs for one refresh (before any top-up).
+pub fn searches_needed(sec: Section, tab: usize, scope: &Scope, favorites: &[String]) -> usize {
+    calls(sec, tab, scope, favorites, PAGE).0.len()
+}
+
+/// One section's list: a page per search (per favorites chunk), hidden repos removed. When that
+/// empties a full page, one bigger request re-asks only the searches that came back full, and only
+/// for a single-chunk scope with quota to spare (a section never costs more than ~10 searches). A
+/// failed search shows what the others found plus a note; only all failing is an error.
 pub fn fetch_section(
     sec: Section,
     tab: usize,
     scope: &Scope,
     favorites: &[String],
     hidden: &ReposCfg,
+    quota: Option<Quota>,
 ) -> Result<GlobalList, String> {
-    let (items, not_shown, full) = run(sec, tab, scope, favorites, PAGE)?;
-    let (kept, dropped) = without_hidden(items, hidden);
-    if dropped > 0 && kept.len() < FILL && full {
-        let (items, not_shown, _) = run(sec, tab, scope, favorites, TOP_UP)?;
-        let (kept, dropped) = without_hidden(items, hidden);
-        return Ok(GlobalList {
-            items: kept,
-            hidden: dropped,
-            not_shown,
-        });
+    let (calls_, not_shown) = calls(sec, tab, scope, favorites, PAGE);
+    let single_chunk = scope_chunks(scope, favorites).0.len() <= 1;
+    let mut lists: Vec<Option<Vec<Item>>> = vec![];
+    let (mut failed, mut first_err) = (0, None);
+    for (kind, args) in &calls_ {
+        match gh::gh(args).and_then(|o| gh::parse_items(&o, *kind, "")) {
+            Ok(items) => lists.push(Some(items)),
+            Err(e) => {
+                failed += 1;
+                first_err.get_or_insert(e);
+                lists.push(None);
+            }
+        }
     }
+    if failed > 0 && failed == calls_.len() {
+        return Err(first_err.unwrap_or_default());
+    }
+    let merged = |lists: &[Option<Vec<Item>>]| merge(lists.iter().flatten().cloned().collect());
+    let (mut kept, mut dropped) = without_hidden(merged(&lists), hidden);
+    if dropped > 0 && kept.len() < FILL && single_chunk && Quota::comfortable(quota) {
+        let (again, _) = calls(sec, tab, scope, favorites, TOP_UP);
+        for (i, (kind, args)) in again.iter().enumerate() {
+            if lists[i].as_ref().is_some_and(|l| l.len() >= PAGE)
+                && let Ok(items) = gh::gh(args).and_then(|o| gh::parse_items(&o, *kind, ""))
+            {
+                lists[i] = Some(items);
+            }
+        }
+        (kept, dropped) = without_hidden(merged(&lists), hidden);
+    }
+    let note = (failed > 0).then(|| {
+        format!(
+            "{failed} of {} searches failed ({}); showing the rest",
+            calls_.len(),
+            first_err.unwrap_or_default()
+        )
+    });
     Ok(GlobalList {
         items: kept,
         hidden: dropped,
         not_shown,
+        note,
     })
 }
 
@@ -343,7 +376,7 @@ pub fn repo_items(
                 state: if fav { "fav".into() } else { String::new() },
                 meta: facts.join(" \u{b7} "),
                 body: card.join("\n"),
-                url: format!("https://github.com/{name}"),
+                url: format!("https://{}/{name}", gh::host()),
                 ..Default::default()
             }
         })
@@ -567,6 +600,7 @@ mod tests {
             &Scope::Favorites,
             &favs(6),
             &ReposCfg::default(),
+            None,
         )
         .unwrap();
         let calls = shim.calls();
@@ -590,6 +624,7 @@ mod tests {
             &Scope::Favorites,
             &favs(21),
             &ReposCfg::default(),
+            None,
         )
         .unwrap();
         assert_eq!((shim.calls().len(), l.not_shown), (4, 5));
@@ -601,6 +636,7 @@ mod tests {
             &Scope::Favorites,
             &[],
             &ReposCfg::default(),
+            None,
         )
         .unwrap();
         assert!(shim.calls().is_empty() && l.items.is_empty());
@@ -617,7 +653,7 @@ mod tests {
             hidden: vec!["noisy/bot".into()],
             ..Default::default()
         };
-        let l = fetch_section(Section::MyPrs, 0, &Scope::All, &[], &cfg).unwrap();
+        let l = fetch_section(Section::MyPrs, 0, &Scope::All, &[], &cfg, None).unwrap();
         let calls = shim.calls();
         assert_eq!(
             calls.len(),
@@ -629,14 +665,22 @@ mod tests {
         assert_eq!((l.items.len(), l.hidden), (5, 95));
         // enough visible rows, or a page that wasn't full: one search
         shim.clear("calls.log");
-        let l = fetch_section(Section::MyPrs, 0, &Scope::All, &[], &ReposCfg::default()).unwrap();
+        let l = fetch_section(
+            Section::MyPrs,
+            0,
+            &Scope::All,
+            &[],
+            &ReposCfg::default(),
+            None,
+        )
+        .unwrap();
         assert_eq!((shim.calls().len(), l.hidden), (1, 0));
         shim.clear("calls.log");
         shim.set(
             "searchprs.out",
             &search_json(&[("noisy/bot", 1), ("keep/me", 2)]),
         );
-        let l = fetch_section(Section::MyPrs, 0, &Scope::All, &[], &cfg).unwrap();
+        let l = fetch_section(Section::MyPrs, 0, &Scope::All, &[], &cfg, None).unwrap();
         assert_eq!((shim.calls().len(), l.items.len(), l.hidden), (1, 1, 1));
     }
 
@@ -652,6 +696,7 @@ mod tests {
             &Scope::Org("cli".into()),
             &[],
             &ReposCfg::default(),
+            None,
         )
         .unwrap();
         let c = shim.calls();
@@ -659,9 +704,49 @@ mod tests {
         assert!(c[0].starts_with("search prs") && c[1].starts_with("search issues"));
         assert!(c[1].ends_with("-- involves:@me is:open archived:false org:cli"));
         assert_eq!(l.items[0].kind, Kind::Pr);
+        // one of the two searches failing still shows the other's rows, with a note
+        shim.set("searchprs.err", "HTTP 422: Validation Failed");
+        let l = fetch_section(
+            Section::Involved,
+            0,
+            &Scope::All,
+            &[],
+            &ReposCfg::default(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            l.items.is_empty()
+                && l.note
+                    .as_deref()
+                    .unwrap()
+                    .contains("1 of 2 searches failed")
+        );
+        shim.set("searchprs.out", &search_json(&[("a/b", 1)]));
+        shim.clear("searchprs.err");
+        shim.set("searchissues.err", "HTTP 500");
+        let l = fetch_section(
+            Section::Involved,
+            0,
+            &Scope::All,
+            &[],
+            &ReposCfg::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!((l.items.len(), l.note.is_some()), (1, true));
+        // every search failing is an error, not a blank
         shim.set("searchprs.err", "HTTP 422: Validation Failed");
         assert!(
-            fetch_section(Section::Involved, 0, &Scope::All, &[], &ReposCfg::default()).is_err()
+            fetch_section(
+                Section::Involved,
+                0,
+                &Scope::All,
+                &[],
+                &ReposCfg::default(),
+                None
+            )
+            .is_err()
         );
     }
 }

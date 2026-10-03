@@ -197,7 +197,7 @@ pub fn dir() -> Option<PathBuf> {
 fn write_private_atomic(path: &Path, body: &str) -> Result<(), String> {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = path.parent().ok_or("bad state path")?;
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    crate::cache::ensure_dir(dir)?;
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = path.with_extension(format!("{}.{n}.tmp", std::process::id()));
     crate::cache::write_private(&tmp, body.as_bytes()).map_err(|e| e.to_string())?;
@@ -207,24 +207,28 @@ fn write_private_atomic(path: &Path, body: &str) -> Result<(), String> {
     })
 }
 
-/// Reads a regular file (never a symlink); anything else is "no file".
+/// Reads a regular file of ours (never through a symlink); anything else is "no file".
 fn read_regular(path: &Path) -> Option<String> {
-    let m = std::fs::symlink_metadata(path).ok()?;
-    m.is_file().then(|| std::fs::read_to_string(path).ok())?
+    crate::cache::read_nofollow(path)
 }
 
-/// The last global-home scope (`all`, `favorites`, `org:x`, `repo:a/b`), kept out of config.toml.
-pub fn load_scope(path: &Path) -> Option<String> {
+/// The last global-home scope (`all`, `favorites`, `org:x`, `repo:a/b`), kept out of config.toml and
+/// tied to the host it was chosen on (another host gets the default).
+pub fn load_scope(path: &Path, host: &str) -> Option<String> {
     #[derive(Deserialize)]
     struct S {
+        host: String,
         scope: String,
     }
     let s: S = serde_json::from_str(&read_regular(path)?).ok()?;
-    Some(s.scope)
+    (s.host == host).then_some(s.scope)
 }
 
-pub fn save_scope(path: &Path, scope: &str) -> Result<(), String> {
-    write_private_atomic(path, &serde_json::json!({ "scope": scope }).to_string())
+pub fn save_scope(path: &Path, host: &str, scope: &str) -> Result<(), String> {
+    write_private_atomic(
+        path,
+        &serde_json::json!({ "host": host, "scope": scope }).to_string(),
+    )
 }
 
 /// The repos you entered last, newest first (at most [`RECENT_MAX`]), per host so hosts never mix.
@@ -276,6 +280,9 @@ pub fn valid_repo(s: &str) -> bool {
     let ok = |p: &str| {
         !p.is_empty()
             && p.len() <= 100
+            && p != "."
+            && p != ".."
+            && !p.starts_with('-')
             && p.chars()
                 .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
     };
@@ -355,9 +362,14 @@ mod tests_recent {
         assert!(Recent::load(&link, "github.com").repos.is_empty());
         // scope round trip
         let sp = d.join("scope.json");
-        assert_eq!(load_scope(&sp), None);
-        save_scope(&sp, "org:cli").unwrap();
-        assert_eq!(load_scope(&sp).as_deref(), Some("org:cli"));
+        assert_eq!(load_scope(&sp, "github.com"), None);
+        save_scope(&sp, "github.com", "org:cli").unwrap();
+        assert_eq!(load_scope(&sp, "github.com").as_deref(), Some("org:cli"));
+        assert_eq!(
+            load_scope(&sp, "ghe.example.com"),
+            None,
+            "another host never inherits a scope"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

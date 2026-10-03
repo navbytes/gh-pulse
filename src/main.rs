@@ -107,11 +107,6 @@ fn main() -> std::io::Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         die("gh-pulse needs an interactive terminal");
     }
-    if let Some(r) = &repo
-        && !state::valid_repo(r)
-    {
-        die(&format!("{r:?} is not owner/repo"));
-    }
     let mode = start_flag.unwrap_or(cfg.ui.start);
     // `gh repo view` (an API call) only runs inside a git work tree, and never when -R is given
     let start = start::decide(
@@ -121,17 +116,8 @@ fn main() -> std::io::Result<()> {
         gh::local_repo,
     )
     .unwrap_or_else(|e| die(&e));
-    let (repo, global) = match start {
-        start::Start::Repo(r) => (
-            Some(if repo.is_some() {
-                gh::resolve_repo(&r).unwrap_or_else(|e| die(&e))
-            } else {
-                r
-            }),
-            false,
-        ),
-        start::Start::Global { repo } => (repo, true),
-    };
+    let (repo, global) =
+        start::canonical(start, repo.is_some(), gh::resolve_repo).unwrap_or_else(|e| die(&e));
     // Flags win over the config file.
     let (ascii, nerd) = (ascii || cfg.ascii, nerd || cfg.nerd);
     let light = light.unwrap_or(cfg.theme.as_deref() == Some("light"));

@@ -35,6 +35,24 @@ pub fn decide(
     }
 }
 
+/// `-R` exactly as it always worked: whatever `gh repo view` accepts (`OWNER/REPO`, `HOST/OWNER/REPO`, a
+/// URL) resolves to the canonical name. Only a plain `owner/name` in global mode skips the lookup (it
+/// only becomes the context `G` leads to); that is the one place no API call is wanted at startup.
+pub fn canonical(
+    start: Start,
+    repo_flag_given: bool,
+    resolve: impl Fn(&str) -> Result<String, String>,
+) -> Result<(Option<String>, bool), String> {
+    match start {
+        Start::Repo(r) if repo_flag_given => Ok((Some(resolve(&r)?), false)),
+        Start::Repo(r) => Ok((Some(r), false)),
+        Start::Global { repo: Some(r) } if repo_flag_given && !crate::state::valid_repo(&r) => {
+            Ok((Some(resolve(&r)?), true))
+        }
+        Start::Global { repo } => Ok((repo, true)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +126,63 @@ mod tests {
         assert_eq!(StartMode::parse("global"), Some(StartMode::Global));
         assert_eq!(StartMode::parse("Global"), None);
         assert_eq!(StartMode::parse(""), None);
+    }
+
+    #[test]
+    fn dash_r_accepts_what_gh_repo_view_accepts() {
+        let resolve = |r: &str| -> Result<String, String> {
+            // stands in for `gh repo view`: URLs and HOST/OWNER/REPO come back as owner/name
+            let r = r.trim_start_matches("https://").trim_end_matches(".git");
+            let parts: Vec<&str> = r.split('/').collect();
+            match parts.as_slice() {
+                [o, n] => Ok(format!("{o}/{n}")),
+                [_host, o, n] => Ok(format!("{o}/{n}")),
+                _ => Err(format!("repo not found or no access: {r}")),
+            }
+        };
+        for (flag, want) in [
+            ("cli/cli", "cli/cli"),
+            ("github.com/cli/cli", "cli/cli"),
+            ("https://github.com/cli/cli", "cli/cli"),
+            ("https://github.com/cli/cli.git", "cli/cli"),
+        ] {
+            let s = decide(StartMode::Repo, Some(flag.into()), || None, || None).unwrap();
+            assert_eq!(
+                canonical(s, true, resolve).unwrap(),
+                (Some(want.into()), false),
+                "{flag}"
+            );
+        }
+        // global mode: a plain name is only context (no lookup); anything else is resolved first
+        let never = |_: &str| -> Result<String, String> { panic!("no API call for a plain name") };
+        let s = decide(StartMode::Global, Some("o/r".into()), || None, || None).unwrap();
+        assert_eq!(
+            canonical(s, true, never).unwrap(),
+            (Some("o/r".into()), true)
+        );
+        let s = decide(
+            StartMode::Global,
+            Some("github.com/o/r".into()),
+            || None,
+            || None,
+        )
+        .unwrap();
+        assert_eq!(
+            canonical(s, true, resolve).unwrap(),
+            (Some("o/r".into()), true)
+        );
+        // a repo found from the directory was already resolved by gh
+        let s = Start::Repo("x/y".into());
+        assert_eq!(
+            canonical(s, false, never).unwrap(),
+            (Some("x/y".into()), false)
+        );
+        // a repo that does not exist is the same error as before
+        let s = decide(StartMode::Repo, Some("nonsense".into()), || None, || None).unwrap();
+        assert!(
+            canonical(s, true, resolve)
+                .unwrap_err()
+                .contains("not found")
+        );
     }
 }

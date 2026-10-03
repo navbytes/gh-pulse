@@ -22,6 +22,14 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+/// Every list load gets a number nobody else has had: panels of different homes (a repo, then
+/// another repo, the global home) can't mistake one another's late replies for their own.
+static SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn next_seq() -> u64 {
+    SEQ.fetch_add(1, Relaxed) + 1
+}
+
 /// Seconds the repo's header facts stay cached.
 const META_TTL: u64 = 300;
 
@@ -139,6 +147,13 @@ impl Side {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Loc {
+    Active,
+    Ctx,
+    Other,
+}
+
 /// What choosing a row in the scope picker does.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScopeChoice {
@@ -159,6 +174,9 @@ pub struct ScopePicker {
     pub cursor: usize,
     /// Type-ahead in the Orgs and Repos stages.
     pub query: String,
+    /// Repo names the Repos stage filters (favorites, recent, the cached repo list): read once on
+    /// entering the stage, not on every frame and key.
+    pub names: Vec<String>,
 }
 
 /// "Drill-in" mode: the left column shows the PR's own Files / Checks / Comments.
@@ -371,6 +389,10 @@ struct RepoMsg {
 /// Seconds the repo list stays fresh; older cached rows still show at once, then refresh.
 const REPOS_TTL: u64 = 600;
 
+/// How many times the repo-list cache was read (tests assert the picker doesn't re-read per key).
+#[cfg(test)]
+static READS: AtomicU64 = AtomicU64::new(0);
+
 /// The repo list as cached, with who it was fetched as.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CachedRepos {
@@ -386,6 +408,8 @@ fn repos_key(host: &str, login: &str) -> String {
 
 /// Cached rows and their age, for this host and login only (and re-cleaned: the disk is not trusted).
 fn read_repos() -> Option<(CachedRepos, u64)> {
+    #[cfg(test)]
+    READS.fetch_add(1, Relaxed);
     let (host, login) = gh::identity()?;
     let st = crate::cache::Store::default_if_enabled()?;
     let (mut c, age): (CachedRepos, u64) = st.read(&repos_key(&host, &login), rate::now())?;
@@ -488,10 +512,10 @@ enum Msg {
     Done(Result<String, String>, Then),
     FormData(u64, Box<gh::FormData>),
     /// The branch checked out in the working directory, when it is a clone of the repo.
-    Branch(u64, Option<String>),
+    Branch(String, Option<String>),
     Repos(u64, Result<RepoMsg, String>),
     /// Repo facts for the header (generation of the header lookup).
-    Meta(u64, gh::RepoMeta),
+    Meta(String, gh::RepoMeta),
     /// (list generation, panel, tab id, (rows, more)) for the other tabs' counts.
     Count(u64, CountKey, Result<(usize, bool), String>),
     /// Unread notifications, for the badge (and the inbox when open).
@@ -501,9 +525,9 @@ enum Msg {
     /// A queued detail fetch that was dropped before it started: forget its placeholder.
     Dropped(String, Tab, u64),
     /// The batched startup request failed (not a rate limit): load the panels one by one instead.
-    StartupFallback(u64),
+    StartupFallback(String),
     /// A global section's side facts, sent just before its list: (panel, seq, hidden rows, favorites left out).
-    GMeta(PK, u64, usize, usize),
+    GMeta(PK, usize, u64, usize, usize, Option<String>),
     /// Your organizations, for the scope picker.
     Orgs(Result<Vec<String>, String>),
     /// Who reacted to one comment: (item key, comment id, names or the error).
@@ -915,7 +939,7 @@ impl App {
             pool::init(app.cfg.api.max_concurrent);
             gh::set_timeout(app.cfg.api.timeout_s);
             if let Some(d) = crate::state::dir() {
-                app.scope = crate::state::load_scope(&d.join("scope.json"))
+                app.scope = crate::state::load_scope(&d.join("scope.json"), &gh::host())
                     .and_then(|s| Scope::parse(&s))
                     .unwrap_or(Scope::All);
                 app.recent = crate::state::Recent::load(&d.join("recent.json"), &gh::host());
@@ -1037,7 +1061,7 @@ impl App {
     /// Local part of the header (the cwd's branch, when the directory is a clone of this repo).
     fn spawn_header(&mut self) {
         self.hgen += 1;
-        let (tx, repo, g) = (self.tx.clone(), self.repo.clone(), self.hgen);
+        let (tx, repo) = (self.tx.clone(), self.repo.clone());
         self.user_job(move || {
             let branch = gh::cwd_is_clone_of(&repo)
                 .then(|| {
@@ -1048,7 +1072,7 @@ impl App {
                         .unwrap_or_default()
                 })
                 .filter(|b| !b.is_empty());
-            let _ = tx.send(Msg::Branch(g, branch));
+            let _ = tx.send(Msg::Branch(repo, branch));
         });
     }
 
@@ -1076,8 +1100,10 @@ impl App {
             return;
         }
         self.recent.touch(&self.repo.clone());
-        if let Some(d) = &self.state_dir {
-            let _ = self.recent.save(&d.join("recent.json"));
+        if let Some(d) = &self.state_dir
+            && let Err(e) = self.recent.save(&d.join("recent.json"))
+        {
+            self.status = format!("recent repos not saved: {e}");
         }
     }
 
@@ -1102,7 +1128,7 @@ impl App {
             let p = &mut self.panels[i];
             p.loading = true;
             p.error = None;
-            p.seq += 1;
+            p.seq = next_seq();
             p.unloaded = false;
             p.stamp.store(p.seq, Relaxed);
             let tab = p.tab_id();
@@ -1141,7 +1167,7 @@ impl App {
                     }
                     if let Some(m) = st.meta {
                         write_meta(&repo, &m, &st.user);
-                        let _ = tx.send(Msg::Meta(g, m));
+                        let _ = tx.send(Msg::Meta(repo.clone(), m));
                     }
                     let _ = tx.send(Msg::User(g, st.user));
                     if let Some(n) = st.open_prs {
@@ -1154,7 +1180,7 @@ impl App {
                     }
                 }
                 Err(_) => {
-                    let _ = tx.send(Msg::StartupFallback(g));
+                    let _ = tx.send(Msg::StartupFallback(repo));
                 }
             },
             // lost (queue full, panic): the lists must not sit on "loading..."
@@ -1182,7 +1208,7 @@ impl App {
         self.user_job(move || {
             let _ = tx.send(Msg::User(g, gh::user()));
             if let Ok(m) = gh::repo_meta(&repo) {
-                let _ = tx.send(Msg::Meta(g, m));
+                let _ = tx.send(Msg::Meta(repo, m));
             }
         });
     }
@@ -1286,7 +1312,7 @@ impl App {
         p.loading = true;
         p.unloaded = false;
         p.error = None;
-        p.seq += 1;
+        p.seq = next_seq();
         p.stamp.store(p.seq, Relaxed);
         if !self.net {
             return;
@@ -1320,19 +1346,35 @@ impl App {
     /// A global section: one search per scope chunk, run at user priority when the section is focused,
     /// reloaded or its scope changed. Hidden repos are dropped inside the job.
     fn load_global(&mut self, i: usize) {
-        let p = &mut self.panels[i];
-        p.loading = true;
-        p.unloaded = false;
-        p.error = None;
-        p.seq += 1;
-        p.stamp.store(p.seq, Relaxed);
-        let sec = match p.kind {
+        let kind = self.panels[i].kind;
+        let sec = match kind {
             PK::Review => Section::Review,
             PK::MyPrs => Section::MyPrs,
             PK::Assigned => Section::Assigned,
             _ => Section::Involved,
         };
-        let (seq, kind, tab, tab_id, stamp) = (p.seq, p.kind, p.tab, p.tab_id(), p.stamp.clone());
+        let tab_id = self.panels[i].tab_id();
+        // the search API allows 30 requests a minute: never start a refresh the rest of the minute can't pay for
+        let needed = global::searches_needed(sec, tab_id, &self.scope, &self.cfg.repos.favorites);
+        if let Some(b) = self.rate.search.filter(|b| rate::now() < b.reset)
+            && (b.remaining as usize) < needed
+        {
+            let msg = format!("search quota low, resets {}", rate::clock(b.reset));
+            let p = &mut self.panels[i];
+            (p.loading, p.unloaded) = (false, false);
+            if p.items.is_empty() {
+                p.error = Some(msg.clone());
+            }
+            self.status = msg;
+            return;
+        }
+        let p = &mut self.panels[i];
+        p.loading = true;
+        p.unloaded = false;
+        p.error = None;
+        p.seq = next_seq();
+        p.stamp.store(p.seq, Relaxed);
+        let (seq, tab, stamp) = (p.seq, p.tab, p.stamp.clone());
         if !self.net {
             return;
         }
@@ -1341,33 +1383,24 @@ impl App {
             self.cfg.repos.favorites.clone(),
             self.cfg.repos.clone(),
         );
-        // the search API allows 30 requests a minute: say so before spending one when it is nearly gone
-        if self
+        let quota = self
             .rate
             .search
-            .is_some_and(|b| b.remaining < 5 && rate::now() < b.reset)
-        {
-            self.status = format!(
-                "search quota low ({} left): this list may be slow to load",
-                self.rate.search.map_or(0, |b| b.remaining)
-            );
-        } else if scope == Scope::Favorites
-            && !self
-                .cfg
-                .repos
-                .favorites
-                .iter()
-                .any(|f| crate::state::valid_repo(f))
-        {
+            .filter(|b| rate::now() < b.reset)
+            .map(|b| global::Quota {
+                remaining: b.remaining,
+                limit: b.limit,
+            });
+        if scope == Scope::Favorites && !favs.iter().any(|f| crate::state::valid_repo(f)) {
             self.status = "no favorites yet: press f on a repo in the Repos panel".into();
         }
         let (tx, tx2) = (self.tx.clone(), self.tx.clone());
         self.queue(
             Prio::User,
             move || stamp.load(Relaxed) != seq,
-            move || match global::fetch_section(sec, tab_id, &scope, &favs, &hidden) {
+            move || match global::fetch_section(sec, tab_id, &scope, &favs, &hidden, quota) {
                 Ok(l) => {
-                    let _ = tx.send(Msg::GMeta(kind, seq, l.hidden, l.not_shown));
+                    let _ = tx.send(Msg::GMeta(kind, tab, seq, l.hidden, l.not_shown, l.note));
                     let _ = tx.send(Msg::List(kind, tab, seq, Ok(l.items)));
                 }
                 Err(e) => {
@@ -1467,6 +1500,25 @@ impl App {
             .find(|p| p.kind == k)
     }
 
+    /// Where the panel that asked for list `seq` lives now: on screen, behind a drill-in, or parked
+    /// with the other home. A reply that matches none of them is for something that is gone.
+    fn locate(&self, kind: PK, tab: usize, seq: u64) -> Option<(Loc, usize)> {
+        let find = |ps: &[Panel]| {
+            ps.iter()
+                .position(|p| p.kind == kind && p.seq == seq && p.tab == tab)
+        };
+        if let Some(i) = find(&self.panels) {
+            return Some((Loc::Active, i));
+        }
+        if let Some(i) = self.ctx.as_ref().and_then(|c| find(&c.saved)) {
+            return Some((Loc::Ctx, i));
+        }
+        self.other
+            .as_ref()
+            .and_then(|o| find(&o.panels))
+            .map(|i| (Loc::Other, i))
+    }
+
     #[cfg(test)]
     pub fn panel_idx_for_test(&self, k: PK) -> usize {
         self.panel_idx(k).unwrap()
@@ -1531,27 +1583,22 @@ impl App {
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 Msg::List(kind, tab, seq, res) => {
-                    let (global, hidden) = (self.global, self.cfg.repos.clone());
                     let (pending, cur) = (self.pending_select.clone(), self.repo.clone());
-                    let Some(p) = self.panel_mut(kind) else {
+                    let Some((loc, idx)) = self.locate(kind, tab, seq) else {
                         continue;
                     };
-                    if p.tab != tab || p.seq != seq {
-                        continue;
-                    }
+                    let p = match loc {
+                        Loc::Active => &mut self.panels[idx],
+                        Loc::Ctx => &mut self.ctx.as_mut().expect("located there").saved[idx],
+                        Loc::Other => &mut self.other.as_mut().expect("located there").panels[idx],
+                    };
                     p.loading = false;
                     let consumed = pending.as_ref().is_some_and(|x| x.0 == kind);
                     let key = (kind, p.tab_id());
                     let cap = p.source().map_or(gh::LIMIT, |s| gh::cap(s.0));
                     let (mut found, mut rec) = (false, None);
                     match res {
-                        Ok(mut items) => {
-                            // hidden repos disappear from the cross-repo (global) results
-                            let cross_repo = (global && matches!(p.kind, PK::Prs | PK::Issues))
-                                || p.kind == PK::Notifs;
-                            if cross_repo {
-                                items.retain(|i| !hidden.is_hidden(&i.repo));
-                            }
+                        Ok(items) => {
                             p.cursor = p.cursor.min(items.len().saturating_sub(1));
                             if let Some((pk, n, repo)) = pending
                                 && pk == p.kind
@@ -1579,8 +1626,15 @@ impl App {
                         self.pending_select = None;
                     }
                     if let Some(r) = rec {
-                        self.cpending.remove(&key);
-                        self.counts.insert(key, r);
+                        // a parked home keeps its own counts
+                        if loc == Loc::Other {
+                            if let Some(o) = self.other.as_mut() {
+                                o.counts.insert(key, r);
+                            }
+                        } else {
+                            self.cpending.remove(&key);
+                            self.counts.insert(key, r);
+                        }
                     }
                 }
                 Msg::Count(g, key, res) => {
@@ -1599,9 +1653,11 @@ impl App {
                         }
                     }
                 }
-                Msg::Meta(g, m) => {
-                    if g == self.hgen {
+                Msg::Meta(repo, m) => {
+                    if !self.global && self.repo == repo {
                         self.meta = Some(m);
+                    } else if let Some(o) = self.other.as_mut().filter(|o| o.repo == repo) {
+                        o.meta = Some(m);
                     }
                 }
                 Msg::Inbox(seq, res) => {
@@ -1680,11 +1736,14 @@ impl App {
                     }
                     self.reload_all();
                 }
-                Msg::Branch(g, b) => {
-                    if g == self.hgen {
+                Msg::Branch(repo, b) => {
+                    if !self.global && self.repo == repo {
                         self.branch = b.clone().unwrap_or_default();
                         self.cwd_branch = b;
                         self.rebuild_header();
+                    } else if let Some(o) = self.other.as_mut().filter(|o| o.repo == repo) {
+                        o.branch = b.clone().unwrap_or_default();
+                        o.cwd_branch = b;
                     }
                 }
                 Msg::FormData(seq, d) => {
@@ -1740,15 +1799,24 @@ impl App {
                         (b.loading, b.error) = (false, Some(e));
                     }
                 }
-                Msg::GMeta(kind, seq, hidden, not_shown) => {
-                    if let Some(p) = self.panel_mut(kind)
-                        && p.seq == seq
-                    {
+                Msg::GMeta(kind, tab, seq, hidden, not_shown, note) => {
+                    if let Some((loc, idx)) = self.locate(kind, tab, seq) {
+                        let p = match loc {
+                            Loc::Active => &mut self.panels[idx],
+                            Loc::Ctx => &mut self.ctx.as_mut().expect("located there").saved[idx],
+                            Loc::Other => {
+                                &mut self.other.as_mut().expect("located there").panels[idx]
+                            }
+                        };
                         (p.hidden, p.not_shown) = (hidden, not_shown);
-                        if not_shown > 0 {
-                            self.status = format!(
-                                "(+{not_shown} favorites not shown \u{2014} narrow the scope with s)"
-                            );
+                        if loc != Loc::Other {
+                            if let Some(n) = note {
+                                self.status = n;
+                            } else if not_shown > 0 {
+                                self.status = format!(
+                                    "(+{not_shown} favorites not shown \u{2014} narrow the scope with s)"
+                                );
+                            }
                         }
                     }
                 }
@@ -1774,8 +1842,8 @@ impl App {
                         self.cache.remove(&(key, tab));
                     }
                 }
-                Msg::StartupFallback(g) => {
-                    if g == self.hgen {
+                Msg::StartupFallback(repo) => {
+                    if !self.global && self.repo == repo {
                         self.fallback_start();
                     }
                 }
@@ -2835,6 +2903,7 @@ impl App {
                         stage: ScopeStage::Top,
                         cursor: 0,
                         query: String::new(),
+                        names: vec![],
                     }));
                 } else {
                     self.status =
@@ -3168,8 +3237,11 @@ impl App {
     /// Narrow the global home. Persisted (state dir, not config); sections reload when next focused.
     fn set_scope(&mut self, scope: Scope) {
         self.scope = scope;
-        if let Some(d) = &self.state_dir {
-            let _ = crate::state::save_scope(&d.join("scope.json"), &self.scope.key());
+        if let Some(d) = &self.state_dir
+            && let Err(e) =
+                crate::state::save_scope(&d.join("scope.json"), &gh::host(), &self.scope.key())
+        {
+            self.status = format!("scope not remembered: {e}");
         }
         let stale = |panels: &mut Vec<Panel>| {
             for p in panels.iter_mut().filter(|p| p.kind.is_global_search()) {
@@ -3228,20 +3300,9 @@ impl App {
                 .map(|o| (o.clone(), ScopeChoice::Set(Scope::Org(o.clone()))))
                 .collect(),
             ScopeStage::Repos => {
-                let known = read_repos().map(|(c, _)| c.rows).unwrap_or_default();
                 let mut names: Vec<String> = vec![];
-                let all = self
-                    .cfg
-                    .repos
-                    .favorites
-                    .iter()
-                    .chain(self.recent.repos.iter())
-                    .chain(known.iter().map(|r| &r.name));
-                for n in all {
-                    if crate::state::valid_repo(n)
-                        && has(n)
-                        && !names.iter().any(|x| x.eq_ignore_ascii_case(n))
-                    {
+                for n in &p.names {
+                    if has(n) && !names.iter().any(|x| x.eq_ignore_ascii_case(n)) {
                         names.push(n.clone());
                     }
                 }
@@ -3265,6 +3326,25 @@ impl App {
                 v
             }
         }
+    }
+
+    /// Candidates for the Repos stage; one disk read of the cached repo list.
+    fn scope_repo_names(&self) -> Vec<String> {
+        let known = read_repos().map(|(c, _)| c.rows).unwrap_or_default();
+        let mut names: Vec<String> = vec![];
+        for n in self
+            .cfg
+            .repos
+            .favorites
+            .iter()
+            .chain(self.recent.repos.iter())
+            .chain(known.iter().map(|r| &r.name))
+        {
+            if crate::state::valid_repo(n) && !names.iter().any(|x| x.eq_ignore_ascii_case(n)) {
+                names.push(n.clone());
+            }
+        }
+        names
     }
 
     fn scope_key(&mut self, mut p: ScopePicker, k: KeyEvent) -> Option<Modal> {
@@ -3296,8 +3376,10 @@ impl App {
                     }
                     Some(ScopeChoice::Stage(st)) => {
                         (p.stage, p.cursor, p.query) = (st, 0, String::new());
-                        if st == ScopeStage::Orgs {
-                            self.fetch_orgs();
+                        match st {
+                            ScopeStage::Orgs => self.fetch_orgs(),
+                            ScopeStage::Repos => p.names = self.scope_repo_names(),
+                            ScopeStage::Top => {}
                         }
                     }
                     None => {}
@@ -3351,8 +3433,26 @@ impl App {
             return;
         }
         self.status = format!("{} {r}", if on { "hidden:" } else { "unhidden:" });
-        let s = self.scope.clone();
-        self.set_scope(s); // sections filter on load
+        if on {
+            // already-loaded sections just lose the rows (no search to spend)
+            let drop_rows = |panels: &mut Vec<Panel>| {
+                for p in panels.iter_mut().filter(|p| p.kind.is_global_search()) {
+                    let before = p.items.len();
+                    p.items.retain(|i| !i.repo.eq_ignore_ascii_case(&r));
+                    p.hidden += before - p.items.len();
+                    p.cursor = p.cursor.min(p.items.len().saturating_sub(1));
+                }
+            };
+            drop_rows(&mut self.panels);
+            if let Some(o) = self.other.as_mut() {
+                drop_rows(&mut o.panels);
+            }
+            self.reset_view();
+        } else {
+            // the rows that were left out are gone from the lists: ask again, when next looked at
+            let s = self.scope.clone();
+            self.set_scope(s);
+        }
     }
 
     fn refresh_repos_panels(&mut self) {
@@ -3373,6 +3473,12 @@ impl App {
 
     /// `r`: just the selected item (its cached details) and the list tab it sits in.
     fn refresh_selected(&mut self) {
+        // a search for this section is already out: asking again would only spend the minute's budget
+        let p = &self.panels[self.focus];
+        if self.ctx.is_none() && p.kind.is_global_search() && p.loading {
+            self.status = "already searching".into();
+            return;
+        }
         let key = self.selected().map(Item::key);
         if let Some(k) = &key {
             self.cache.retain(|(ik, _), _| ik != k);
@@ -3943,11 +4049,16 @@ mod tests {
         a.switch_repo("x/y".into());
         assert!(a.cwd_branch.is_none() && a.pending_select.is_none());
         let stale = a.hgen - 1;
-        a.tx.send(Msg::Branch(stale, Some("old".into()))).unwrap();
+        a.tx.send(Msg::Branch("o/r".into(), Some("old".into())))
+            .unwrap();
         a.tx.send(Msg::User(stale, "mallory".into())).unwrap();
         a.poll();
-        assert!(a.cwd_branch.is_none() && !a.header.contains("mallory"));
-        a.tx.send(Msg::Branch(a.hgen, Some("new".into()))).unwrap();
+        assert!(
+            a.cwd_branch.is_none() && !a.header.contains("mallory"),
+            "a reply for the repo we left"
+        );
+        a.tx.send(Msg::Branch("x/y".into(), Some("new".into())))
+            .unwrap();
         a.poll();
         assert_eq!(a.cwd_branch.as_deref(), Some("new"));
     }
@@ -5100,7 +5211,7 @@ mod tests {
         let mut a = home();
         a.state_dir = Some(dir.clone());
         a.cfg.repos.favorites = vec!["a/b".into()];
-        let saved = || crate::state::load_scope(&dir.join("scope.json"));
+        let saved = || crate::state::load_scope(&dir.join("scope.json"), "github.com");
         // Favorites
         press(&mut a, 's');
         press(&mut a, 'j');
@@ -5192,11 +5303,12 @@ mod tests {
     fn hidden_repos_are_counted_in_the_section_not_listed() {
         let mut a = home();
         a.panels[0].seq = 4;
-        a.tx.send(Msg::GMeta(PK::Review, 4, 3, 0)).unwrap();
-        a.tx.send(Msg::GMeta(PK::Review, 3, 99, 0)).unwrap(); // a stale answer
+        a.tx.send(Msg::GMeta(PK::Review, 0, 4, 3, 0, None)).unwrap();
+        a.tx.send(Msg::GMeta(PK::Review, 0, 3, 99, 0, None))
+            .unwrap(); // a stale answer
         a.poll();
         assert_eq!(a.panels[0].hidden, 3);
-        a.tx.send(Msg::GMeta(PK::Review, 4, 0, 5)).unwrap();
+        a.tx.send(Msg::GMeta(PK::Review, 0, 4, 0, 5, None)).unwrap();
         a.poll();
         assert!(a.status.contains("+5 favorites not shown"), "{}", a.status);
     }
@@ -5470,14 +5582,32 @@ mod tests {
         a.panels[3].cursor = 0; // e/f
         press(&mut a, 'f');
         assert!(a.cfg.repos.is_fav("e/f"), "adding from Recent");
-        // H: hidden everywhere; the sections are searched again without it
+        // H: hidden everywhere; loaded sections just lose its rows, no search is spent
         a.panels[0].unloaded = false;
+        a.panels[0].items = vec![gitem("e/f", 1), gitem("a/b", 2), gitem("e/f", 3)];
+        a.panels[1].items = vec![gitem("e/f", 4)];
         press(&mut a, 'H');
         assert!(a.cfg.repos.is_hidden("e/f"));
-        assert!(
-            a.panels[0].unloaded,
-            "the sections reload when next focused"
+        assert!(!a.panels[0].unloaded && !a.panels[0].loading, "no reload");
+        assert_eq!(
+            a.panels[0]
+                .items
+                .iter()
+                .map(|i| i.number)
+                .collect::<Vec<_>>(),
+            [2]
         );
+        assert_eq!(
+            (
+                a.panels[0].hidden,
+                a.panels[1].items.len(),
+                a.panels[1].hidden
+            ),
+            (2, 0, 1)
+        );
+        // unhiding cannot bring the rows back by itself: the sections are searched again
+        press(&mut a, 'H');
+        assert!(!a.cfg.repos.is_hidden("e/f") && a.panels[0].unloaded);
         // s: scope the home to that repo
         a.panels[3].cursor = 1; // a/b
         press(&mut a, 's');
@@ -5488,7 +5618,7 @@ mod tests {
         );
         assert!(a.header.contains("scope: repo:a/b"));
         assert_eq!(
-            crate::state::load_scope(&dir.join("scope.json")).as_deref(),
+            crate::state::load_scope(&dir.join("scope.json"), "github.com").as_deref(),
             Some("repo:a/b")
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -5551,7 +5681,10 @@ mod tests {
         let mut a = home();
         a.panels[0].seq = 3;
         press(&mut a, 'r');
-        assert!(a.panels[0].loading && a.panels[0].seq == 4);
+        assert!(
+            a.panels[0].loading && a.panels[0].seq != 3,
+            "a fresh, never-reused number"
+        );
         press(&mut a, '4');
         a.cfg.repos.favorites = vec!["a/b".into()];
         press(&mut a, 'r');
