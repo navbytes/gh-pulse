@@ -41,7 +41,11 @@ pub fn entries(app: &App) -> Vec<Entry> {
     add("Navigation", s("{ }"), "previous / next list tab");
     add("Navigation", s("j / k / arrows"), "move");
     add("Navigation", s("Ctrl-d / Ctrl-u"), "half page down / up");
-    add("Navigation", s("g / G / Home / End"), "top / bottom");
+    add(
+        "Navigation",
+        s("g / G / Home / End"),
+        "top / bottom (g groups instead in a global list; use Home)",
+    );
     add(
         "Navigation",
         k(Act::Filter),

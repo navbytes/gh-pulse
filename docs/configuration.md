@@ -41,6 +41,7 @@ cache = true              # on-disk cache of slow-changing lookups
 
 [ui]
 start = "auto"            # auto | repo | global (flag: --start)
+window = "7d"             # PRs in the global home updated within: 24h | 7d | 30d | all (W cycles it)
 
 [panels]
 show = ["prs", "files", "issues", "actions", "repo"]   # order = numbering
@@ -122,6 +123,12 @@ ownership checks); `[api] cache = false` turns caching off.
 | `auto` (default) | that repo | the global home |
 | `repo` | that repo | error: "not in a GitHub repo" |
 | `global` | the global home (`G` reaches the repo) | the global home |
+
+`[ui] window` is how far back the global home's pull request sections (Review requested, My PRs, Involved) look:
+`24h`, `7d` (default), `30d` or `all`. It is one `updated:>=` qualifier on the search you already make, so it costs
+no extra calls and shrinks the pages; issues and your own `[[sections]]` keep their full history. `W` cycles it for the
+session (the sections search again). Note that *updated* means last activity: a review request older than the window
+that nobody has touched since is hidden, so use `all` if you want to see everything that is waiting.
 
 Inside a git work tree `auto` asks GitHub which repo it is (one `gh repo view`); outside one it makes no call at all.
 The global home's panels come from `[panels] global` (any of `review`, `mine`, `assigned`, `involved`, `repos`,

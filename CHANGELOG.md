@@ -5,6 +5,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Global home: `g` groups a list by PR author or repo (headings show the count and longest wait, longest-waiting group first); each PR/issue row shows the time since its last update.
+- Global home: pull request sections only look at what was updated in a window, `7d` by default (`[ui] window`, `W` cycles 24h / 7d / 30d / all). One `updated:>=` qualifier on the existing search: no extra API calls.
+
 ### Changed
 - `?` opens a lazygit-style keybindings menu: grouped rows with a key column, a cursor, and `/` to filter.
 - `H` hides the selected row's repo from any global section (Review requested, My PRs, Issues, custom), not only from the Repos panel.
