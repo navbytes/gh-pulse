@@ -2,6 +2,8 @@
 
 **lazygit for GitHub: a keyboard-driven TUI over the `gh` CLI.**
 
+[Website](https://navbytes.github.io/gh-pulse/) · [Install](#installation) · [Documentation](docs/configuration.md)
+
 Numbered panels on the left, a detail pane on the right. Review pull requests (diffs, checks, review threads),
 triage issues, watch workflow runs, browse branches and releases, and act on all of it without leaving the
 terminal. It shells out to [`gh`](https://cli.github.com), so there is no token handling: whatever `gh` can
