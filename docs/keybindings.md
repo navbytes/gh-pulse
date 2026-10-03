@@ -7,7 +7,7 @@ Press `?` in the app for the same list. Keys are checked against `src/app.rs` (`
 
 | Key | Action |
 |---|---|
-| `?` | Help popup (sized to its content; `j` `k` scroll when the terminal is short, any other key closes) |
+| `?` | Keybindings menu (lazygit style): grouped rows with a key column; `j` `k` / arrows move, `/` filters by key, description or section (Enter keeps the filter), `Esc` clears the filter and then closes (`q` closes too) |
 | `q` | Quit (closes the log view first when one is open) |
 | `Ctrl-C` | Quit, from anywhere including popups |
 | `1`-`7` | Focus panel by number (`1` to the number of panels shown, at most `7`; `Tab` / `Shift-Tab` reach any beyond that, e.g. with custom `[[sections]]`; a PR drill-in has 4). Pressing the number of the already focused panel steps to its next list tab |

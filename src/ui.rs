@@ -14,74 +14,6 @@ use ratatui::{
 const MIN_W: u16 = 50;
 const MIN_H: u16 = 12;
 
-/// The `?` text. Remappable actions show whatever keys the active keymap gives them.
-fn help_text(app: &App) -> String {
-    let k = |a: Act| app.keys.labels(a);
-    let n = app.panels.len();
-    format!(
-        "\
-Panels (default: Pull requests, Files, Issues, Actions, Repo; choose them in [panels])
-  {nums}, Tab/S-Tab  focus panel{rest} (its number again: next list tab)   {{ }}  previous/next list tab
-  Your own searches: [[sections]] in config.toml add panels (see docs/configuration.md)
-  j/k, arrows     move             Ctrl-d/u  half page     g/G or Home/End  top/bottom
-  {filter}  filter (Enter apply, Esc clear)
-  l/Right         focus the detail pane   h/Esc/Left  back to the list
-  {global}  (list focus) switch between the repo and the global home; in Files and PR drill-in it jumps to the last row
-  {browser}  repo browser: all your repos (search, sort, favorite, hide, Enter switches)
-  {inbox}  inbox: unread notifications of all repos (Enter opens it here, m marks read, o browser)
-Global home (opens outside a repo or with --start global; [panels] global picks the sections)
-  Review requested, My PRs, Issues, Repos: searches across all your repos, newest update first
-  {scope}  scope: all / favorites / an org / one repo      {switch}  open the selected item's repo (G returns)
-  Repos panel: Enter open the repo   {scope} scope the home to it   {zoom} favorite
-  H  hide the selected row's repo (any section; unhide in the Repos panel or the browser, `.` shows hidden)
-Repo panel (Branches / Tags / Releases tabs)
-  Enter/l  details (a tag: commit, date, release)   {copy} on a tag copies its name   {actions}  branch/release actions
-Pull requests
-  Files panel follows the selected PR; j/k there changes the file shown in the diff
-  Enter on a PR drills in: Files / Commits / Checks / Comments of that PR (Esc returns)
-  Commits: j/k picks a commit, the right pane shows its diff (n/p file, t/w/{zoom} as in Diff)
-  [ ]  detail tab (Overview/Checks/Comments/Diff/Commits); in a PR drill-in: next/prev panel
-Diff
-  j/k line   Ctrl-d/u half page   g/G first/last row   n/p file   t unified/split/auto
-  w wrap/clip   v mark file viewed   {zoom} zoom
-Comments
-  j/k move by comment   Ctrl-d/u half page (inside a tall comment first)
-  Enter  expand/collapse (long comments, <details>)   e  show who reacted (asks GitHub once per comment)
-Actions (always asks to confirm, shows the exact command)
-  {actions}  action menu for the selected item / row    {approve} approve  {comment} comment  {merge} merge
-  n  new issue (Issues panel) / new PR from the cwd branch (PR panel)   d  run workflow (Actions panel)
-  Forms: Tab/S-Tab fields, Space toggles, Left/Right pickers, Ctrl-S review the command, Esc cancel
-  Input popups: Enter newline, Ctrl-S submit, Esc cancel
-Mouse: click panel/row/tab, wheel scrolls
-Anywhere
-  {open}  open in browser    {copy}  copy URL    {checkout}  checkout selected PR
-  {refresh}  refresh the selected item and its list      {refresh_all}  reload everything (skips the cache)    {log}  command log
-  {help}  this help    {quit}  quit
-(remap the keys marked above in config.toml, see docs/configuration.md)",
-        nums = if n > 1 { format!("1-{}", n.min(7)) } else { "1".into() },
-        rest = if n > 7 { " (digits stop at 7, Tab reaches the rest)" } else { "" },
-        filter = k(Act::Filter),
-        global = k(Act::Global),
-        browser = k(Act::Browser),
-        inbox = k(Act::Inbox),
-        scope = k(Act::Scope),
-        switch = k(Act::SwitchRepoContext),
-        zoom = k(Act::Zoom),
-        actions = k(Act::Actions),
-        approve = k(Act::Approve),
-        comment = k(Act::Comment),
-        merge = k(Act::Merge),
-        open = k(Act::Open),
-        copy = k(Act::CopyUrl),
-        checkout = k(Act::Checkout),
-        refresh = k(Act::Refresh),
-        refresh_all = k(Act::RefreshAll),
-        log = k(Act::CommandLog),
-        help = k(Act::Help),
-        quit = k(Act::Quit),
-    )
-}
-
 pub fn draw(f: &mut Frame, app: &App) {
     let th = &app.theme;
     let area = f.area();
@@ -239,56 +171,96 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
 }
 
-/// Help text wrapped to the popup width: headings bold, continuation lines indented under their line.
-fn help_lines(app: &App, w: usize) -> Vec<Line<'static>> {
+/// The `?` keybindings menu (lazygit style): grouped rows with a key column, a cursor, `/` filter.
+fn help_popup(f: &mut Frame, app: &App, area: Rect) {
+    use unicode_width::UnicodeWidthStr;
     let th = &app.theme;
-    let mut out = vec![];
-    for l in help_text(app).lines() {
-        let indent = l.len() - l.trim_start().len();
-        if indent == 0 {
-            out.push(Line::styled(
-                l.to_string(),
+    let all = crate::help::entries(app);
+    let rows = crate::help::visible(&all, &app.help_filter);
+    app.help_max.set(rows.len());
+    let cursor = app.help_scroll.min(rows.len().saturating_sub(1));
+    let w = area.width.saturating_sub(4).clamp(40, 100);
+    let h = area.height.saturating_sub(2).clamp(5, 34);
+    let a = area.centered(Constraint::Length(w), Constraint::Length(h));
+    let inner_w = w.saturating_sub(2) as usize;
+    let page = h.saturating_sub(2) as usize;
+    let keyw = rows
+        .iter()
+        .map(|e| e.key.width())
+        .max()
+        .unwrap_or(0)
+        .min(inner_w / 3)
+        + 1;
+
+    // display lines: a heading whenever the section changes, then one line per row
+    let mut lines: Vec<Line<'static>> = vec![];
+    let mut cursor_line = 0;
+    let mut last = "";
+    for (i, e) in rows.iter().enumerate() {
+        if e.section != last {
+            last = e.section;
+            lines.push(Line::styled(
+                format!(" {}", e.section),
                 Style::new().fg(th.accent).bold(),
             ));
-            continue;
         }
-        let pad = " ".repeat(indent);
-        for (k, row) in wrap(l.trim_start(), w.saturating_sub(indent + 2))
-            .into_iter()
-            .enumerate()
-        {
-            let extra = if k == 0 { "" } else { "  " };
-            out.push(Line::raw(format!("{pad}{extra}{row}")));
+        if i == cursor {
+            cursor_line = lines.len();
         }
+        let key = mid_ellipsis(&e.key, keyw.saturating_sub(1), th.ic.ell);
+        let pad = " ".repeat(keyw.saturating_sub(key.width()));
+        let desc = mid_ellipsis(&e.desc, inner_w.saturating_sub(keyw + 3), th.ic.ell);
+        let mut line = Line::from(vec![
+            Span::styled(format!("  {key}{pad}"), Style::new().fg(th.ok)),
+            Span::raw(desc),
+        ]);
+        if i == cursor {
+            let used = line.width();
+            line.push_span(Span::raw(" ".repeat(inner_w.saturating_sub(used))));
+            line = line.style(Style::new().bg(th.sel_bg).bold());
+        }
+        lines.push(line);
     }
-    out
-}
+    if rows.is_empty() {
+        lines.push(Line::styled(
+            "  No matching keybindings",
+            Style::new().fg(th.muted),
+        ));
+    }
+    // keep the cursor in view, and its heading when it is the first row of a section
+    let mut top = app.help_top.get().min(lines.len().saturating_sub(page));
+    if cursor_line < top {
+        top = cursor_line;
+    } else if cursor_line >= top + page {
+        top = cursor_line + 1 - page;
+    }
+    if cursor_line == top + 1 && top > 0 {
+        top -= 1; // the section heading sits right above
+    }
+    if cursor_line <= 1 {
+        top = 0;
+    }
+    app.help_top.set(top);
 
-/// Sized to the longest line (up to the terminal), wrapping or scrolling (j/k) when it doesn't fit.
-fn help_popup(f: &mut Frame, app: &App, area: Rect) {
-    let text = help_text(app);
-    let longest = text.lines().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
-    let w = (longest + 4).min(area.width.saturating_sub(2)).max(20);
-    let inner_w = w.saturating_sub(2) as usize;
-    let lines = help_lines(app, inner_w);
-    let h = (lines.len() as u16 + 2)
-        .min(area.height.saturating_sub(2))
-        .max(3);
-    let rows = h.saturating_sub(2) as usize;
-    let max = lines.len().saturating_sub(rows);
-    app.help_max.set(max);
-    let top = app.help_scroll.min(max);
-    let title = if max > 0 {
-        " Keys (j/k scroll, any other key closes) "
+    let footer = if app.help_typing {
+        format!(" /{}_ ", app.help_filter)
+    } else if !app.help_filter.is_empty() {
+        format!(" filter: {}  (Esc clears) ", app.help_filter)
     } else {
-        " Keys "
+        " / filter  j/k move  Esc close ".to_string()
     };
-    let a = area.centered(Constraint::Length(w), Constraint::Length(h));
+    let count = if rows.is_empty() {
+        String::new()
+    } else {
+        format!(" {} of {} ", cursor + 1, rows.len())
+    };
     f.render_widget(Clear, a);
     f.render_widget(
-        Paragraph::new(lines)
-            .scroll((top as u16, 0))
-            .block(popup_block(app, title.into())),
+        Paragraph::new(lines).scroll((top as u16, 0)).block(
+            popup_block(app, " Keybindings ".into())
+                .title_bottom(Line::styled(footer, Style::new().fg(th.muted)))
+                .title_bottom(Line::styled(count, Style::new().fg(th.muted)).right_aligned()),
+        ),
         a,
     );
 }
@@ -2962,32 +2934,51 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
     }
 
     #[test]
-    fn help_popup_fits_or_scrolls() {
+    fn help_menu_lists_keys_scrolls_and_filters() {
         let mut a = seeded();
         key(&mut a, KeyCode::Char('?'));
-        let s = render_app(&a, 200, 50);
-        for want in [
-            "(Esc returns)",
-            "previous/next list tab",
-            "Repo panel (Branches / Tags / Releases tabs)",
-            "m merge",
-            "f zoom",
-            "g/G first/last row",
-        ] {
-            assert!(s.contains(want), "200 cols: missing {want:?}\n{s}");
+        let s = render_app(&a, 120, 50);
+        for want in ["Keybindings", "Navigation", "focus a panel", "/ filter"] {
+            assert!(s.contains(want), "missing {want:?}\n{s}");
         }
-        let s = render_app(&a, 80, 24); // too small for everything: wraps and scrolls
         assert!(
-            s.contains("Keys (j/k scroll") && s.contains("Panels (default"),
-            "{s}"
+            !s.contains("Anywhere"),
+            "the last section is below the fold\n{s}"
         );
-        for _ in 0..40 {
+        let s = render_app(&a, 80, 14); // short: the cursor scrolls the list
+        assert!(s.contains("Navigation") && !s.contains("quit"), "{s}");
+        for _ in 0..80 {
             key(&mut a, KeyCode::Char('j'));
         }
-        let s = render_app(&a, 80, 24);
-        assert!(s.contains("quit"), "scrolled to the end\n{s}");
-        key(&mut a, KeyCode::Char('x')); // any other key closes
-        assert!(!a.help && !render_app(&a, 80, 24).contains("Keys"));
+        let s = render_app(&a, 80, 14);
+        assert!(
+            s.contains("Anywhere") && !s.contains("focus a panel"),
+            "{s}"
+        );
+        // filtering narrows the rows, matches section names, and shows the count
+        key(&mut a, KeyCode::Char('g'));
+        key(&mut a, KeyCode::Char('/'));
+        for c in "who reacted".chars() {
+            key(&mut a, KeyCode::Char(c));
+        }
+        let s = render_app(&a, 120, 30);
+        assert!(
+            s.contains("show who reacted") && s.contains("1 of 1") && !s.contains("Anywhere"),
+            "{s}"
+        );
+        key(&mut a, KeyCode::Enter); // keep the filter, leave typing
+        assert!(render_app(&a, 120, 30).contains("filter: who reacted"));
+        key(&mut a, KeyCode::Esc); // first Esc clears the filter ...
+        assert!(a.help && render_app(&a, 120, 50).contains("focus a panel"));
+        key(&mut a, KeyCode::Esc); // ... the second closes
+        assert!(!a.help && !render_app(&a, 120, 50).contains("Keybindings"));
+        // a filter with no match says so
+        key(&mut a, KeyCode::Char('?'));
+        key(&mut a, KeyCode::Char('/'));
+        key(&mut a, KeyCode::Char('z'));
+        key(&mut a, KeyCode::Char('z'));
+        key(&mut a, KeyCode::Char('z'));
+        assert!(render_app(&a, 120, 30).contains("No matching keybindings"));
     }
 
     #[test]
@@ -3269,22 +3260,26 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
             "{bar}"
         );
         key(&mut a, KeyCode::Char('!')); // the new help key works...
+        key(&mut a, KeyCode::Char('/')); // "menu" matches the action menu and this menu
+        for c in "menu".chars() {
+            key(&mut a, KeyCode::Char(c));
+        }
         let s = render_app(&a, 200, 60);
         assert!(
-            s.contains("z  action menu") && s.contains("b / ctrl-b  repo browser"),
+            s.contains("z action menu") && !s.contains("x action menu"),
             "{s}"
         );
         assert!(
-            s.contains("!  this help")
-                && !s.contains("x  action menu")
-                && !s.contains("?  this help"),
+            s.contains("! this menu") && !s.contains("? this menu"),
             "{s}"
         );
-        assert!(
-            s.contains("e  show who reacted")
-                && s.contains("Ctrl-d/u half page (inside a tall comment first)"),
-            "{s}"
-        );
+        for _ in 0..4 {
+            key(&mut a, KeyCode::Backspace);
+        }
+        for c in "browser".chars() {
+            key(&mut a, KeyCode::Char(c));
+        }
+        assert!(render_app(&a, 200, 60).contains("b / ctrl-b"));
     }
 
     #[test]
@@ -4644,14 +4639,14 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
     #[test]
     fn the_help_panel_line_follows_the_active_layout() {
         use crate::config::{SectionCfg, SectionKind, Where};
-        let help = |a: &App| help_text(a).lines().nth(1).unwrap().to_string();
+        let help = |a: &App| crate::help::entries(a).swap_remove(0).key;
         let a = app(false, IconSet::Unicode);
+        assert_eq!(help(&a), "1-5 / Tab / S-Tab");
         assert!(
-            help(&a).starts_with("  1-5, Tab/S-Tab  focus panel (its number"),
-            "{}",
-            help(&a)
+            crate::help::entries(&a)
+                .iter()
+                .any(|e| e.key == "[[sections]]")
         );
-        assert!(help_text(&a).contains("[[sections]] in config.toml"));
         let cfg = crate::config::Config {
             sections: (0..3)
                 .map(|i| SectionCfg {
@@ -4670,13 +4665,7 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
             false,
             cfg,
         );
-        assert!(
-            help(&b).starts_with(
-                "  1-7, Tab/S-Tab  focus panel (digits stop at 7, Tab reaches the rest)"
-            ),
-            "{}",
-            help(&b)
-        );
+        assert_eq!(help(&b), "1-7 / Tab / S-Tab");
     }
 
     #[test]

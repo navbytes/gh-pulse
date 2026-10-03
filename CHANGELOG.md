@@ -3,6 +3,12 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+- `?` opens a lazygit-style keybindings menu: grouped rows with a key column, a cursor, and `/` to filter.
+- `H` hides the selected row's repo from any global section (Review requested, My PRs, Issues, custom), not only from the Repos panel.
+
 ## [0.3.0]
 
 ### Changed
