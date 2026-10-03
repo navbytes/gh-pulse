@@ -51,10 +51,12 @@ The Files panel (2) has no filter and follows the selected PR; the Checks and Co
 Sections: `1` Review requested, `2` My PRs (`{` `}`: Open / Merged / Closed), `3` Issues (Assigned / Mine / Mentioned),
 `4` Repos (Favorites / Recent); `[panels] global` reorders, drops or adds Involved and Files. Everything else (detail
 tabs, drill-in with `Enter`, actions, `x`, `a`, `m`, `C`) works on a row with that row's repo.
+Custom `[[sections]]` follow the built-in panels (`5`, `6`, ... or `Tab`); they search when first focused, `r` searches again,
+and `s` applies to those whose filter has no `repo:` / `org:` / `user:` of its own (their title says `(own filter)`).
 
 | Key | Action |
 |---|---|
-| `s` | Scope picker: `j` `k` / arrows, `Enter` picks, typing filters Org... and Repo... lists (a full `owner/name` is accepted), `Backspace` goes back, `Esc` cancels |
+| `s` | Scope picker: `j` `k` / arrows, `Enter` picks, typing filters Org... and Repo... lists (a full `owner/name` is accepted; in Org... any valid org or user name offers `Use org 'name'`, member or not), `Backspace` goes back, `Esc` cancels |
 | `S` | Open the row's repo as the app's repo; `G` leads back |
 | `r` | Search this section again |
 | Repos panel: `Enter` | Open the repo (`S` too) |

@@ -18,7 +18,7 @@
 - `r` / `R` fetch fresh data but cannot overwrite `gh --cache`'s stored copy: it expires on its own TTL (a plain request would otherwise repeat the old answer within that window).
 - Startup fetches only the PR and Issues lists in the batch; the Actions and Repo panels (REST) load on first focus and show a placeholder until then.
 - Reaction names make one extra call per commented card the first time `e` is pressed.
-- Global home: custom `[[sections]]` (your own saved search queries as panels) are not built yet; the five fixed sections cover review, authored, assigned and involved work.
+- Custom sections: no tabs (one search per section), no `sort`/`group` options, and `limit` is capped at 100 (a favorites scope still searches at most 16 repos, fewer when the filter has its own `OR`/`NOT` operators). Quotes only group words (`label:"a b"` is passed as `label:a b`, which `gh` quotes itself). Filters are not validated against GitHub's syntax beyond the character set and the 5-operator warning.
 - Global home: `gh search` returns no CI status, so rows show draft and merged/closed markers but no check marker; adding one needs a GraphQL search (more quota).
 - Global home: the Closed tab of My PRs is `is:closed is:unmerged` (merged PRs have their own tab); each section shows at most 100 rows per search (200 after a hidden-repo top-up).
 - Favorites scope searches at most 16 favorites per refresh (4 calls of 4 repos in an OR group); the rest are reported as "not shown" rather than silently dropped.

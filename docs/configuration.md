@@ -48,6 +48,11 @@ hide_empty = false
 [panels.repo]
 tabs = ["branches", "releases"]    # drop Tags
 default_tab = "branches"
+
+[[sections]]                       # your own search panels, see "Custom sections"
+title  = "Needs my review (acme)"
+kind   = "prs"                     # prs | issues
+filter = "is:open review-requested:@me org:acme draft:false"
 ```
 
 ## API etiquette
@@ -67,7 +72,7 @@ work for something you have already moved past is dropped before it starts (an a
 - **Quota awareness.** Our own GraphQL queries ask for `rateLimit { cost remaining resetAt limit }` (free) and `gh api
   rate_limit` is read at startup and every five minutes (also free). The `L` log shows each query's cost and the
   remaining quota. With less than `low_quota_percent` of the GraphQL or core quota left (or fewer than 5 search
-  requests) the header shows `⚡ remaining/limit` (`rate_header = false` hides it). Under `pause_percent` everything
+  requests; your own searches are counted locally between the five-minute checks, and `L` shows `search N/30 left`) the header shows `⚡ remaining/limit` (`rate_header = false` hides it). Under `pause_percent` everything
   automatic stops until the window resets (tab counts, automatic comment pages, the inbox badge poll; the quota
   check itself still runs) and the status line says `paused background refresh (rate limit low, resets HH:MM)`.
   Your own actions keep working; at exhaustion the usual rate-limit message includes the reset time. A secondary
@@ -123,7 +128,7 @@ search` call, or one per four favorites with the favorites scope, at most 4): `r
 archived:false`; `author:@me` with `is:open` / `is:merged` / `is:closed is:unmerged`; `assignee:@me`, `author:@me` or
 `mentions:@me` with `is:open` for issues; `involves:@me` (PRs and issues, two calls) for Involved. Rows from hidden
 repos (`[repos] hidden`, the repo browser's `h`) are dropped client side; when that empties a full page one bigger
-request tops it up. The scope (`all`, `favorites`, `org:x`, `repo:a/b`) is stored in `$XDG_STATE_HOME/gh-pulse/scope.json`.
+request tops it up. The scope (`all`, `favorites`, `org:x`, `repo:a/b`; `org:` also takes any org or user you type, member or not) is stored in `$XDG_STATE_HOME/gh-pulse/scope.json`.
 Search budget: one section refresh costs one search per scope chunk (two for Involved), so at most 8, plus - only
 for a single-chunk scope with at least 10 searches (and a third of the minute) left - one bigger re-ask of just the
 searches that came back full after hidden repos emptied a page. A refresh that the rest of the minute can't pay for
@@ -158,9 +163,99 @@ Any subset works, at least one is required, repeats are an error. Names:
 `[panels.prs]`, `[panels.issues]`, `[panels.actions]` and `[panels.repo]` take `tabs` (which list tabs to offer, in
 this order) and `default_tab` (which one opens first, and must be among `tabs`). Tab names: prs `mine` `review` `all`
 `merged`; issues `assigned` `mine` `all`; actions `runs` `workflows`; repo `branches` `tags` `releases`.
-`hide_empty = true` collapses a panel with nothing in any of its tabs to a single line (the focused panel never
+Custom searches from `[[sections]]` are named `section:<title>` here (see Custom sections). `hide_empty = true` collapses a panel with nothing in any of its tabs to a single line (the focused panel never
 collapses). A bad name is a startup error naming the file, the line and the valid choices. With `files` not shown, the
 Diff tab still works: `n` / `p` pick the file.
+
+## Custom sections
+
+`[[sections]]` adds your own GitHub searches as panels, like gh-dash's sections. Each entry is one panel, appended
+after the built-in ones (order them with `section:<title>` in `[panels] show` / `global`, see below).
+
+```toml
+[[sections]]
+title  = "Needs my review (acme)"   # panel name, 1..40 characters, unique
+kind   = "prs"                      # "prs" | "issues"
+filter = "is:open review-requested:@me org:acme draft:false"
+limit  = 50                         # optional, 1..100, default 30
+where  = "global"                   # "global" (default) | "repo" | "both"
+```
+
+| Key | Meaning |
+|---|---|
+| `title` | Panel title. Control characters are shown neutralized. Titles must be unique; at most 12 sections |
+| `kind` | `prs` runs `gh search prs`, `issues` runs `gh search issues` |
+| `filter` | GitHub search syntax, at most 256 characters, one line (see the rules below) |
+| `limit` | Rows to fetch (default 30, at most 100). A title count ending in `+` means the limit was reached |
+| `where` | `global`: a panel of the global home. `repo`: a panel of the repo home. `both`: both homes |
+
+**How the search is built.** The filter is split into terms (whitespace separates them; double quotes group words, so
+`label:"good first issue"` is one term) and each term is passed to `gh search` as its own argument after `--`, never
+through a shell and never as a flag. Added to your terms:
+
+- `archived:false`, unless the filter has an `archived:` qualifier.
+- Global home: the active scope (`s`: `org:x`, `repo:a/b`, or a group of favorites) **unless the filter already has a
+  `repo:`, `org:` or `user:` qualifier**. Then the scope does not apply, and the panel title says `(own filter)`.
+- Repo home (`where = "repo"` or `"both"`): `repo:<the current repo>`, unless the filter has its own `repo:`.
+- If the filter uses `OR`, it is wrapped in parentheses first, so the added qualifiers apply to the whole thing.
+- `@me` is you, as in the built-in sections.
+
+**Rules (checked at startup, errors name `file:line`).** No control characters or newlines; terms may not start with
+`--`; the characters allowed are letters, digits and `- _ . : / @ * < > = ! , ~ ( ) ' # + ?` (so no `$`, backtick, `;`,
+`|`, `&` or `\`). GitHub allows at most 5 `AND` / `OR` / `NOT` operators in a query; `-qualifier` terms count too. More
+than 5 is a **warning** at startup (the status line), not an error, because GitHub decides in the end. With the
+favorites scope each group of favorites uses operators as well (`OR` between repos); a filter that already uses
+operators gets smaller groups (down to one repo per search, so fewer favorites are searched; the rest are reported as
+"not shown").
+
+**Behavior.** A section is lazy: its title count is `?` until you focus it, then it makes one search (favorites scope:
+one per group of up to four repos, at most four; the same guards and quota refusal as the built-in sections). `r`
+searches it again, `s` changes the scope for sections without their own scope qualifier. Hidden repos
+(`[repos] hidden`) are dropped client side, with the same one-time top-up request as the built-in sections. Rows, the
+detail pane (Overview / Checks / Comments / Diff / Commits), drill-in, actions and `-R` behave like the other global
+panels. In the global home a `kind = "prs"` section also feeds the Files panel.
+
+Referring to a section in `[panels]`: `show = ["prs", "section:Bugs"]` places it in the repo home,
+`global = ["section:Needs my review (acme)", "review"]` in the global home. An unknown title, or a section whose
+`where` does not include that home, is an error. Sections not listed are appended after the built-in panels.
+Number keys `1`-`7` focus the first seven panels; use `Tab` for the rest.
+
+Examples, in the spirit of gh-dash:
+
+```toml
+[[sections]]
+title  = "My open PRs"
+kind   = "prs"
+filter = "is:open author:@me"
+
+[[sections]]
+title  = "Needs my review"
+kind   = "prs"
+filter = "is:open review-requested:@me -author:app/dependabot draft:false"
+
+[[sections]]
+title  = "Bugs I own"
+kind   = "issues"
+filter = "is:open assignee:@me label:bug"
+
+[[sections]]
+title  = "Good first issues"
+kind   = "issues"
+filter = 'is:open label:"good first issue" org:cli'   # own scope: the `s` scope does not apply
+limit  = 20
+
+[[sections]]
+title  = "Stale PRs here"
+kind   = "prs"
+filter = "is:open updated:<2026-01-01"
+where  = "repo"                                       # only in the repo home, for the current repo
+
+[[sections]]
+title  = "Team PRs"
+kind   = "prs"
+filter = "is:open (author:alice OR author:bob)"
+where  = "both"
+```
 
 ## Syncing viewed marks with GitHub
 
