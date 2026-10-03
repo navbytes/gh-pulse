@@ -39,7 +39,7 @@ Diff
   w wrap/clip   v mark file viewed   {zoom} zoom
 Comments
   j/k move by comment   Ctrl-d/u half page (inside a tall comment first)
-  Enter  expand/collapse (long comments, <details>)   e  show who reacted
+  Enter  expand/collapse (long comments, <details>)   e  show who reacted (asks GitHub once per comment)
 Actions (always asks to confirm, shows the exact command)
   {actions}  action menu for the selected item / row    {approve} approve  {comment} comment  {merge} merge
   n  new issue (Issues panel) / new PR from the cwd branch (PR panel)   d  run workflow (Actions panel)
@@ -48,7 +48,7 @@ Actions (always asks to confirm, shows the exact command)
 Mouse: click panel/row/tab, wheel scrolls
 Anywhere
   {open}  open in browser    {copy}  copy URL    {checkout}  checkout selected PR
-  {refresh}  refresh panel      {refresh_all}  refresh all    {log}  command log
+  {refresh}  refresh the selected item and its list      {refresh_all}  reload everything (skips the cache)    {log}  command log
   {help}  this help    {quit}  quit
 (remap the keys marked above in config.toml, see docs/configuration.md)",
         filter = k(Act::Filter),
@@ -129,8 +129,25 @@ pub fn draw(f: &mut Frame, app: &App) {
     let bw = badge.as_ref().map_or(0, |b| {
         unicode_width::UnicodeWidthStr::width(b.as_str()) as u16
     });
-    let [head, badge_area] =
-        Layout::horizontal([Constraint::Min(0), Constraint::Length(bw)]).areas(head);
+    // `⚡ 412/5000` when the quota is low, left of the badge
+    let chip = app
+        .quota_chip()
+        .map(|c| format!("{} {}/{} ", th.ic.zap, c.remaining, c.limit));
+    let cw = chip.as_ref().map_or(0, |c| {
+        unicode_width::UnicodeWidthStr::width(c.as_str()) as u16
+    });
+    let [head, chip_area, badge_area] = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(cw),
+        Constraint::Length(bw),
+    ])
+    .areas(head);
+    if let Some(c) = chip {
+        f.render_widget(
+            Paragraph::new(Span::styled(c, Style::new().fg(th.err).bold())),
+            chip_area,
+        );
+    }
     // repo, branch and user always; the repo facts are dropped from the right as the width shrinks
     let mut facts = vec![];
     if app.ctx.is_none()
@@ -662,6 +679,9 @@ fn bar_line(app: &App) -> Line<'static> {
         return Line::styled(app.status.clone(), Style::new().fg(th.warn));
     }
     let mut spans = vec![];
+    if let Some(n) = app.pause_note() {
+        spans.push(Span::styled(format!("{n}  "), Style::new().fg(th.warn)));
+    }
     for tok in hints(app).split("  ") {
         match tok.split_once(' ') {
             Some((k, d)) => {
@@ -883,9 +903,12 @@ struct Part {
     active: bool,
 }
 
-fn count_txt(app: &App, c: Option<(usize, bool)>) -> String {
+fn count_txt(app: &App, c: Option<(usize, bool)>, wanted: bool, failed: bool) -> String {
     match c {
-        None => app.theme.ic.ell.to_string(),
+        None if failed => app.theme.ic.fail.to_string(),
+        // `…` while a count is on its way, `?` when it is only fetched once the tab is opened
+        None if wanted => app.theme.ic.ell.to_string(),
+        None => "?".to_string(),
         Some((n, true)) => format!("{n}+"),
         Some((n, false)) => n.to_string(),
     }
@@ -914,7 +937,15 @@ fn tab_title(app: &App, i: usize, short_name: bool, short_tabs: bool) -> Vec<Par
         }
         let label = if short_tabs { t.short } else { t.label };
         v.push(Part {
-            text: format!("{label} {}", count_txt(app, app.tab_count(i, ti))),
+            text: format!(
+                "{label} {}",
+                count_txt(
+                    app,
+                    app.tab_count(i, ti),
+                    app.count_wanted(i, ti),
+                    app.tab_failed(i, ti)
+                )
+            ),
             tab: Some(ti),
             active: ti == p.tab,
         });
@@ -947,6 +978,7 @@ fn simple_title(app: &App, i: usize, with_tab: bool, short_name: Option<bool>) -
         (PK::Status, _) => String::new(),
         (_, Some((n, true))) => format!("({n}+)"),
         (_, Some((n, false))) => format!("({n})"),
+        (_, None) if app.tab_failed(i, p.tab) => format!("({})", th.ic.fail),
         (_, None) => format!("({})", th.ic.ell),
     };
     let text = format!(" [{}] {name}{extra}{count} ", i + 1);
@@ -1041,6 +1073,7 @@ fn panel(f: &mut Frame, app: &App, i: usize, area: Rect, compact: bool) {
         let n = match &p.error {
             Some(e) => Note::Err(e.clone()),
             None if p.loading => Note::Loading,
+            None if p.unloaded => Note::Empty("loads when you focus it"),
             None if p.kind.derived() && app.pr_item().is_none() => {
                 Note::Empty("select a pull request")
             }
@@ -1529,7 +1562,8 @@ fn reactions_line(app: &App, c: &crate::gh::Card, open: bool) -> Option<Line<'st
         .iter()
         .map(|r| {
             let l = reaction_label(th, &r.content);
-            if open {
+            // names come with a second call after `e`; until then the count stands
+            if open && !r.users.is_empty() {
                 let more = (r.count as usize).saturating_sub(r.users.len());
                 let extra = if more > 0 {
                     format!(" +{more}")
@@ -4245,5 +4279,126 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
             !s.contains("MIT License") && s.contains("Overview"),
             "an item replaces it\n{s}"
         );
+    }
+
+    fn low_rate(remaining: u32, reset: u64) -> crate::rate::RateState {
+        crate::rate::RateState {
+            graphql: Some(crate::rate::Bucket {
+                limit: 5000,
+                remaining,
+                reset,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn low_quota_shows_a_chip_and_a_pause_note() {
+        let later = crate::rate::now() + 3600;
+        for (w, h) in [(80u16, 24u16), (120, 40)] {
+            let mut a = app(false, IconSet::Unicode);
+            a.seed_unread(&["a/b"]);
+            let plain = render_app(&a, w, h);
+            assert!(!plain.contains('\u{26a1}'), "no chip with plenty of quota");
+            a.rate = low_rate(412, later);
+            let s = render_app(&a, w, h);
+            let head = s.lines().next().unwrap().trim_end().to_string();
+            assert!(
+                head.contains('\u{26a1}') && head.contains("412/5000"),
+                "{w}: {head:?}"
+            );
+            assert!(
+                head.ends_with("\u{2709} 1"),
+                "the badge keeps the edge next to the chip: {head:?}"
+            );
+            // not paused at 8%: no note; the bar is untouched
+            assert!(!s.contains("paused background"));
+            // paused: the note leads the bar and names when it ends
+            a.rate = low_rate(300, later);
+            a.paused = true;
+            a.rate_clock = Some((later, "14:05".into()));
+            let s = render_app(&a, w, h);
+            let bar = s.lines().last().unwrap();
+            assert!(
+                bar.contains("paused background refresh (rate limit low, resets 14:05)"),
+                "{w}: {bar:?}"
+            );
+            // [api] rate_header = false hides the chip but not the pause
+            a.cfg.api.rate_header = false;
+            let s = render_app(&a, w, h);
+            assert!(!s.contains('\u{26a1}') && s.contains("paused background"));
+        }
+        let mut a = app(false, IconSet::Ascii);
+        a.rate = low_rate(412, crate::rate::now() + 60);
+        assert!(
+            render_app(&a, 120, 24)
+                .lines()
+                .next()
+                .unwrap()
+                .contains("! 412/5000")
+        );
+    }
+
+    #[test]
+    fn counts_that_are_not_fetched_by_themselves_show_a_question_mark() {
+        let a = app(false, IconSet::Unicode);
+        let s = render_app(&a, 120, 40);
+        let prs = line_of(&s, "[1]");
+        assert!(
+            prs.contains("Rev ?"),
+            "search-backed tabs wait to be opened: {prs}"
+        );
+        assert!(
+            prs.contains("All \u{2026}") && prs.contains("Mrg \u{2026}"),
+            "plain lists are on their way: {prs}"
+        );
+        let mut off = app(false, IconSet::Unicode);
+        off.cfg.api.counts = crate::config::Counts::Off;
+        let s = render_app(&off, 120, 40);
+        assert!(
+            line_of(&s, "[5]").contains("Tags ?"),
+            "{}",
+            line_of(&s, "[5]")
+        );
+        let mut g = app(false, IconSet::Unicode);
+        g.global = true;
+        assert!(line_of(&render_app(&g, 120, 40), "[3]").contains("All ?"));
+    }
+
+    #[test]
+    fn panels_that_have_not_been_focused_say_so_instead_of_claiming_to_be_empty() {
+        let mut a = app(false, IconSet::Unicode);
+        let i = a.panel_idx_for_test(crate::app::PK::Repo);
+        a.panels[i].unloaded = true;
+        let s = render_app(&a, 120, 40);
+        assert!(
+            s.contains("loads when you focus it") && !line_of(&s, "[5]").contains("Branches 0"),
+            "{s}"
+        );
+        key(&mut a, KeyCode::Char('5'));
+        assert!(!a.panels[i].unloaded, "focusing loads it");
+    }
+
+    #[test]
+    fn a_failed_tab_shows_a_cross_not_zero() {
+        let mut a = app(false, IconSet::Unicode);
+        a.panels[0].error = Some("gh timed out after 60s".into());
+        a.count_failed.insert((crate::app::PK::Prs, 2));
+        for (w, h) in [(120u16, 40u16), (80, 24)] {
+            let s = render_app(&a, w, h);
+            let t = line_of(&s, "[1]");
+            assert!(
+                t.contains('\u{2717}') && !t.contains("Mine 0") && !t.contains("(0)"),
+                "{w}: {t}"
+            );
+        }
+        let t = line_of(&render_app(&a, 120, 40), "[1]");
+        assert!(
+            t.matches('\u{2717}').count() == 2,
+            "the active tab and the failed count: {t}"
+        );
+        let mut ascii = app(false, IconSet::Ascii);
+        ascii.panels[0].error = Some("x".into());
+        assert!(line_of(&render_app(&ascii, 120, 40), "[1]").contains("Mine x"));
     }
 }

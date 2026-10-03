@@ -20,6 +20,8 @@ pub struct Icons {
     pub star: &'static str,
     /// Unread-notifications badge.
     pub mail: &'static str,
+    /// Low-quota chip.
+    pub zap: &'static str,
     pub unread: &'static str,
     /// Soft-wrap continuation marker.
     pub cont: &'static str,
@@ -47,6 +49,7 @@ impl Icons {
                 branch: "",
                 star: "*",
                 mail: "@",
+                zap: "!",
                 unread: "*",
                 cont: ">",
                 thread: "#",
@@ -68,6 +71,7 @@ impl Icons {
                 branch: "⎇ ",
                 star: "★",
                 mail: "✉",
+                zap: "⚡",
                 unread: "●",
                 cont: "↪",
                 thread: "◆",
@@ -89,6 +93,7 @@ impl Icons {
                 branch: "\u{e0a0} ",
                 star: "\u{f005}",
                 mail: "\u{f0e0}",
+                zap: "\u{f0e7}",
                 unread: "\u{f111}",
                 cont: "↪",
                 thread: "\u{f27b}",

@@ -27,6 +27,16 @@ hidden = ["octocat/old-experiments"]
 quit = ["q", "ctrl-q"]
 actions = "space"
 
+[api]
+max_concurrent = 4        # gh processes at once (1..8)
+counts = "lazy"           # lazy | eager | off: how tab counts are fetched
+low_quota_percent = 20    # show the quota chip below this
+pause_percent = 10        # stop background refreshing below this
+rate_header = true        # the chip at all
+settle_ms = 250           # idle time before a Comments/Diff/Commits/Checks fetch
+timeout_s = 60            # a gh read that takes longer is killed (pagination 2x, writes 5x)
+cache = true              # on-disk cache of slow-changing lookups
+
 [panels]
 show = ["prs", "files", "issues", "actions", "repo"]   # order = numbering
 hide_empty = false
@@ -35,6 +45,62 @@ hide_empty = false
 tabs = ["branches", "releases"]    # drop Tags
 default_tab = "branches"
 ```
+
+## API etiquette
+
+gh-pulse is a polite client. Every `gh` process runs through one small worker pool: at most `max_concurrent`
+(default 4) at once, what you asked for (the selected item, actions, forms) before anything automatic, and queued
+work for something you have already moved past is dropped before it starts (an already-running `gh` is left to finish).
+
+- **Reliability.** Every `gh` child has a deadline (`timeout_s`, default 60 s; paginated reads double it, writes get five
+  times) and is killed with a `gh timed out after Ns` error; children still running when you quit are killed. A job
+  that panics or is lost reports an error instead of leaving a panel on "loading...". Writes (a confirmed command, the
+  `sync_viewed` mark) run on a thread of their own, never behind reads, never dropped for lack of room. The repo
+  browser loads one page per job so a long account does not hold a worker.
+- **Startup** is one GraphQL request: the active tab of the PR and Issues lists, who you are, the repo's header facts
+  and the quota. The Actions and Repo panels (REST) load when you first focus them. Failing that request (not a rate
+  limit) falls back to the old one-command-per-panel loading.
+- **Quota awareness.** Our own GraphQL queries ask for `rateLimit { cost remaining resetAt limit }` (free) and `gh api
+  rate_limit` is read at startup and every five minutes (also free). The `L` log shows each query's cost and the
+  remaining quota. With less than `low_quota_percent` of the GraphQL or core quota left (or fewer than 5 search
+  requests) the header shows `⚡ remaining/limit` (`rate_header = false` hides it). Under `pause_percent` everything
+  automatic stops until the window resets (tab counts, automatic comment pages, the inbox badge poll; the quota
+  check itself still runs) and the status line says `paused background refresh (rate limit low, resets HH:MM)`.
+  Your own actions keep working; at exhaustion the usual rate-limit message includes the reset time. A secondary
+  limit or `Retry-After` message backs the automatic work off for the time GitHub names.
+- **Tab counts** (`[panels]` titles; a list or count that failed shows `✗`, never `0`, and a failed count is not retried until the next reload). `lazy` (default): the focused panel's other tabs, one at a time, after a second
+  of idling; never in the global view; never for tabs backed by GitHub's search (Mine / Review requested PRs,
+  Assigned / Mine issues), which show `?` until you open them. `eager` fetches every panel's tabs (still skipping
+  search-backed ones); `off` never fetches (`?`). The tab you are on always counts its own list.
+- **Comments.** The first request fetches 50 items per connection and 20 replies per thread, reactions as counts
+  only; `e` fetches the names of one comment's reactors. The rest pages in as background work (5 pages, then
+  scroll or `m`), and not at all while the quota is low.
+- **Settle delay.** The Overview of the selected item loads once the cursor has rested for a whole idle tick (about 200 ms), so only the row you stop on is fetched; Comments, Diff, Commits and Checks
+  after `settle_ms` (default 250), so scrolling through a list does not fire a request per row.
+- **Refresh.** `r` refreshes the selected item and its list tab, `R` everything. The only polling in the app is the
+  inbox badge (every 2 minutes, background priority) and the free quota check (every 5 minutes).
+
+### Cache
+
+Slow-changing lookups are cached under `$XDG_CACHE_HOME/gh-pulse` (default `~/.cache/gh-pulse`; only absolute paths
+are honored). The directory must be a real directory you own: an existing one with looser permissions is tightened to
+`0700`, one owned by someone else or reached through a symlink is refused and the cache turns itself off (the status
+line says why). Files are `0600`, written through unique temp files created exclusively, and read only if they are
+regular files you own.
+
+| What | TTL | Where | Keyed by |
+|---|---|---|---|
+| Your repo list (repo browser) | 10 min (shown at once, refreshed behind it when older) | `repos-<host>-<login>.json` | host + login, also stored inside and checked |
+| A repo's header facts | 5 min | `meta-<host>-<repo>.json` | host + repo; the stored login must match yours |
+| Labels, issue/PR templates, workflow YAML | 1 hour | `gh/...` (gh's own entries, via `gh api --cache`) | URL + token + request (verified: another token misses the cache) |
+| Tags | 10 min | `gh/...` | same |
+
+**Templates and workflow files are raw text from the repo you opened, private repos included, and stay on disk for up to
+an hour.** If the repo list or header facts cannot be tied to your login (a token from the environment rather than
+`gh auth login`), they are not cached at all. Text read back from the cache is neutralized again like everything else.
+Never cached: tokens, comments, notifications, PR details, diffs, anything from a write. `r` / `R` fetch fresh data
+(the cached copy still expires on its own schedule). `gh-pulse --clear-cache` deletes the directory (only after the same
+ownership checks); `[api] cache = false` turns caching off.
 
 ## Panels
 
@@ -77,8 +143,8 @@ Keys are a single character (case matters: `C` is shift-c), `ctrl-<letter>`, or 
 |---|---|---|
 | `quit` | `q` | Quit |
 | `help` | `?` | Help popup |
-| `refresh` | `r` | Refresh the focused panel |
-| `refresh_all` | `R` | Refresh everything |
+| `refresh` | `r` | Refresh the selected item and its list tab |
+| `refresh_all` | `R` | Reload everything (skips the cache) |
 | `actions` | `x` | Action menu |
 | `approve` | `a` | Approve (PRs) |
 | `comment` | `C` | Comment |
