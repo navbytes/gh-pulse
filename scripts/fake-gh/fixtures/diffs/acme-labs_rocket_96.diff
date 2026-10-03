@@ -1,0 +1,45 @@
+diff --git a/src/batch.rs b/src/batch.rs
+index 5d2c1ab..a9f03e4 100644
+--- a/src/batch.rs
++++ b/src/batch.rs
+@@ -1,24 +1,31 @@
+-use std::sync::Mutex;
++use tokio::sync::mpsc;
+ 
+ use crate::sample::Sample;
+ 
++const CAPACITY: usize = 1024;
++
+ pub struct Batcher {
+-    pending: Mutex<Vec<Sample>>,
++    tx: mpsc::Sender<Sample>,
+ }
+ 
+ impl Batcher {
+-    pub fn new() -> Self {
+-        Batcher { pending: Mutex::new(Vec::new()) }
++    pub fn new() -> (Self, mpsc::Receiver<Sample>) {
++        let (tx, rx) = mpsc::channel(CAPACITY);
++        (Batcher { tx }, rx)
+     }
+ 
+-    pub fn push(&self, s: Sample) {
+-        self.pending.lock().unwrap().push(s);
++    /// Drops the sample instead of blocking the flight loop when the channel is full.
++    pub fn push(&self, s: Sample) -> bool {
++        self.tx.try_send(s).is_ok()
+     }
++}
+ 
+-    pub fn drain(&self) -> Vec<Sample> {
+-        std::mem::take(&mut *self.pending.lock().unwrap())
++pub async fn flush(rx: &mut mpsc::Receiver<Sample>, max: usize) -> Vec<Sample> {
++    let mut out = Vec::with_capacity(max);
++    while out.len() < max {
++        match rx.try_recv() {
++            Ok(s) => out.push(s),
++            Err(_) => break,
++        }
+     }
++    out
+ }

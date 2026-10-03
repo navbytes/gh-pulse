@@ -1,0 +1,13 @@
+diff --git a/README.md b/README.md
+index 1c0b7d3..6e8a2f1 100644
+--- a/README.md
++++ b/README.md
+@@ -1,5 +1,7 @@
+ # Project
+ 
+ Short description of the project.
+ 
+-See the wiki for details.
++## Getting started
++
++See the wiki for details, or run `make help`.

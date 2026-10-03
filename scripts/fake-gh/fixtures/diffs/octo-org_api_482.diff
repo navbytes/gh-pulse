@@ -1,0 +1,125 @@
+diff --git a/middleware/ratelimit.go b/middleware/ratelimit.go
+index 1c0b7d1..6e8a2f1 100644
+--- a/middleware/ratelimit.go
++++ b/middleware/ratelimit.go
+@@ -3,47 +3,61 @@
+ import (
+ 	"net"
+ 	"net/http"
++	"strconv"
+ 	"sync"
+ 	"time"
+ )
+ 
+-// Limiter counts requests per key in a fixed window.
++// Limiter is a token bucket per key (API token, or client IP when anonymous).
+ type Limiter struct {
+-	mu     sync.Mutex
+-	limit  int
+-	window time.Duration
+-	hits   map[string]*counter
++	mu      sync.Mutex
++	rate    float64 // tokens added per second
++	burst   float64
++	buckets map[string]*bucket
+ }
+ 
+-type counter struct {
+-	n     int
+-	start time.Time
++type bucket struct {
++	tokens float64
++	last   time.Time
+ }
+ 
+-func NewLimiter(limit int, window time.Duration) *Limiter {
+-	return &Limiter{limit: limit, window: window, hits: make(map[string]*counter)}
++func NewLimiter(rps, burst float64) *Limiter {
++	return &Limiter{rate: rps, burst: burst, buckets: make(map[string]*bucket)}
+ }
+ 
+-// Allow reports whether key may proceed.
+-func (l *Limiter) Allow(key string, now time.Time) bool {
++// Allow reports whether key may proceed and, if not, how long to wait.
++func (l *Limiter) Allow(key string, now time.Time) (bool, time.Duration) {
+ 	l.mu.Lock()
+ 	defer l.mu.Unlock()
+ 
+-	c, ok := l.hits[key]
+-	if !ok || now.Sub(c.start) > l.window {
+-		l.hits[key] = &counter{n: 1, start: now}
+-		return true
++	b, ok := l.buckets[key]
++	if !ok {
++		b = &bucket{tokens: l.burst, last: now}
++		l.buckets[key] = b
+ 	}
+-	c.n++
+-	return c.n <= l.limit
++	b.tokens += now.Sub(b.last).Seconds() * l.rate
++	if b.tokens > l.burst {
++		b.tokens = l.burst
++	}
++	b.last = now
++	if b.tokens >= 1 {
++		b.tokens--
++		return true, 0
++	}
++	return false, time.Duration((1 - b.tokens) / l.rate * float64(time.Second))
+ }
+ 
+-// RateLimit rejects requests over the limit with 429.
++// RateLimit rejects requests over the limit with 429 and a Retry-After header.
+ func RateLimit(l *Limiter) func(http.Handler) http.Handler {
+ 	return func(next http.Handler) http.Handler {
+ 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-			key, _, _ := net.SplitHostPort(r.RemoteAddr)
+-			if !l.Allow(key, time.Now()) {
++			key := r.Header.Get("X-Api-Token")
++			if key == "" {
++				key, _, _ = net.SplitHostPort(r.RemoteAddr)
++			}
++			ok, wait := l.Allow(key, time.Now())
++			if !ok {
++				w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+ 				http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+ 				return
+ 			}
+diff --git a/server/router.go b/server/router.go
+index 1c0b7d2..6e8a2f2 100644
+--- a/server/router.go
++++ b/server/router.go
+@@ -15,5 +15,6 @@
+ 	mux.HandleFunc("GET /v2/repos", handlers.ListRepos)
+ 	mux.HandleFunc("GET /v2/search", handlers.Search)
+ 
+-	return middleware.Logging(mux)
++	limiter := middleware.NewLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
++	return middleware.Logging(middleware.RateLimit(limiter)(mux))
+ }
+diff --git a/config/config.go b/config/config.go
+index 1c0b7d3..6e8a2f3 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -3,13 +3,17 @@
+ import "os"
+ 
+ type Config struct {
+-	Addr     string
+-	LogLevel string
++	Addr           string
++	LogLevel       string
++	RateLimitRPS   float64
++	RateLimitBurst float64
+ }
+ 
+ func Load() *Config {
+ 	return &Config{
+-		Addr:     env("ADDR", ":8080"),
+-		LogLevel: env("LOG_LEVEL", "info"),
++		Addr:           env("ADDR", ":8080"),
++		LogLevel:       env("LOG_LEVEL", "info"),
++		RateLimitRPS:   envFloat("RATE_LIMIT_RPS", 20),
++		RateLimitBurst: envFloat("RATE_LIMIT_BURST", 40),
+ 	}
+ }

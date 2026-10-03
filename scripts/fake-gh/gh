@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""Fake `gh` for reproducible gh-pulse screenshots: answers from fixtures/*.json (synthetic data only).
+
+Offline by construction (stdlib only, no sockets, never reads ~/.config/gh). Anything that would write
+(non-GET api calls, mutations, pr/issue edits, ...) is refused: it is appended to $FAKE_GH_LOG/writes.log
+and prints nothing. Every call is appended to $FAKE_GH_LOG/calls.log; unknown reads answer `[]`.
+"""
+import json, os, re, sys, tempfile, time
+from datetime import datetime, timedelta, timezone
+
+D = os.path.dirname(os.path.abspath(__file__))
+FX = os.path.join(D, 'fixtures')
+LOGDIR = os.environ.get('FAKE_GH_LOG') or tempfile.gettempdir()
+argv = sys.argv[1:]
+j = ' '.join(argv)
+NOW = datetime.now(timezone.utc)
+
+
+def fx(name):
+    with open(os.path.join(FX, name)) as f:
+        return json.load(f)
+
+
+def log(name, line):
+    try:
+        with open(os.path.join(LOGDIR, name), 'a') as f:
+            f.write(line + '\n')
+    except OSError:
+        pass
+
+
+def iso(**ago):
+    return (NOW - timedelta(**ago)).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def out(o):
+    sys.stdout.write(o if isinstance(o, str) else json.dumps(o))
+    sys.exit(0)
+
+
+def agos(o):  # "@AGO:<minutes>" placeholders -> timestamps
+    if isinstance(o, str) and o.startswith('@AGO:'):
+        return iso(minutes=int(o[5:]))
+    if isinstance(o, list):
+        return [agos(x) for x in o]
+    if isinstance(o, dict):
+        return {k: agos(v) for k, v in o.items()}
+    return o
+
+
+def flag(name):  # value of `--name v` or `--name=v`
+    for i, a in enumerate(argv):
+        if a == name and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith(name + '='):
+            return a.split('=', 1)[1]
+
+
+def jq(o, expr):  # only `.a.b` paths
+    for p in [p for p in (expr or '').strip().split('.') if p]:
+        o = o.get(p) if isinstance(o, dict) else None
+    return o
+
+
+def pick(d, fields):
+    return {k: d[k] for k in fields.split(',') if k in d}
+
+
+log('calls.log', j[:300])
+
+# --- refuse writes -----------------------------------------------------------------------------
+WRITE_SUB = {('pr', s) for s in ('review', 'comment', 'merge', 'close', 'edit', 'ready', 'reopen', 'checkout', 'create')} | \
+            {('issue', s) for s in ('comment', 'close', 'edit', 'reopen', 'create', 'delete', 'transfer')} | \
+            {('workflow', 'run'), ('run', 'rerun'), ('run', 'cancel'), ('release', 'create'), ('release', 'delete')}
+method = (flag('-X') or flag('--method') or 'GET').upper()
+is_gql_mutation = argv[:2] == ['api', 'graphql'] and any(re.match(r'query=\s*mutation', a) for a in argv)
+if tuple(argv[:2]) in WRITE_SUB or (argv[:1] == ['api'] and method != 'GET') or is_gql_mutation:
+    log('writes.log', j[:300])
+    sys.stderr.write('fake gh: write refused\n')
+    sys.exit(1)
+
+META = fx('meta.json')
+LOGIN = META['login']
+ITEMS = fx('items.json')
+
+
+def item_json(it, repo_field=True):
+    o = {'number': it['n'], 'title': it['t'], 'state': it['st'], 'isDraft': it.get('draft', False),
+         'url': f"https://github.com/{it['r']}/{'pull' if it['k'] == 'pr' else 'issues'}/{it['n']}",
+         'author': {'login': it['a']}, 'labels': [{'name': n} for n in it['labels']],
+         'body': it.get('body', ''), 'updatedAt': iso(hours=it['age_h'])}
+    if repo_field:
+        o['repository'] = {'nameWithOwner': it['r'], 'name': it['r'].split('/')[1]}
+    return o
+
+
+def matches(it, terms):
+    """Evaluate the search qualifiers gh-pulse sends; `(repo:a OR repo:b)` groups are OR-ed."""
+    owners, repos, ok = set(), set(), True
+    for t in terms:
+        t = t.strip('()')
+        if t == 'OR':
+            continue
+        if t.startswith('repo:'): repos.add(t[5:])
+        elif t.startswith(('org:', 'user:')): owners.add(t.split(':', 1)[1])
+        elif t == 'review-requested:@me': ok &= it.get('rev', False)
+        elif t == 'author:@me': ok &= bool(it.get('me') or it.get('mine'))
+        elif t == 'assignee:@me': ok &= it.get('asg', False)
+        elif t == 'mentions:@me': ok &= it.get('men', False)
+        elif t == 'involves:@me': ok &= any(it.get(k) for k in ('rev', 'me', 'mine', 'asg', 'men'))
+        elif t == 'is:open': ok &= it['st'] == 'open'
+        elif t == 'is:merged': ok &= it['st'] == 'merged'
+        elif t == 'is:closed': ok &= it['st'] in ('closed', 'merged')
+        elif t == 'is:unmerged': ok &= it['st'] != 'merged'
+    r = it['r']
+    return ok and (not repos or r in repos) and (not owners or r.split('/')[0] in owners)
+
+
+def search(kind, terms, limit):
+    res = [it for it in ITEMS if it['k'] == kind and matches(it, terms)]
+    res.sort(key=lambda it: it['age_h'])
+    return [item_json(it) for it in res[:limit]]
+
+
+# --- gh search ---------------------------------------------------------------------------------
+if argv[:1] == ['search'] and argv[1] in ('prs', 'issues'):
+    terms = argv[argv.index('--') + 1:] if '--' in argv else []
+    out(search('pr' if argv[1] == 'prs' else 'issue', terms, int(flag('--limit') or 30)))
+
+# --- gh api ------------------------------------------------------------------------------------
+if argv[:2] == ['api', 'rate_limit']:
+    b = {'limit': 5000, 'remaining': 4870, 'used': 130, 'reset': int(time.time()) + 2400}
+    out({'resources': {'core': b, 'graphql': b, 'search': {'limit': 30, 'remaining': 30, 'used': 0, 'reset': int(time.time()) + 60}}, 'rate': b})
+RL = {'cost': 1, 'remaining': 4870, 'limit': 5000, 'resetAt': iso(hours=-1)}
+if argv[:2] == ['api', 'user'] and ('-q' in argv or '--jq' in argv):
+    out(LOGIN + '\n')
+if argv[:1] == ['api'] and len(argv) > 1 and argv[1].startswith('user/orgs'):
+    out('\n'.join(META['orgs']) + '\n')
+if argv[:1] == ['api'] and len(argv) > 1 and argv[1].startswith('notifications'):
+    ns = []
+    for n in fx('notifications.json'):
+        subj = {'title': n['title'], 'type': n['kind']}
+        if n['kind'] in ('PullRequest', 'Issue') and n['n']:
+            seg = 'pulls' if n['kind'] == 'PullRequest' else 'issues'
+            subj['url'] = f"https://api.github.com/repos/{n['repo']}/{seg}/{n['n']}"
+        ns.append({'id': n['id'], 'unread': n['unread'], 'reason': n['reason'], 'subject': subj,
+                   'repository': {'full_name': n['repo']}, 'updated_at': iso(minutes=n['age_m'])})
+    out(ns)
+
+if argv[:2] == ['api', 'graphql']:
+    q = next((a[6:] for a in argv if a.startswith('query=')), '')
+    kv = {}
+    for i, a in enumerate(argv[:-1]):
+        if a in ('-f', '-F') and not argv[i + 1].startswith('query=') and '=' in argv[i + 1]:
+            k, v = argv[i + 1].split('=', 1)
+            kv[k] = v
+    if 'repositories(' in q:  # the repo browser
+        nodes = []
+        for r in sorted(fx('repos.json'), key=lambda r: r['age_h']):
+            o, n = r['r'].split('/')
+            nodes.append({'nameWithOwner': r['r'], 'isPrivate': r.get('private', False), 'isFork': r.get('fork', False),
+                          'isArchived': r.get('archived', False), 'stargazerCount': r['stars'], 'pushedAt': iso(hours=r['age_h']),
+                          'primaryLanguage': {'name': r['lang']},
+                          'owner': {'__typename': 'User' if o in (LOGIN, 'hubot', 'monalisa') else 'Organization', 'login': o},
+                          'issues': {'totalCount': r['issues']}, 'pullRequests': {'totalCount': r['prs']}})
+        out({'data': {'viewer': {'login': LOGIN, 'repositories': {'pageInfo': {'hasNextPage': False, 'endCursor': None}, 'nodes': nodes}}, 'rateLimit': RL}})
+    if 'openPrs' in q:  # startup batch for a repo home
+        repo = f"{kv.get('o')}/{kv.get('n')}"
+        mine = [it for it in ITEMS if it['r'] == repo]
+        r = {'openPrs': {'totalCount': sum(1 for it in mine if it['k'] == 'pr' and it['st'] == 'open')}}
+        f = META['repo_facts'].get(repo, {})
+        if kv.get('meta') == 'true':
+            r.update({'stargazerCount': f.get('stars', 12), 'forkCount': f.get('forks', 2), 'isPrivate': False,
+                      'description': f.get('description', 'A synthetic repository'), 'pushedAt': iso(hours=3),
+                      'licenseInfo': {'name': f.get('license', 'MIT')}, 'defaultBranchRef': {'name': f.get('branch', 'main')},
+                      'openIssues': {'totalCount': sum(1 for it in mine if it['k'] == 'issue')},
+                      'repositoryTopics': {'nodes': [{'topic': {'name': t}} for t in f.get('topics', [])]}})
+        def nodes(kind, st=None, who=None):
+            sel = [it for it in mine if it['k'] == kind and (st is None or it['st'] == st) and (who is None or it.get(who))]
+            return {'nodes': [{k: v for k, v in item_json(it, False).items() if k != 'updatedAt'} | {'labels': {'nodes': [{'name': n} for n in it['labels']]}} for it in sel]}
+        d = {'viewer': {'login': LOGIN}, 'rateLimit': RL, 'repository': r}
+        if kv.get('prOpen') == 'true': r['prOpen'] = nodes('pr', 'open')
+        if kv.get('prMerged') == 'true': r['prMerged'] = nodes('pr', 'merged')
+        if kv.get('isOpen') == 'true': r['isOpen'] = nodes('issue', 'open')
+        if kv.get('prSearch') == 'true':
+            d['prSearch'] = nodes('pr', 'open', 'rev' if 'review-requested' in kv.get('qpr', '') else 'me')
+        if kv.get('isSearch') == 'true':
+            d['isSearch'] = nodes('issue', 'open', 'asg' if 'assignee' in kv.get('qis', '') else 'mine')
+        out({'data': d})
+    if 'reviewThreads(first:100){nodes{path}}' in q:  # per-file thread counts for the diff
+        det = fx('prs.json').get(f"{kv.get('o')}/{kv.get('n')}#{kv.get('p')}", {})
+        ths = (det.get('comments') or {}).get('threads', [])
+        out({'data': {'repository': {'pullRequest': {'reviewThreads': {'nodes': [{'path': t['path']} for t in ths]}}}, 'rateLimit': RL}})
+    if 'repository(' in q and 'comments(first' in q:  # Comments tab (first page only)
+        pr = 'pullRequest(' in q
+        det = (fx('prs.json').get(f"{kv.get('o')}/{kv.get('n')}#{kv.get('p')}", {}) or {}).get('comments') or {}
+        page = lambda xs: {'totalCount': len(xs), 'pageInfo': {'hasNextPage': False, 'endCursor': None}, 'nodes': xs}
+        ths = [dict(t, comments=page(t['comments'])) for t in det.get('threads', [])]
+        obj = {'comments': page(det.get('comments', []))}
+        if pr:
+            obj.update({'reviews': page(det.get('reviews', [])), 'reviewThreads': page(ths)})
+        out(agos({'data': {'repository': {'pullRequest' if pr else 'issue': obj}, 'rateLimit': RL}}))
+    out({'data': {'rateLimit': RL}})
+
+# --- gh repo / pr ------------------------------------------------------------------------------
+if argv[:2] == ['repo', 'view']:
+    repo = argv[2] if len(argv) > 2 and not argv[2].startswith('-') else 'octo-org/api'
+    f = META['repo_facts'].get(repo, {})
+    full = {'stargazerCount': f.get('stars', 12), 'forkCount': f.get('forks', 2), 'issues': {'totalCount': 5}, 'isPrivate': False,
+            'defaultBranchRef': {'name': f.get('branch', 'main')}, 'description': f.get('description', 'A synthetic repository'),
+            'licenseInfo': {'name': f.get('license', 'MIT')}, 'repositoryTopics': [{'name': t} for t in f.get('topics', [])],
+            'pushedAt': iso(hours=3), 'nameWithOwner': repo}
+    if '-q' in argv or '--jq' in argv:
+        out(repo + '\n')
+    out(pick(full, flag('--json')) if flag('--json') else full)
+
+if argv[:1] == ['pr'] and len(argv) > 2:
+    sub, num, repo = argv[1], argv[2], flag('-R') or 'octo-org/api'
+    det = fx('prs.json').get(f'{repo}#{num}', {})
+    if sub == 'view':
+        item = next((i for i in ITEMS if i['r'] == repo and str(i['n']) == num and i['k'] == 'pr'), None)
+        full = {'headRefOid': 'a3f9c1e07b5d4c2e8f61d0b9a7c3e5f2d1b4a687', 'isDraft': bool(item and item.get('draft')),
+                'mergeable': 'MERGEABLE', 'baseRefName': 'main', 'headRefName': 'feature/' + num, 'reviewDecision': '',
+                'mergedAt': iso(hours=item['age_h']) if item and item['st'] == 'merged' else None,
+                'reviewRequests': [], 'latestReviews': []}
+        full.update(det.get('overview', {}))
+        res = pick(full, flag('--json') or '')
+        q = flag('-q') or flag('--jq')
+        out(str(jq(res, q)) + '\n' if q else res)
+    if sub == 'checks':
+        cs = det.get('checks', [{'name': 'build', 'bucket': 'pass', 'workflow': 'CI', 'link': f'https://github.com/{repo}/actions/runs/1', 'age_s': 200}])
+        out([{'name': c['name'], 'bucket': c['bucket'], 'link': c['link'], 'workflow': c['workflow'],
+              'startedAt': iso(seconds=c['age_s']), 'completedAt': iso(seconds=c['age_s'] - 40) if c['bucket'] != 'pending' else None} for c in cs])
+    if sub == 'diff':
+        name = det.get('diff', 'default.diff')
+        with open(os.path.join(FX, 'diffs', name)) as f:
+            out(f.read())
+
+out([])  # unknown read: empty list

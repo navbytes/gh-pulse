@@ -1,0 +1,249 @@
+{
+ "octo-org/api#482": {
+  "overview": {
+   "isDraft": false,
+   "mergeable": "MERGEABLE",
+   "baseRefName": "main",
+   "headRefName": "hubot/ratelimit",
+   "reviewDecision": "REVIEW_REQUIRED",
+   "reviewRequests": [
+    {
+     "__typename": "User",
+     "login": "you"
+    },
+    {
+     "__typename": "User",
+     "login": "monalisa"
+    }
+   ],
+   "latestReviews": [
+    {
+     "author": {
+      "login": "monalisa"
+     },
+     "state": "COMMENTED"
+    }
+   ]
+  },
+  "checks": [
+   {
+    "name": "build",
+    "bucket": "pass",
+    "workflow": "CI",
+    "link": "https://github.com/octo-org/api/actions/runs/1",
+    "age_s": 300
+   },
+   {
+    "name": "test (go 1.23)",
+    "bucket": "pass",
+    "workflow": "CI",
+    "link": "https://github.com/octo-org/api/actions/runs/2",
+    "age_s": 240
+   },
+   {
+    "name": "lint",
+    "bucket": "pass",
+    "workflow": "CI",
+    "link": "https://github.com/octo-org/api/actions/runs/3",
+    "age_s": 90
+   },
+   {
+    "name": "load-test (staging)",
+    "bucket": "pending",
+    "workflow": "Load",
+    "link": "https://github.com/octo-org/api/actions/runs/4",
+    "age_s": 60
+   }
+  ],
+  "diff": "octo-org_api_482.diff",
+  "comments": {
+   "comments": [
+    {
+     "id": "IC1",
+     "author": {
+      "login": "monalisa"
+     },
+     "authorAssociation": "MEMBER",
+     "lastEditedAt": null,
+     "body": "Nice, this has been on the list for a while. Two questions:\n\n1. Should authenticated and anonymous traffic share the same defaults?\n2. Can we expose the remaining budget in `X-RateLimit-Remaining`?",
+     "createdAt": "@AGO:150",
+     "reactionGroups": [
+      {
+       "content": "THUMBS_UP",
+       "users": {
+        "totalCount": 3
+       }
+      }
+     ]
+    },
+    {
+     "id": "IC2",
+     "author": {
+      "login": "hubot"
+     },
+     "authorAssociation": "CONTRIBUTOR",
+     "lastEditedAt": null,
+     "body": "Good points. I'll keep one default for now and add the header in a follow-up so this stays small.\n\nStaging load test is running.",
+     "createdAt": "@AGO:95",
+     "reactionGroups": [
+      {
+       "content": "THUMBS_UP",
+       "users": {
+        "totalCount": 1
+       }
+      },
+      {
+       "content": "ROCKET",
+       "users": {
+        "totalCount": 1
+       }
+      }
+     ]
+    }
+   ],
+   "reviews": [
+    {
+     "id": "R1",
+     "author": {
+      "login": "monalisa"
+     },
+     "authorAssociation": "MEMBER",
+     "state": "COMMENTED",
+     "submittedAt": "@AGO:140",
+     "lastEditedAt": null,
+     "body": "Looks good overall. A couple of inline notes.",
+     "reactionGroups": []
+    }
+   ],
+   "threads": [
+    {
+     "id": "T1",
+     "isResolved": false,
+     "isOutdated": false,
+     "path": "middleware/ratelimit.go",
+     "line": 47,
+     "comments": [
+      {
+       "id": "TC1",
+       "author": {
+        "login": "monalisa"
+       },
+       "authorAssociation": "MEMBER",
+       "lastEditedAt": null,
+       "body": "The `buckets` map never shrinks, so a client rotating IPs can grow it without bound. Could we evict idle buckets?",
+       "createdAt": "@AGO:138",
+       "reactionGroups": [
+        {
+         "content": "EYES",
+         "users": {
+          "totalCount": 1
+         }
+        }
+       ]
+      },
+      {
+       "id": "TC2",
+       "author": {
+        "login": "hubot"
+       },
+       "authorAssociation": "CONTRIBUTOR",
+       "lastEditedAt": null,
+       "body": "Fair. I'll add a janitor goroutine that drops buckets idle for more than a minute.",
+       "createdAt": "@AGO:100",
+       "reactionGroups": []
+      }
+     ]
+    },
+    {
+     "id": "T2",
+     "isResolved": true,
+     "isOutdated": false,
+     "path": "server/router.go",
+     "line": 19,
+     "comments": [
+      {
+       "id": "TC3",
+       "author": {
+        "login": "monalisa"
+       },
+       "authorAssociation": "MEMBER",
+       "lastEditedAt": null,
+       "body": "Should the limiter wrap the logger, so rejected requests are still logged?",
+       "createdAt": "@AGO:136",
+       "reactionGroups": []
+      },
+      {
+       "id": "TC4",
+       "author": {
+        "login": "hubot"
+       },
+       "authorAssociation": "CONTRIBUTOR",
+       "lastEditedAt": null,
+       "body": "It already does: Logging is the outer layer. Resolving.",
+       "createdAt": "@AGO:120",
+       "reactionGroups": [
+        {
+         "content": "THUMBS_UP",
+         "users": {
+          "totalCount": 1
+         }
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "acme-labs/rocket#96": {
+  "overview": {
+   "isDraft": true,
+   "mergeable": "MERGEABLE",
+   "baseRefName": "main",
+   "headRefName": "octocat/async-batch",
+   "reviewDecision": "",
+   "reviewRequests": [
+    {
+     "__typename": "User",
+     "login": "you"
+    }
+   ],
+   "latestReviews": []
+  },
+  "diff": "acme-labs_rocket_96.diff",
+  "checks": [
+   {
+    "name": "cargo test",
+    "bucket": "pass",
+    "workflow": "CI",
+    "link": "https://github.com/acme-labs/rocket/actions/runs/9",
+    "age_s": 600
+   },
+   {
+    "name": "clippy",
+    "bucket": "fail",
+    "workflow": "CI",
+    "link": "https://github.com/acme-labs/rocket/actions/runs/10",
+    "age_s": 500
+   }
+  ]
+ },
+ "octo-org/web#1215": {
+  "overview": {
+   "isDraft": false,
+   "mergeable": "MERGEABLE",
+   "baseRefName": "main",
+   "headRefName": "you/dark-settings",
+   "reviewDecision": "APPROVED",
+   "reviewRequests": [],
+   "latestReviews": [
+    {
+     "author": {
+      "login": "hubot"
+     },
+     "state": "APPROVED"
+    }
+   ]
+  }
+ }
+}

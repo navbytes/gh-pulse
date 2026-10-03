@@ -824,7 +824,7 @@ fn label(app: &App, it: &Item, show_repo: bool, w: usize) -> Line<'static> {
     }
     let prefixed = matches!(it.kind, Kind::Pr | Kind::Issue);
     let repo = it.repo_display();
-    if show_repo && !repo.is_empty() && !prefixed {
+    if show_repo && !repo.is_empty() && !prefixed && it.kind != Kind::Repo {
         v.push(Span::styled(format!("{repo} "), muted));
     }
     match it.kind {
@@ -2679,6 +2679,37 @@ mod tests {
 
     fn key(app: &mut App, c: KeyCode) {
         app.on_key(KeyEvent::new(c, KeyModifiers::NONE));
+    }
+
+    fn text(l: &Line) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn repo_rows_name_the_repo_once_and_pr_rows_keep_owner_repo_number() {
+        let a = app(false, IconSet::Unicode);
+        let repo = Item {
+            kind: Kind::Repo,
+            repo: "o/r".into(),
+            state: "fav".into(),
+            meta: "public · Go · 2h".into(),
+            ..Default::default()
+        };
+        for show_repo in [true, false] {
+            let s = text(&label(&a, &repo, show_repo, 60));
+            assert_eq!(s.matches("o/r").count(), 1, "{s:?}");
+            assert!(s.contains("public · Go · 2h"), "{s:?}");
+        }
+        let pr = Item {
+            kind: Kind::Pr,
+            repo: "o/r".into(),
+            number: 7,
+            title: "t".into(),
+            state: "open".into(),
+            ..Default::default()
+        };
+        assert!(text(&label(&a, &pr, true, 60)).starts_with("o/r#7 "));
+        assert!(text(&label(&a, &pr, false, 60)).starts_with("#7 "));
     }
 
     const LONG: &str = "This is a deliberately long prose line in a markdown file that has to wrap in a narrow pane instead of being clipped away";
