@@ -165,7 +165,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             facts.push(format!("default {}", m.branch));
         }
         if let Some((n, more)) = app.open_prs() {
-            facts.push(format!("{n}{} open PRs", if more { "+" } else { "" }));
+            facts.push(open_prs_fact(n, more));
         }
     }
     let extra = if loading { 4 } else { 0 };
@@ -405,6 +405,14 @@ fn repo_overview(f: &mut Frame, app: &App, area: Rect) {
 
 /// The header text for `avail` columns: `base` whole (ellipsized only if it alone is too long), then as
 /// many of `facts` as fit, whole, dropping from the right.
+fn open_prs_fact(n: usize, more: bool) -> String {
+    let plus = if more { "+" } else { "" };
+    format!(
+        "{n}{plus} open PR{}",
+        if n == 1 && !more { "" } else { "s" }
+    )
+}
+
 fn fit_header(
     base: &str,
     facts: &[String],
@@ -2653,6 +2661,14 @@ fn form_popup(f: &mut Frame, app: &App, form: &crate::form::Form) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn open_prs_fact_pluralises() {
+        assert_eq!(open_prs_fact(1, false), "1 open PR");
+        assert_eq!(open_prs_fact(0, false), "0 open PRs");
+        assert_eq!(open_prs_fact(74, false), "74 open PRs");
+        assert_eq!(open_prs_fact(1, true), "1+ open PRs");
+    }
     use super::*;
     use crate::gh::{Check, Entry};
     use crate::theme::IconSet;

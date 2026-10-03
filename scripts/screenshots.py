@@ -158,6 +158,12 @@ def launch(repo, tmp):
 def pr(t, nums, tab=3):
     """Go to the `tab`-th list tab of panel 1 (2 = All open, 3 = Merged) and select the first PR of `nums` that is listed;
     falls back to the top row. Panel 1 is already focused at startup, so its number is not pressed."""
+    for k in '345':  # warm panels 3-5 so every panel shows real rows and counts
+        t.send(k, 1.5)
+        try: t.wait_for(r'\[%s\][^\n]*\d' % k, 12)
+        except SystemExit: pass  # the 80x24 titles carry no counts
+        t.pump(1)
+    t.send('1', 1)
     t.send('}' * tab, 1)
     for _ in range(30):
         if re.search(r'│#\d+ ', t.text()): break
