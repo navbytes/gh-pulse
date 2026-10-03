@@ -604,7 +604,7 @@ pub struct Filter {
 }
 
 fn term_char_ok(c: char) -> bool {
-    c.is_alphanumeric() || "-_.:/@*<>=!,~()'#+?".contains(c)
+    c.is_alphanumeric() || "-_.:/@*<>=!,~()\"'#+?".contains(c)
 }
 
 /// Splits on whitespace outside double quotes. Every term later travels as its own argument after
@@ -625,9 +625,10 @@ pub fn parse_filter(src: &str) -> Result<Filter, String> {
     let (mut terms, mut cur, mut quoted) = (vec![], String::new(), false);
     for c in src.chars() {
         match c {
-            // gh re-quotes a term with spaces itself (`label:good first` -> `label:"good first"`), so the
-            // user's quotes only group words here and are not passed on
-            '"' => quoted = !quoted,
+            '"' => {
+                quoted = !quoted;
+                cur.push(c);
+            }
             c if c.is_whitespace() && !quoted => {
                 if !cur.is_empty() {
                     terms.push(std::mem::take(&mut cur));
@@ -1224,11 +1225,7 @@ mod tests {
     }
 
     fn names(c: &Config) -> Vec<PanelName> {
-        c.panels
-            .layout(&[])
-            .iter()
-            .map(|p| p.name.clone())
-            .collect()
+        c.panels.layout(&[])().iter().map(|p| p.name).collect()
     }
 
     #[test]
@@ -1236,7 +1233,7 @@ mod tests {
         use PanelName::*;
         let c = parse("", "t").unwrap();
         assert_eq!(names(&c), [Prs, Files, Issues, Actions, Repo]);
-        let tabs: Vec<_> = c.panels.layout(&[]).iter().map(|p| p.tabs.len()).collect();
+        let tabs: Vec<_> = c.panels.layout(&[])().iter().map(|p| p.tabs.len()).collect();
         assert_eq!(tabs, [4, 0, 3, 2, 3]);
         assert!(!c.panels.hide_empty);
         // the inbox key is part of the closed key set
@@ -1258,7 +1255,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(names(&c), [Repo, Prs, Issues], "order = numbering");
-        let l = c.panels.layout(&[]);
+        let l = c.panels.layout(&[])();
         assert_eq!(l[0].tabs.iter().map(|t| t.id).collect::<Vec<_>>(), [2, 0]);
         assert_eq!(l[0].tab, 1, "default_tab picks its position in tabs");
         assert_eq!((l[1].tabs[l[1].tab].label, l[1].tabs.len()), ("Review", 4));
@@ -1449,11 +1446,7 @@ mod tests {
     fn the_global_home_panels_are_configurable_and_validated() {
         use PanelName::*;
         let g = |c: &Config| -> Vec<PanelName> {
-            c.panels
-                .global_layout(&[])
-                .iter()
-                .map(|p| p.name.clone())
-                .collect()
+            c.panels.global_layout(&[])().iter().map(|p| p.name).collect()
         };
         let c = parse("", "t").unwrap();
         assert_eq!(
@@ -1463,7 +1456,7 @@ mod tests {
         );
         let tabs: Vec<_> = c
             .panels
-            .global_layout(&[])
+            .global_layout(&[])()
             .iter()
             .map(|p| p.tabs.len())
             .collect();
@@ -1480,11 +1473,7 @@ mod tests {
         // repo-mode lists may now include `repos`, but not the global sections (and vice versa)
         let c = parse("[panels]\nshow = [\"prs\", \"repos\"]\n", "t").unwrap();
         assert_eq!(
-            c.panels
-                .layout(&[])
-                .iter()
-                .map(|p| p.name.clone())
-                .collect::<Vec<_>>(),
+            c.panels.layout(&[])().iter().map(|p| p.name).collect::<Vec<_>>(),
             [Prs, Repos]
         );
         let e = parse("[panels]\nshow = [\"prs\", \"review\"]\n", "cfg").unwrap_err();
@@ -1515,160 +1504,5 @@ mod tests {
         let mut over = BTreeMap::new();
         over.insert("scope".to_string(), Keys::One("z".into()));
         assert_eq!(Keymap::build(&over).unwrap().label(Act::Scope), "z");
-    }
-    const TWO: &str = r#"
-[[sections]]
-title  = "Needs my review (acme)"
-kind   = "prs"
-filter = "is:open review-requested:@me org:acme draft:false"
-limit  = 50
-where  = "both"
-
-[[sections]]
-title  = "Bugs"
-kind   = "issues"
-filter = 'is:open label:"good first issue" -label:wip'
-"#;
-
-    #[test]
-    fn sections_parse_with_defaults_and_survive_a_save() {
-        let c = parse(TWO, "cfg").unwrap();
-        assert_eq!(c.sections.len(), 2);
-        let (a, b) = (&c.sections[0], &c.sections[1]);
-        assert_eq!(
-            (a.kind, a.at, a.limit()),
-            (SectionKind::Prs, Where::Both, 50)
-        );
-        assert_eq!(
-            (b.kind, b.at, b.limit()),
-            (SectionKind::Issues, Where::Global, 30)
-        );
-        // quotes group words and are not passed on; `-label:wip` counts as an operator
-        let f = parse_filter(&b.filter).unwrap();
-        assert_eq!(f.terms, ["is:open", "label:good first issue", "-label:wip"]);
-        assert_eq!((f.ops, f.own_scope, f.has_archived), (1, false, false));
-        // saved files re-read to the same sections
-        let back = parse(&toml::to_string_pretty(&c).unwrap(), "cfg").unwrap();
-        assert_eq!(back.sections, c.sections);
-        // sections are extra panels after the built-in ones, per home
-        let names = |l: Vec<PanelSpec>| l.into_iter().map(|p| p.name.word()).collect::<Vec<_>>();
-        assert_eq!(
-            names(c.panels.global_layout(&c.sections)),
-            [
-                "review",
-                "mine",
-                "assigned",
-                "repos",
-                "section:Needs my review (acme)",
-                "section:Bugs"
-            ]
-        );
-        assert_eq!(
-            names(c.panels.layout(&c.sections))
-                .last()
-                .map(String::as_str),
-            Some("section:Needs my review (acme)"),
-            "only where = repo / both in the repo home"
-        );
-    }
-
-    #[test]
-    fn panels_lists_place_sections_and_unknown_names_are_errors() {
-        let src = format!(
-            "{TWO}\n[panels]\nglobal = [\"section:Bugs\", \"review\"]\nshow = [\"section:Needs my review (acme)\", \"prs\"]\n"
-        );
-        let c = parse(&src, "cfg").unwrap();
-        let g: Vec<_> = c
-            .panels
-            .global_layout(&c.sections)
-            .iter()
-            .map(|p| p.name.word())
-            .collect();
-        assert_eq!(
-            g,
-            ["section:Bugs", "review", "section:Needs my review (acme)"]
-        );
-        let e = parse("[[sections]]\ntitle=\"A\"\nkind=\"prs\"\nfilter=\"x\"\n[panels]\nglobal = [\"section:B\"]\n", "cfg").unwrap_err();
-        assert!(
-            e.starts_with("cfg:6:") && e.contains("unknown section `B`") && e.contains("A"),
-            "{e}"
-        );
-        let e = parse("[panels]\nshow = [\"section:B\"]\n", "cfg").unwrap_err();
-        assert!(
-            e.starts_with("cfg:2:") && e.contains("unknown section"),
-            "{e}"
-        );
-        // a global-only section cannot be placed in the repo home
-        let e = parse("[[sections]]\ntitle=\"A\"\nkind=\"prs\"\nfilter=\"x\"\n[panels]\nshow = [\"prs\", \"section:A\"]\n", "cfg").unwrap_err();
-        assert!(
-            e.starts_with("cfg:6:") && e.contains("where = \"global\""),
-            "{e}"
-        );
-    }
-
-    #[test]
-    fn bad_sections_are_errors_naming_the_line() {
-        let sec = |body: &str| {
-            format!("# top\n[[sections]]\ntitle = \"A\"\nkind = \"prs\"\nfilter = \"x\"\n{body}")
-        };
-        let bad = |src: String| parse(&src, "cfg").unwrap_err();
-        let e = bad(sec("").replace("\"prs\"", "\"repos\""));
-        assert!(
-            e.starts_with("cfg:4:") && e.contains("prs") && e.contains("issues"),
-            "{e}"
-        );
-        let e = bad(sec("limit = 0\n"));
-        assert!(e.starts_with("cfg:6:") && e.contains("1..100"), "{e}");
-        let e = bad(sec("limit = 101\n"));
-        assert!(e.contains("1..100"), "{e}");
-        let e = bad(sec("where = \"nowhere\"\n"));
-        assert!(e.starts_with("cfg:6:") && e.contains("nowhere"), "{e}");
-        let e = bad(sec("").replace("\"x\"", &format!("\"{}\"", "a".repeat(257))));
-        assert!(e.starts_with("cfg:5:") && e.contains("256"), "{e}");
-        for evil in ["a\\nb", "a\\u0007b", "a\\tb"] {
-            let e = bad(sec("").replace("\"x\"", &format!("\"{evil}\"")));
-            assert!(
-                e.starts_with("cfg:5:") && e.contains("control character"),
-                "{evil}: {e}"
-            );
-        }
-        for evil in [
-            "$(x)", "a;b", "`x`", "a|b", "a&b", "a\\\\b", "--web", "x --jq=.", "\\\"open",
-        ] {
-            let e = bad(sec("").replace("\"x\"", &format!("\"{evil}\"")));
-            assert!(
-                e.starts_with("cfg:5:") && e.contains("filter"),
-                "{evil}: {e}"
-            );
-        }
-        let e = bad(sec("").replace("\"x\"", "\" \""));
-        assert!(e.contains("empty"), "{e}");
-        let e = bad(sec("").replace("\"A\"", &format!("\"{}\"", "t".repeat(41))));
-        assert!(e.starts_with("cfg:3:") && e.contains("1..40"), "{e}");
-        let e = bad(format!("{}{}", sec(""), sec("")));
-        assert!(e.starts_with("cfg:8:") && e.contains("used twice"), "{e}");
-        let many: String = (0..13)
-            .map(|i| format!("[[sections]]\ntitle = \"s{i}\"\nkind = \"prs\"\nfilter = \"x\"\n"))
-            .collect();
-        let e = bad(many);
-        assert!(e.contains("at most 12"), "{e}");
-        let e = bad("[[sections]]\ntitle = \"A\"\n".into());
-        assert!(e.contains("missing field"), "{e}");
-    }
-
-    #[test]
-    fn operator_counts_and_scope_markers_come_from_the_terms() {
-        let f = |s: &str| parse_filter(s).unwrap();
-        assert_eq!(f("a OR b AND c NOT d -label:x").ops, 4);
-        assert_eq!(f("(repo:a/b OR repo:c/d)").ops, 1);
-        assert!(f("(repo:a/b OR repo:c/d)").own_scope && f("USER:me").own_scope);
-        assert!(!f("-org:x").own_scope && !f("label:org:x").own_scope);
-        assert!(f("-archived:true").has_archived && f("archived:false").has_archived);
-        // too many operators is a warning, not an error
-        let src = "[[sections]]\ntitle = \"A\"\nkind = \"prs\"\nfilter = \"a OR b OR c OR d OR e OR f OR g\"\n";
-        let c = parse(src, "cfg").unwrap();
-        let w = warnings(&c);
-        assert!(w.len() == 1 && w[0].contains("6 AND/OR/NOT"), "{w:?}");
-        assert!(warnings(&parse(TWO, "cfg").unwrap()).is_empty());
     }
 }

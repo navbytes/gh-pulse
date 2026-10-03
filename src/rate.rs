@@ -223,14 +223,38 @@ pub fn apply_poll(body: &str) -> bool {
     });
     if let Some(g) = p.graphql {
         crate::gh::log_note(&format!(
-            "rate: graphql {}/{} left, core {}/{}",
+            "rate: graphql {}/{} left, core {}/{}{}",
             g.remaining,
             g.limit,
             p.core.map_or(0, |c| c.remaining),
-            p.core.map_or(0, |c| c.limit)
+            p.core.map_or(0, |c| c.limit),
+            p.search.map_or(String::new(), |b| format!(
+                ", search {}/{} left",
+                b.remaining, b.limit
+            ))
         ));
     }
     true
+}
+
+/// Our own `gh search` calls spend the search budget (30 a minute) that only `gh api rate_limit` reports,
+/// every five minutes: count them locally so the chip and the `L` log stay current between polls.
+pub fn note_searches(n: u32) {
+    let now = now();
+    let mut left = None;
+    update(|s| {
+        if let Some(b) = &mut s.search {
+            let (remaining, limit) = b.at(now);
+            if now >= b.reset {
+                b.reset = now + 60;
+            }
+            (b.remaining, b.limit) = (remaining.saturating_sub(n), limit);
+            left = Some(*b);
+        }
+    });
+    if let Some(b) = left {
+        crate::gh::log_note(&format!("rate: search {}/{} left", b.remaining, b.limit));
+    }
 }
 
 /// An error that may be GitHub throttling us: back background work off for as long as it says

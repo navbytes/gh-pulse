@@ -2,7 +2,7 @@
 //! from GitHub search, narrowed by a scope (all / favorites / one org / one repo). Everything here is
 //! pure or a single `gh search` call per section and chunk: the app decides when to call it.
 use crate::browse::RepoRow;
-use crate::config::ReposCfg;
+use crate::config::{self, MAX_OPS, ReposCfg, SectionCfg, SectionKind};
 use crate::gh::{self, Item, Kind};
 use crate::state::valid_repo;
 
@@ -75,15 +75,20 @@ pub const MAX_CHUNKS: usize = 4;
 /// The qualifier terms of each search call for `scope`, and how many favorites did not fit.
 /// Names that are not plain `owner/name` are ignored (a config typo must not become a qualifier).
 pub fn scope_chunks(scope: &Scope, favorites: &[String]) -> (Vec<Vec<String>>, usize) {
+    scope_chunks_by(scope, favorites, FAV_CHUNK)
+}
+
+/// `scope_chunks` with `per` favorites in each group (a custom filter's own operators eat into the budget).
+fn scope_chunks_by(scope: &Scope, favorites: &[String], per: usize) -> (Vec<Vec<String>>, usize) {
     match scope {
         Scope::All => (vec![vec![]], 0),
         Scope::Org(o) => (vec![vec![format!("org:{o}")]], 0),
         Scope::Repo(r) => (vec![vec![format!("repo:{r}")]], 0),
         Scope::Favorites => {
             let favs: Vec<&String> = favorites.iter().filter(|f| valid_repo(f)).collect();
-            let shown = favs.len().min(FAV_CHUNK * MAX_CHUNKS);
+            let shown = favs.len().min(per * MAX_CHUNKS);
             let chunks = favs[..shown]
-                .chunks(FAV_CHUNK)
+                .chunks(per)
                 .map(|c| or_group(c.iter().map(|r| format!("repo:{r}")).collect()))
                 .collect();
             (chunks, favs.len() - shown)
@@ -159,18 +164,19 @@ const TOP_UP: usize = 200;
 /// A list with fewer visible rows than this after filtering is topped up.
 const FILL: usize = 30;
 
-/// The exact `gh` argument lists (after `gh`) for a section: one per search and scope chunk, plus
-/// the number of favorites that did not fit.
-pub fn calls(
-    sec: Section,
-    tab: usize,
+type Calls = Vec<(Kind, Vec<String>)>;
+
+/// One `gh search` per search and scope chunk: `terms` follow `--`, so they can never be flags.
+fn build_calls(
+    base: Vec<(Search, Vec<String>)>,
     scope: &Scope,
     favorites: &[String],
+    per: usize,
     limit: usize,
-) -> (Vec<(Kind, Vec<String>)>, usize) {
-    let (chunks, not_shown) = scope_chunks(scope, favorites);
+) -> (Calls, usize) {
+    let (chunks, not_shown) = scope_chunks_by(scope, favorites, per);
     let mut out = vec![];
-    for (kind, terms) in base(sec, tab) {
+    for (kind, terms) in base {
         for chunk in &chunks {
             let mut a: Vec<String> = [
                 "search",
@@ -184,12 +190,132 @@ pub fn calls(
             ]
             .map(String::from)
             .to_vec();
-            a.extend(terms.iter().map(|t| t.to_string()));
+            a.extend(terms.iter().cloned());
             a.extend(chunk.iter().cloned());
             out.push((kind.kind(), a));
         }
     }
     (out, not_shown)
+}
+
+/// The exact `gh` argument lists (after `gh`) for a section: one per search and scope chunk, plus
+/// the number of favorites that did not fit.
+pub fn calls(
+    sec: Section,
+    tab: usize,
+    scope: &Scope,
+    favorites: &[String],
+    limit: usize,
+) -> (Calls, usize) {
+    let base = base(sec, tab)
+        .into_iter()
+        .map(|(k, t)| (k, t.into_iter().map(String::from).collect()))
+        .collect();
+    build_calls(base, scope, favorites, FAV_CHUNK, limit)
+}
+
+/// A `[[sections]]` search, ready to run: the user's terms plus the defaults we add.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Custom {
+    search: Search,
+    terms: Vec<String>,
+    /// Boolean operators in the filter; favorites groups must fit under GitHub's limit with them.
+    ops: usize,
+    /// The scope qualifiers are appended (global home, filter without a scope qualifier of its own).
+    scoped: bool,
+    limit: usize,
+}
+
+impl Custom {
+    /// `repo` is the current repo when the section runs in the repo home. Err only for a filter that
+    /// `config::parse_filter` refuses (the config loader has already checked, a test config may not).
+    pub fn new(cfg: &SectionCfg, repo: Option<&str>) -> Result<Custom, String> {
+        let f = config::parse_filter(&cfg.filter)?;
+        let mut terms = f.terms;
+        // without parentheses GitHub's OR would swallow the qualifiers added below
+        if f.has_or {
+            terms[0].insert(0, '(');
+            terms.last_mut().expect("non-empty").push(')');
+        }
+        if !f.has_archived {
+            terms.push("archived:false".into());
+        }
+        if let Some(r) = repo
+            && !f.own_repo
+        {
+            terms.push(format!("repo:{r}"));
+        }
+        Ok(Custom {
+            search: match cfg.kind {
+                SectionKind::Prs => Search::Prs,
+                SectionKind::Issues => Search::Issues,
+            },
+            terms,
+            ops: f.ops,
+            scoped: repo.is_none() && !f.own_scope,
+            limit: cfg.limit(),
+        })
+    }
+
+    fn calls(&self, scope: &Scope, favorites: &[String], limit: usize) -> (Calls, usize) {
+        let scope = if self.scoped { scope } else { &Scope::All };
+        let per = FAV_CHUNK.min((MAX_OPS + 1).saturating_sub(self.ops)).max(1);
+        build_calls(
+            vec![(self.search, self.terms.clone())],
+            scope,
+            favorites,
+            per,
+            limit,
+        )
+    }
+}
+
+/// What a global panel searches for.
+#[derive(Clone, Debug)]
+pub enum Query {
+    Section(Section, usize),
+    Custom(Custom),
+}
+
+impl Query {
+    pub fn uses_scope(&self) -> bool {
+        match self {
+            Query::Section(..) => true,
+            Query::Custom(c) => c.scoped,
+        }
+    }
+
+    /// Searches one refresh needs (before any top-up).
+    pub fn searches_needed(&self, scope: &Scope, favorites: &[String]) -> usize {
+        match self {
+            Query::Section(sec, tab) => searches_needed(*sec, *tab, scope, favorites),
+            Query::Custom(c) => c.calls(scope, favorites, PAGE).0.len(),
+        }
+    }
+
+    pub fn fetch(
+        &self,
+        scope: &Scope,
+        favorites: &[String],
+        hidden: &ReposCfg,
+        quota: Option<Quota>,
+    ) -> Result<GlobalList, String> {
+        match self {
+            Query::Section(sec, tab) => fetch_section(*sec, *tab, scope, favorites, hidden, quota),
+            Query::Custom(c) => {
+                let page = c.limit;
+                let mut l = fetch_with(
+                    |n| c.calls(scope, favorites, n),
+                    (page, (2 * page).min(TOP_UP)),
+                    c.calls(scope, favorites, page).0.len() <= 1,
+                    hidden,
+                    quota,
+                )?;
+                l.items.truncate(page);
+                Ok(l)
+            }
+        }
+    }
 }
 
 pub struct GlobalList {
@@ -256,12 +382,28 @@ pub fn fetch_section(
     hidden: &ReposCfg,
     quota: Option<Quota>,
 ) -> Result<GlobalList, String> {
-    let (calls_, not_shown) = calls(sec, tab, scope, favorites, PAGE);
-    let single_chunk = scope_chunks(scope, favorites).0.len() <= 1;
+    fetch_with(
+        |n| calls(sec, tab, scope, favorites, n),
+        (PAGE, TOP_UP),
+        scope_chunks(scope, favorites).0.len() <= 1,
+        hidden,
+        quota,
+    )
+}
+
+/// `calls_for(limit)` builds the searches; `(page, top_up)` are the two request sizes.
+fn fetch_with(
+    calls_for: impl Fn(usize) -> (Calls, usize),
+    (page, top_up): (usize, usize),
+    single_chunk: bool,
+    hidden: &ReposCfg,
+    quota: Option<Quota>,
+) -> Result<GlobalList, String> {
+    let (calls_, not_shown) = calls_for(page);
     let mut lists: Vec<Option<Vec<Item>>> = vec![];
     let (mut failed, mut first_err) = (0, None);
     for (kind, args) in &calls_ {
-        match gh::gh(args).and_then(|o| gh::parse_items(&o, *kind, "")) {
+        match search(args, *kind, page) {
             Ok(items) => lists.push(Some(items)),
             Err(e) => {
                 failed += 1;
@@ -275,11 +417,11 @@ pub fn fetch_section(
     }
     let merged = |lists: &[Option<Vec<Item>>]| merge(lists.iter().flatten().cloned().collect());
     let (mut kept, mut dropped) = without_hidden(merged(&lists), hidden);
-    if dropped > 0 && kept.len() < FILL && single_chunk && Quota::comfortable(quota) {
-        let (again, _) = calls(sec, tab, scope, favorites, TOP_UP);
+    if dropped > 0 && kept.len() < FILL.min(page) && single_chunk && Quota::comfortable(quota) {
+        let (again, _) = calls_for(top_up);
         for (i, (kind, args)) in again.iter().enumerate() {
-            if lists[i].as_ref().is_some_and(|l| l.len() >= PAGE)
-                && let Ok(items) = gh::gh(args).and_then(|o| gh::parse_items(&o, *kind, ""))
+            if lists[i].as_ref().is_some_and(|l| l.len() >= page)
+                && let Ok(items) = search(args, *kind, top_up)
             {
                 lists[i] = Some(items);
             }
@@ -299,6 +441,13 @@ pub fn fetch_section(
         not_shown,
         note,
     })
+}
+
+/// One `gh search` call, noted against the search API's budget (`limit` rows = one request per 100).
+fn search(args: &[String], kind: Kind, limit: usize) -> Result<Vec<Item>, String> {
+    let out = gh::gh(args);
+    crate::rate::note_searches(limit.div_ceil(100) as u32);
+    gh::parse_items(&out?, kind, "")
 }
 
 /// Your organizations (`gh api user/orgs`), cached for an hour.
@@ -842,6 +991,197 @@ mod tests {
                 .contains("1 of 2 searches failed (boom)"),
             "{:?}",
             l.note
+        );
+    }
+    fn sec(kind: SectionKind, filter: &str) -> SectionCfg {
+        SectionCfg {
+            title: "T".into(),
+            kind,
+            filter: filter.into(),
+            limit: None,
+            at: config::Where::Global,
+        }
+    }
+
+    /// The terms after `--` of the single search a custom section runs.
+    fn tail(filter: &str, scope: &Scope, repo: Option<&str>) -> String {
+        let c = Custom::new(&sec(SectionKind::Prs, filter), repo).unwrap();
+        let (calls, _) = c.calls(scope, &[], 30);
+        assert_eq!(calls.len(), 1);
+        let a = &calls[0].1;
+        let dd = a.iter().position(|x| x == "--").unwrap();
+        assert_eq!(
+            a[..dd].join(" "),
+            "search prs --limit=30 --json number,title,url,state,isDraft,author,labels,body,repository,updatedAt --sort=updated --order=desc"
+        );
+        assert_eq!(a.iter().filter(|x| *x == "--").count(), 1);
+        a[dd + 1..].join(" ")
+    }
+
+    #[test]
+    fn a_filter_becomes_terms_with_scope_archived_and_repo_added_as_documented() {
+        let org = Scope::Org("acme".into());
+        let rv = "review-requested:@me";
+        let all = Scope::All;
+        assert_eq!(
+            tail(&format!("is:open {rv}"), &all, None),
+            format!("is:open {rv} archived:false")
+        );
+        assert_eq!(
+            tail(&format!("is:open {rv}"), &org, None),
+            format!("is:open {rv} archived:false org:acme"),
+            "scope qualifiers appended"
+        );
+        assert_eq!(
+            tail("is:open org:other", &org, None),
+            "is:open org:other archived:false",
+            "a qualifier of its own turns the scope off"
+        );
+        for own in ["repo:a/b", "user:me", "(repo:a/b OR repo:c/d)"] {
+            assert!(
+                !tail(&format!("is:open {own}"), &org, None).contains("org:acme"),
+                "{own}"
+            );
+        }
+        assert_eq!(
+            tail("is:open archived:true", &all, None),
+            "is:open archived:true"
+        );
+        assert_eq!(tail("-archived:true x", &all, None), "-archived:true x");
+        assert_eq!(
+            tail("is:open", &org, Some("o/r")),
+            "is:open archived:false repo:o/r",
+            "repo mode: the current repo, not the scope"
+        );
+        assert_eq!(
+            tail("is:open repo:x/y", &org, Some("o/r")),
+            "is:open repo:x/y archived:false"
+        );
+        // OR is grouped so the added qualifiers apply to all of it
+        assert_eq!(
+            tail("a OR b", &org, None),
+            "(a OR b) archived:false org:acme"
+        );
+        assert_eq!(
+            tail("label:\"good first issue\" -label:wip", &all, None),
+            "label:good first issue -label:wip archived:false"
+        );
+    }
+
+    #[test]
+    fn hostile_filters_are_refused_or_stay_data_after_the_separator() {
+        for bad in [
+            "--web",
+            "x --jq=.",
+            "a\nb",
+            "a\rb",
+            "$(touch x)",
+            "`id`",
+            "a;b",
+            "x | y",
+            "\"unclosed",
+            "",
+        ] {
+            assert!(
+                Custom::new(&sec(SectionKind::Prs, bad), None).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+        // an OR with a user: qualifier is just terms: nothing before `--` changes
+        assert_eq!(
+            tail("x OR user:y", &Scope::Org("acme".into()), None),
+            "(x OR user:y) archived:false"
+        );
+        // a quoted phrase cannot smuggle a flag either
+        assert!(Custom::new(&sec(SectionKind::Prs, "\"--web\""), None).is_err());
+        // terms that merely contain dashes are fine
+        assert_eq!(
+            tail("fix-it -label:a-b", &Scope::All, None),
+            "fix-it -label:a-b archived:false"
+        );
+    }
+
+    #[test]
+    fn favorites_groups_leave_room_for_the_filters_own_operators() {
+        let c = |f: &str| Custom::new(&sec(SectionKind::Issues, f), None).unwrap();
+        let f6 = favs(6);
+        let (calls, left) = c("a OR b").calls(&Scope::Favorites, &f6, 30);
+        assert_eq!((calls.len(), left), (2, 0));
+        // 5 operators already: single repos, no OR group, at most 4 searches
+        let (calls, left) = c("a OR b OR c OR d OR e OR f").calls(&Scope::Favorites, &f6, 30);
+        assert_eq!((calls.len(), left), (4, 2));
+        assert!(calls[0].1.last().is_some_and(|t| t == "repo:o/r0") && calls[0].0 == Kind::Issue);
+        // an own-scope filter ignores favorites entirely: one search
+        let (calls, _) = c("org:x").calls(&Scope::Favorites, &f6, 30);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            Query::Custom(c("org:x")).searches_needed(&Scope::Favorites, &f6),
+            1
+        );
+        assert!(!Query::Custom(c("org:x")).uses_scope() && Query::Custom(c("x")).uses_scope());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_custom_section_is_one_search_limited_filtered_and_topped_up_like_the_others() {
+        let shim = crate::testshim::Shim::new();
+        let mut cfg = sec(SectionKind::Prs, "is:open author:@me");
+        cfg.limit = Some(3);
+        let q = Query::Custom(Custom::new(&cfg, None).unwrap());
+        let rows: Vec<(&str, u64)> = (1..=5).map(|i| ("keep/me", i)).collect();
+        shim.set("searchprs.out", &search_json(&rows));
+        let l = q
+            .fetch(&Scope::Org("acme".into()), &[], &ReposCfg::default(), None)
+            .unwrap();
+        let c = shim.calls();
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert!(
+            c[0].contains("--limit=3 ")
+                && c[0].ends_with("-- is:open author:@me archived:false org:acme"),
+            "{c:?}"
+        );
+        assert_eq!(l.items.len(), 3, "never more rows than the limit");
+        // hidden repos are dropped client side; a full page that emptied is asked for once more, twice as big
+        shim.clear("calls.log");
+        let hidden = ReposCfg {
+            hidden: vec!["noisy/bot".into()],
+            ..Default::default()
+        };
+        shim.set(
+            "searchprs.out",
+            &search_json(&[("noisy/bot", 1), ("noisy/bot", 2), ("noisy/bot", 3)]),
+        );
+        let l = q.fetch(&Scope::All, &[], &hidden, None).unwrap();
+        let c = shim.calls();
+        assert_eq!(c.len(), 2, "{c:?}");
+        assert!(c[1].contains("--limit=6 "));
+        assert_eq!((l.items.len(), l.hidden), (0, 3));
+        // too little search quota left: the page is enough
+        shim.clear("calls.log");
+        let low = Some(Quota {
+            remaining: 9,
+            limit: 30,
+        });
+        q.fetch(&Scope::All, &[], &hidden, low).unwrap();
+        assert_eq!(shim.calls().len(), 1);
+        // a failure is an error, not a blank list
+        shim.set("searchprs.err", "HTTP 422: Validation Failed");
+        assert!(q.fetch(&Scope::All, &[], &hidden, None).is_err());
+        // every search is counted against the budget
+        shim.clear("searchprs.err");
+        crate::rate::apply_poll(
+            r#"{"resources":{"graphql":{"limit":5000,"remaining":5000,"reset":4102444800},"core":{"limit":5000,"remaining":5000,"reset":4102444800},"search":{"limit":30,"remaining":20,"reset":4102444800}}}"#,
+        );
+        q.fetch(&Scope::All, &[], &ReposCfg::default(), None)
+            .unwrap();
+        assert_eq!(
+            crate::rate::snapshot().search.map(|b| b.remaining),
+            Some(19)
+        );
+        assert!(
+            crate::gh::cmd_log()
+                .iter()
+                .any(|l| l.contains("rate: search 19/30 left"))
         );
     }
 }

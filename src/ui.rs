@@ -1018,7 +1018,13 @@ fn extra_note(app: &App, i: usize, squeezed: bool) -> String {
 
 /// The one-tab form: `[2] Files (12)`, `[1] Pull requests · Mine (3)`; `with_tab` keeps the tab name,
 /// `short_name` squeezes the panel name to `PRs` (or drops it).
-fn simple_title(app: &App, i: usize, with_tab: bool, short_name: Option<bool>) -> Vec<Part> {
+fn simple_title(
+    app: &App,
+    i: usize,
+    with_tab: bool,
+    short_name: Option<bool>,
+    cut: usize,
+) -> Vec<Part> {
     let (p, th) = (&app.panels[i], &app.theme);
     let tab = p.tabs.get(p.tab).map(|t| t.label);
     let name = if p.title.is_empty() {
@@ -1030,6 +1036,10 @@ fn simple_title(app: &App, i: usize, with_tab: bool, short_name: Option<bool>) -
         None => String::new(),
         Some(true) if name == "Pull requests" => "PRs ".to_string(),
         Some(_) if name.is_empty() => String::new(),
+        Some(_) if name.chars().count() > cut => {
+            let keep: String = name.chars().take(cut.saturating_sub(1)).collect();
+            format!("{keep}{} ", th.ic.ell)
+        }
         Some(_) => format!("{name} "),
     };
     let extra = match (with_tab, p.title.is_empty(), tab) {
@@ -1073,10 +1083,16 @@ fn fit_title(app: &App, i: usize, avail: usize) -> Vec<Part> {
         forms.push(tab_title(app, i, true, false));
         forms.push(tab_title(app, i, true, true));
     }
-    forms.push(simple_title(app, i, true, Some(false)));
-    forms.push(simple_title(app, i, false, Some(false)));
-    forms.push(simple_title(app, i, false, Some(true)));
-    forms.push(simple_title(app, i, false, None));
+    let st = |tab, name, cut| simple_title(app, i, tab, name, cut);
+    forms.push(st(true, Some(false), usize::MAX));
+    forms.push(st(false, Some(false), usize::MAX));
+    forms.push(st(false, Some(true), usize::MAX));
+    // a long title (a custom section's) is cut to fit before the name is given up altogether
+    let bare = parts_width(&st(false, None, usize::MAX));
+    if avail > bare + 3 {
+        forms.push(st(false, Some(false), avail - bare - 1));
+    }
+    forms.push(st(false, None, usize::MAX));
     if let Some(f) = forms.iter().position(|f| parts_width(f) <= avail) {
         return forms.swap_remove(f);
     }
@@ -1146,9 +1162,14 @@ fn panel(f: &mut Frame, app: &App, i: usize, area: Rect, compact: bool) {
             None if p.kind.derived() && app.pr_item().is_none() => {
                 Note::Empty("select a pull request")
             }
-            None if p.kind.is_global_search() && app.favorites_missing() => Note::Empty(
-                "No favorites yet \u{2014} press f in the Repos panel or B (repo browser) to add some",
-            ),
+            None if p.kind.is_global_search()
+                && app.favorites_missing()
+                && app.scope_applies_to(i) =>
+            {
+                Note::Empty(
+                    "No favorites yet \u{2014} press f in the Repos panel or B (repo browser) to add some",
+                )
+            }
             None => Note::Empty(match p.kind {
                 PK::Files => "no files",
                 PK::Commits => "no commits",
@@ -4613,6 +4634,84 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
         a.panels[1].items = vec![it("cli/cli", 99, "Mine one", Kind::Pr)];
         a.panels[2].items = vec![it("acme/widgets", 12, "Crash on start", Kind::Issue)];
         a
+    }
+
+    #[test]
+    fn custom_sections_lay_out_as_extra_panels_at_both_sizes() {
+        use crate::config::{SectionCfg, SectionKind, Where};
+        let sec = |title: &str, kind, filter: &str| SectionCfg {
+            title: title.into(),
+            kind,
+            filter: filter.into(),
+            limit: None,
+            at: Where::Global,
+        };
+        let cfg = crate::config::Config {
+            sections: vec![
+                sec(
+                    "Needs my review",
+                    SectionKind::Prs,
+                    "is:open review-requested:@me",
+                ),
+                sec(
+                    "Acme bugs",
+                    SectionKind::Issues,
+                    "is:open org:acme label:bug",
+                ),
+            ],
+            ..Default::default()
+        };
+        for (w, h) in [(80u16, 24u16), (120, 40)] {
+            let mut a = App::build_start(
+                Some("o/r".into()),
+                true,
+                Theme::new(false, IconSet::Unicode, true),
+                false,
+                cfg.clone(),
+            );
+            let it = |repo: &str, n: u64, title: &str, kind: Kind| Item {
+                number: n,
+                title: title.into(),
+                repo: repo.into(),
+                state: "open".into(),
+                kind,
+                ..Default::default()
+            };
+            a.panels[4].items = vec![it("cli/cli", 7, "Review me please", Kind::Pr)];
+            a.panels[5].items = vec![it("acme/widgets", 3, "Widget crash", Kind::Issue)];
+            a.panels[5].unloaded = true;
+            for f in [4, 5] {
+                a.focus = f;
+                let s = render_app(&a, w, h);
+                assert!(
+                    s.contains("[5] ") && s.contains("[6] "),
+                    "{w}x{h} focus {f}\n{s}"
+                );
+                let t = line_of(&s, if f == 4 { "[5]" } else { "[6]" });
+                assert!(
+                    t.contains(if f == 4 {
+                        "Needs my review"
+                    } else {
+                        "Acme bugs"
+                    }),
+                    "{w}x{h}: {t}"
+                );
+            }
+            a.focus = 4;
+            let s = render_app(&a, w, h);
+            assert!(s.contains("cli/cli#7 Review me please"), "{w}x{h}\n{s}");
+            assert!(
+                line_of(&s, "[5]").contains("(1)"),
+                "{w}x{h}: {}",
+                line_of(&s, "[5]")
+            );
+            // not yet searched, scoped by its own org: said in the title, count unknown
+            a.focus = 5;
+            let s = render_app(&a, w, h);
+            let t = line_of(&s, "[6]");
+            assert!(t.contains("(own filter)") || w == 80, "{w}x{h}: {t}");
+            assert!(s.contains("[1] ") && s.contains("[4] "), "{w}x{h}\n{s}");
+        }
     }
 
     #[test]
