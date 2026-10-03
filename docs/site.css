@@ -116,7 +116,7 @@ h2 { margin-bottom: 22px; font-size: clamp(43px, 5.2vw, 72px); font-weight: 730;
 .mini-rows i { margin-left: auto; color: var(--lime); font-style: normal; }
 .product-card .card-footnote { margin: 14px 0 0; color: #91a39d; font-size: 11px; }
 .card-footnote a { color: var(--lime); text-decoration: underline; text-underline-offset: 3px; }
-.pulse-card { background: radial-gradient(circle at 85% 10%, #263426, transparent 55%), #17211c; }
+.activity-card { background: radial-gradient(circle at 85% 10%, #263426, transparent 55%), #17211c; }
 .status-stack { display: grid; gap: 9px; margin-top: 23px; }
 .status-stack span { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid #3d5344; border-radius: 6px; background: #101c17; color: #dfeddf; font: 11px ui-monospace, monospace; }
 .status-stack i { width: 7px; height: 7px; border-radius: 50%; }

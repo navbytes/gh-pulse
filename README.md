@@ -140,8 +140,9 @@ This downloads a precompiled binary from the latest GitHub release.
 
 The new extension can coexist with an existing `gh pulse` installation. Install it with
 `gh extension install navbytes/gh-tui`, then check `gh tui --version` before removing the old extension with
-`gh extension remove pulse` if you no longer need it. Whether `gh extension upgrade pulse` follows the repository
-rename is still to be verified against a published release. If a new XDG directory does not exist, gh-tui keeps
+`gh extension remove pulse` if you no longer need it. With GitHub CLI 2.100.0 on macOS arm64, `gh extension upgrade pulse` was verified
+against v0.3.0 through the repository redirect; it updates the old extension but its command remains `gh pulse`.
+Install `gh-tui` separately for `gh tui`. If a new XDG directory does not exist, gh-tui keeps
 using its existing gh-pulse config, state, or cache directory for reads and writes; it does not move files. A
 previously installed standalone `gh-pulse` binary is not removed automatically.
 

@@ -1,6 +1,6 @@
 # gh-pulse to gh-tui rename plan
 
-This plan tracks the v0.3.0 rename. It is not a release announcement. Do not publish a tag or move the GitHub repository until the gates below are complete.
+This plan records the v0.3.0 rename, including the release gates and remaining documentation work.
 
 ## Scope and phases
 
@@ -11,7 +11,14 @@ This plan tracks the v0.3.0 rename. It is not a release announcement. Do not pub
 
 ## Compatibility limits
 
-The old `gh pulse` command is provided by an installed `gh-pulse` extension. GitHub CLI selects release assets by platform suffix, so duplicate `gh-pulse-*` assets are unnecessary. Whether `gh extension upgrade pulse` follows the repository redirect is still unverified. Confirm it in an isolated GitHub CLI home with a real published release before promising it to users. The new install command is `gh extension install navbytes/gh-tui`; if the old extension remains installed, remove it only after its configuration and state have been checked. Do not change the user's installed extensions during automated tests.
+The old `gh pulse` command is provided by an installed `gh-pulse` extension. GitHub CLI selects release assets by platform suffix, so duplicate `gh-pulse-*` assets are unnecessary. With GitHub CLI 2.100.0 in an isolated macOS arm64 CLI home, `gh extension upgrade pulse` followed the repository redirect from v0.2.0 to v0.3.0 successfully; the command stayed `gh pulse` and reported gh-tui 0.3.0. A fresh `gh extension install navbytes/gh-tui` provided `gh tui` alongside it. Do not assume the upgrade is verified on other platforms. Remove the old extension only after checking its configuration and state. Do not change the user's installed extensions during automated tests.
+
+## Execution status (2026-10-03)
+
+- Repository moved to `navbytes/gh-tui`; the v0.3.0 release is live. CI, all four platform builds, checksums, provenance, and a downloaded macOS arm64 binary passed. Native attestation verification passed.
+- Isolated old-extension upgrade and new-extension install both passed on macOS arm64 without changing the user's installed extensions.
+- All 19 screenshots were regenerated with the new binary: 12 from public repositories and 7 from synthetic fake-gh data. The privacy blocklist passed, and the full public set was visually reviewed. The screenshot update awaits a follow-up commit or PR.
+- The `/gh-tui/` Pages URL is live and passed browser checks at 320, 390, and 1440 px for branding, images, and overflow. Deploy the final activity-label and screenshot update; the old `/gh-pulse/` Pages path will not redirect.
 
 ## Release and publishing gates
 

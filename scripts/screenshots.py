@@ -192,7 +192,7 @@ def set_layout(t, want):  # cycle `t` until the diff header shows the wanted lay
 
 
 def s_main(t):
-    pr(t, [5])
+    pr(t, [8])
 def s_diff_split(t):
     pr(t, [4]); ctx(t, 0); t.send('f', .8); set_layout(t, 'auto:split')
 def s_diff_prose(t):
@@ -215,6 +215,10 @@ def s_help(t):
     pr(t, [5]); t.send('?', 1)
 def s_compact(t):
     pr(t, [])  # the narrow layout moves the detail pane, so the row search in pr() would never match
+    for _ in range(120):
+        if f'{GP} #8' in t.text(): break
+        t.send('j', .25)
+    t.pump(3)
 
 
 GP, CLI = os.environ.get('GH_TUI_SHOT_REPO', 'navbytes/gh-tui'), 'cli/cli'

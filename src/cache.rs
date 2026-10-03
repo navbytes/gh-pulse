@@ -321,7 +321,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn clear_cache_removes_everything_gh_pulse_cached() {
+    fn clear_cache_removes_everything_gh_tui_cached() {
         let shim = crate::testshim::Shim::new();
         let d = dir().unwrap();
         assert!(shim.dir.join("cache") == d);
