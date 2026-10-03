@@ -218,11 +218,25 @@ impl Store {
     }
 
     pub fn write<T: Serialize>(&self, key: &str, data: &T, now: u64) -> Result<(), String> {
+        self.write_limited(key, data, now, usize::MAX)
+    }
+
+    /// Like `write`, but an entry that serializes to more than `max` bytes is left out (Ok: not an error).
+    pub fn write_limited<T: Serialize>(
+        &self,
+        key: &str,
+        data: &T,
+        now: u64,
+        max: usize,
+    ) -> Result<(), String> {
         if let Err(e) = self.ensure() {
             refuse(e.clone());
             return Err(e);
         }
         let body = serde_json::to_string(&Entry { at: now, data }).map_err(|e| e.to_string())?;
+        if body.len() > max {
+            return Ok(());
+        }
         let path = self.file(key);
         // unique per process and call, and created exclusively: it can't be a pre-planted link
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -236,6 +250,43 @@ impl Store {
             let _ = std::fs::remove_file(&tmp);
             e.to_string()
         })
+    }
+}
+
+impl Store {
+    /// Remove entries whose file name starts with `prefix` and that are older than the hard maximum,
+    /// then the oldest ones beyond `keep` files. Our own files only: a symlink or other file type is
+    /// never touched. Returns how many were removed.
+    pub fn prune(&self, prefix: &str, keep: usize) -> usize {
+        let Ok(rd) = std::fs::read_dir(&self.dir) else {
+            return 0;
+        };
+        let now = std::time::SystemTime::now();
+        let mut files: Vec<(std::time::SystemTime, PathBuf)> = vec![];
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with(prefix) || !name.ends_with(".json") {
+                continue;
+            }
+            let Ok(m) = std::fs::symlink_metadata(e.path()) else {
+                continue;
+            };
+            if m.is_file() {
+                files.push((m.modified().unwrap_or(now), e.path()));
+            }
+        }
+        files.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+        let mut removed = 0;
+        for (i, (t, path)) in files.iter().enumerate() {
+            let old = now
+                .duration_since(*t)
+                .is_ok_and(|d| d.as_secs() > HARD_MAX_AGE);
+            if (old || i >= keep) && std::fs::remove_file(path).is_ok() {
+                removed += 1;
+            }
+        }
+        removed
     }
 }
 
@@ -260,6 +311,25 @@ mod tests {
         let d = std::env::temp_dir().join(format!("gh-tui-cache-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         Store::new(d)
+    }
+
+    #[test]
+    fn prune_keeps_the_newest_files_with_the_prefix_and_leaves_others_alone() {
+        let s = store("prune");
+        for (i, k) in ["d-a", "d-b", "d-c", "other"].into_iter().enumerate() {
+            s.write(k, &i, 1).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(s.prune("d-", 2), 1, "only d-a is beyond the newest two");
+        assert!(s.read::<usize>("d-a", 1).is_none());
+        assert!(s.read::<usize>("d-b", 1).is_some() && s.read::<usize>("d-c", 1).is_some());
+        assert!(
+            s.read::<usize>("other", 1).is_some(),
+            "other prefixes are not ours to prune"
+        );
+        // an entry over the limit is not written, and that is not an error
+        assert!(s.write_limited("big", &"x".repeat(100), 1, 50).is_ok());
+        assert!(s.read::<String>("big", 1).is_none());
     }
 
     #[test]

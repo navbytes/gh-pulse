@@ -23,6 +23,8 @@ pub struct Config {
     pub api: ApiCfg,
     #[serde(skip_serializing_if = "UiCfg::is_default")]
     pub ui: UiCfg,
+    #[serde(skip_serializing_if = "CacheCfg::is_default")]
+    pub cache: CacheCfg,
     /// `[[sections]]`: your own search-based panels. Last, so the file stays valid TOML when saved.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sections: Vec<SectionCfg>,
@@ -114,6 +116,70 @@ impl Window {
 impl UiCfg {
     fn is_default(&self) -> bool {
         *self == UiCfg::default()
+    }
+}
+
+/// `[cache]`: how long cached data counts as fresh. Older entries are still shown at once (marked as
+/// cached) while a refresh runs; `[api] cache = false` turns the whole cache off.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CacheCfg {
+    /// Keep PR and issue details (comments, diffs, commits, checks) on disk between runs.
+    pub details: bool,
+    /// Review requested, My PRs (open) and a repo's PR list.
+    pub hot_s: u64,
+    /// Involved, issues, and a repo's issue list.
+    pub warm_s: u64,
+    /// Merged and closed tabs.
+    pub cold_s: u64,
+    /// CI checks while one is still pending (finished checks use `overview_s`).
+    pub checks_s: u64,
+    /// PR overview: review state and mergeability can change without the PR being updated.
+    pub overview_s: u64,
+    /// Comments, diffs and commits: valid while the PR is unchanged, but never longer than this.
+    pub detail_s: u64,
+    /// Slow facts: the repo list, repo facts, workflows, labels, templates, organizations.
+    pub slow_s: u64,
+}
+
+impl Default for CacheCfg {
+    fn default() -> Self {
+        CacheCfg {
+            details: true,
+            hot_s: 120,
+            warm_s: 300,
+            cold_s: 900,
+            checks_s: 45,
+            overview_s: 300,
+            detail_s: 86_400,
+            slow_s: 3_600,
+        }
+    }
+}
+
+impl CacheCfg {
+    fn is_default(&self) -> bool {
+        *self == CacheCfg::default()
+    }
+
+    fn check(&self) -> Result<(), (&'static str, String)> {
+        for (key, v) in [
+            ("hot_s", self.hot_s),
+            ("warm_s", self.warm_s),
+            ("cold_s", self.cold_s),
+            ("checks_s", self.checks_s),
+            ("overview_s", self.overview_s),
+            ("detail_s", self.detail_s),
+            ("slow_s", self.slow_s),
+        ] {
+            if !(5..=604_800).contains(&v) {
+                return Err((
+                    key,
+                    format!("cache.{key}: must be 5..604800 seconds (a week), got {v}"),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -940,6 +1006,12 @@ pub fn parse(src: &str, name: &str) -> Result<Config, String> {
     if let Err((key, msg)) = cfg.api.check() {
         return Err(format!("{name}:{}: {msg}", key_line(src, "[api]", 0, key)));
     }
+    if let Err((key, msg)) = cfg.cache.check() {
+        return Err(format!(
+            "{name}:{}: {msg}",
+            key_line(src, "[cache]", 0, key)
+        ));
+    }
     Ok(cfg)
 }
 
@@ -1204,6 +1276,24 @@ impl Keymap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cache_section_has_tiered_defaults_and_validates_ranges() {
+        let d = parse("", "t").unwrap().cache;
+        assert_eq!(
+            (d.hot_s, d.warm_s, d.cold_s, d.slow_s),
+            (120, 300, 900, 3600)
+        );
+        assert!(d.details && d.checks_s == 45 && d.detail_s == 86_400);
+        let c = parse("[cache]\ndetails = false\nhot_s = 30\n", "t")
+            .unwrap()
+            .cache;
+        assert!(!c.details && c.hot_s == 30 && c.warm_s == 300);
+        let e = parse("[cache]\nhot_s = 1\n", "t").unwrap_err();
+        assert!(e.contains("t:2") && e.contains("hot_s"), "{e}");
+        assert!(parse("[cache]\nwarm_s = 999999\n", "t").is_err());
+        assert!(parse("[cache]\nbogus = 1\n", "t").is_err(), "unknown field");
+    }
 
     #[test]
     fn the_pr_window_parses_cycles_and_rejects_nonsense() {

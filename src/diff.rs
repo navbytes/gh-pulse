@@ -1,6 +1,6 @@
 use unicode_width::UnicodeWidthChar;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Op {
     Ctx,
     Add,
@@ -8,7 +8,7 @@ pub enum Op {
     Hunk,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DLine {
     pub op: Op,
     pub old: Option<u32>,
@@ -16,6 +16,7 @@ pub struct DLine {
     pub text: String,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct File {
     /// Display path (look-alike characters neutralized).
     pub path: String,

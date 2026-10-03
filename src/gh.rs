@@ -1,5 +1,5 @@
 use crate::diff;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::ffi::{OsStr, OsString};
 use std::process::Command;
@@ -286,7 +286,7 @@ pub struct RepoRef {
     name_with_owner: String,
 }
 
-#[derive(Deserialize, Debug, Default, Clone)]
+#[derive(Deserialize, Serialize, Debug, Default, Clone)]
 pub struct Author {
     pub login: String,
 }
@@ -548,8 +548,8 @@ struct Workflow {
     path: String,
 }
 
-const PR_FIELDS: &str = "number,title,url,state,isDraft,author,labels,body";
-const ISSUE_FIELDS: &str = "number,title,url,state,author,labels,body";
+const PR_FIELDS: &str = "number,title,url,state,isDraft,author,labels,body,updatedAt";
+const ISSUE_FIELDS: &str = "number,title,url,state,author,labels,body,updatedAt";
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -763,8 +763,8 @@ query($o:String!,$n:String!,$qpr:String!,$qis:String!,$prSearch:Boolean!,$prOpen
  prSearch:search(query:$qpr,type:ISSUE,first:100) @include(if:$prSearch){nodes{...PRF}}\
  isSearch:search(query:$qis,type:ISSUE,first:100) @include(if:$isSearch){nodes{...ISF}}\
 }\
-fragment PRF on PullRequest{number title url state isDraft body author{login} labels(first:20){nodes{name}}}\
-fragment ISF on Issue{number title url state body author{login} labels(first:20){nodes{name}}}";
+fragment PRF on PullRequest{number title url state isDraft body updatedAt author{login} labels(first:20){nodes{name}}}\
+fragment ISF on Issue{number title url state body updatedAt author{login} labels(first:20){nodes{name}}}";
 
 /// Which first-screen parts to fetch: the PR and issue tab ids (`gh::list` ids) to open with, and
 /// whether the repo facts are needed (not when a fresh copy is cached).
@@ -1180,7 +1180,7 @@ fn branches(repo: &str) -> Result<Vec<Item>, String> {
         .collect())
 }
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Serialize, Default, Debug)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Overview {
     pub is_draft: bool,
@@ -1193,21 +1193,21 @@ pub struct Overview {
     pub latest_reviews: Vec<LatestReview>,
 }
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Serialize, Default, Debug)]
 #[serde(default)]
 pub struct ReviewReq {
     pub login: Option<String>,
     pub name: Option<String>,
 }
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Serialize, Default, Debug)]
 #[serde(default)]
 pub struct LatestReview {
     pub author: Option<Author>,
     pub state: String,
 }
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Serialize, Default, Debug)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Check {
     pub name: String,
@@ -1225,7 +1225,7 @@ pub struct Thread {
     pub path: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Reaction {
     /// GitHub's enum name, e.g. THUMBS_UP.
     pub content: String,
@@ -1234,7 +1234,7 @@ pub struct Reaction {
 }
 
 /// One comment as shown in the Comments tab: author, standing, age, edits, reactions, replies.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Card {
     /// GraphQL node id, to ask for who reacted.
     pub id: String,
@@ -1253,7 +1253,7 @@ pub struct Card {
 }
 
 /// A selectable block in the Comments tab.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
     /// One-line label for the Comments panel.
     pub head: String,
@@ -1263,7 +1263,7 @@ pub struct Entry {
     pub card: Card,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct FilesData {
     /// Head sha; anchors inline comments.
     pub sha: String,
@@ -1277,6 +1277,7 @@ pub struct FilesData {
     pub gh_viewed: Vec<String>,
 }
 
+#[derive(Serialize, Deserialize)]
 pub enum Data {
     Overview(Overview),
     Checks(Vec<Check>),
@@ -1287,7 +1288,7 @@ pub enum Data {
 }
 
 /// One commit of a PR.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CommitRow {
     pub sha: String,
     pub subject: String,
@@ -1406,7 +1407,7 @@ fn card_from(n: &Value) -> Card {
 }
 
 /// Cursors for what is still to be fetched after the first page of comments.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Pending {
     /// Next cursor per connection: issue/PR comments, reviews, review threads.
     pub conn: [Option<String>; 3],
@@ -1421,7 +1422,7 @@ impl Pending {
 }
 
 /// The Comments tab data: entries (comments, then reviews, then threads) plus paging state.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CommentsData {
     pub entries: Vec<Entry>,
     /// How many entries each group (comments / reviews / threads) holds, for inserting later pages.
@@ -1435,6 +1436,7 @@ pub struct CommentsData {
     pub loading: bool,
     pub error: Option<String>,
     /// Set after a rate-limit error: no new page is requested before this instant.
+    #[serde(skip)]
     pub blocked_until: Option<std::time::Instant>,
 }
 
@@ -1949,6 +1951,18 @@ pub fn detail(repo: &str, it: &Item, tab: Tab) -> Result<Data, String> {
     let mut d = detail_raw(repo, it, tab)?;
     clean_data(&mut d);
     Ok(d)
+}
+
+/// Data read back from disk is cleaned again: the cache directory is not trusted.
+pub fn reclean(d: &mut Data) {
+    clean_data(d);
+    if let Data::Files(f) = d {
+        use crate::sanitize::clean_in_place as cl;
+        for file in &mut f.files {
+            cl(&mut file.path);
+            file.lines.iter_mut().for_each(|l| cl(&mut l.text));
+        }
+    }
 }
 
 fn clean_entry(e: &mut Entry) {
