@@ -102,7 +102,8 @@ Regenerate with `GH_PULSE_SHOT_BLOCKLIST=word,word python3 scripts/screenshots.p
   **My PRs** (Open / Merged / Closed), **Issues** (Assigned / Mine / Mentioned), an optional **Involved**, and a
   **Repos** panel (Favorites / Recent). Rows read `owner/repo#N`; the detail pane, diffs, checks, comments and every
   action work across repos without switching. `s` narrows the home to all repos, your favorites, one org or one repo;
-  `S` opens the selected item's repo (`G` goes back); hidden repos are left out. A full-screen **repo browser** (`B`)
+  `S` opens the selected item's repo (`G` goes back); hidden repos are left out. The scope picker also takes any org
+  or user name you type. A full-screen **repo browser** (`B`)
   covers every repo you can access, with search, sort, favorites and hide.
 - **Custom sections**: add your own GitHub searches as panels with `[[sections]]` in the config (gh-dash style), for the
   global home, the repo home or both, e.g. `filter = "is:open review-requested:@me org:acme"`. They load when focused,
@@ -131,15 +132,12 @@ gh pulse                      # same flags as the standalone binary
 gh extension upgrade pulse
 ```
 
-This downloads a precompiled binary from a GitHub release, so it needs a published release. No release exists
-yet (the release workflow has not run); until the first one is published, use cargo below.
+This downloads a precompiled binary from the latest GitHub release.
 
-Prebuilt platforms: macOS (arm64, amd64) and Linux (arm64, amd64; glibc). Windows is unsupported and untested.
-The Linux binaries are built on Ubuntu 22.04, so they need glibc 2.35 or newer. The release build is not yet
-tested end to end.
+Prebuilt platforms: macOS (arm64, amd64) and Linux (arm64, amd64; glibc 2.35 or newer, built on Ubuntu 22.04).
+Windows is unsupported and untested.
 
-Each release carries a `SHA256SUMS` file and, once a release has been cut, build provenance attestations. To verify
-a downloaded binary: `sha256sum -c SHA256SUMS --ignore-missing` (Linux) or `shasum -a 256 -c SHA256SUMS --ignore-missing` (macOS), or
+Each release carries a `SHA256SUMS` file and build provenance attestations. To verify a downloaded binary: `sha256sum -c SHA256SUMS --ignore-missing` (Linux) or `shasum -a 256 -c SHA256SUMS --ignore-missing` (macOS), or
 `gh attestation verify gh-pulse-linux-amd64 --repo navbytes/gh-pulse`.
 
 ### With cargo
@@ -190,17 +188,30 @@ gh-pulse needs an interactive terminal; piping stdin/stdout prints a message and
 
 ## Configuration
 
-Optional `~/.config/gh-pulse/config.toml` (`$XDG_CONFIG_HOME` is honored): default theme and icons, favorite and
-hidden repos (written by the repo browser), and key remapping. Flags override the file; a missing file means
+Optional `~/.config/gh-pulse/config.toml` (`$XDG_CONFIG_HOME` is honored): theme and icons, start mode, panels and
+tabs, custom sections, API tuning, favorite and hidden repos (written by the repo browser), and key remapping. Flags override the file; a missing file means
 defaults; an invalid file stops startup with `file:line: message`. See [docs/configuration.md](docs/configuration.md).
 The file never contains credentials; authentication stays entirely with `gh`.
 
+Custom sections are your own GitHub searches as panels (gh-dash style); each is one search, run when you focus it.
+Three examples (`where` defaults to `"global"`; full reference in [docs/configuration.md](docs/configuration.md#custom-sections)):
+
 ```toml
-[[sections]]                  # an extra panel: your own search
-title  = "Needs my review (acme)"
-kind   = "prs"                # or "issues"
+[[sections]]
+title  = "Needs my review"
+kind   = "prs"
 filter = "is:open review-requested:@me org:acme draft:false"
-limit  = 50                   # optional, 1..100 (default 30); where = "global" | "repo" | "both"
+
+[[sections]]
+title  = "My stale PRs"
+kind   = "prs"
+filter = "is:open author:@me updated:<2026-01-01"
+
+[[sections]]
+title  = "Bugs in acme/widgets"
+kind   = "issues"
+filter = "is:open label:bug repo:acme/widgets"
+limit  = 50                   # optional, 1..100 (default 30)
 ```
 
 ## Local state
@@ -224,9 +235,7 @@ cache switches itself off with a notice). What is stored:
 Never cached: tokens, comments, notifications, PR details, diffs, anything from a write. `gh-pulse --clear-cache`
 deletes the whole directory; `[api] cache = false` turns caching off; `r` and `R` skip it.
 
-Files you mark viewed (`v`) are remembered in `$XDG_STATE_HOME/gh-pulse/viewed.json` (default
-`~/.local/state/`), per repo and PR, and reset when the PR's head commit changes. Nothing is written to GitHub.
-A corrupt state file is ignored with a warning, never a crash.
+Files you mark viewed (`v`) reset when the PR's head commit changes; nothing is written to GitHub unless you set `sync_viewed`.
 
 ## Concepts
 
@@ -243,7 +252,7 @@ A corrupt state file is ignored with a warning, never a crash.
   file shown in the diff.
 - **Drill-in.** `Enter` on a PR replaces the left column with Files / Commits / Checks / Comments of that PR; `Esc` goes
   back and your cursor is where you left it.
-- **Search budget.** Each global section is one GitHub search (the search API allows 30 a minute), made when you
+- **Search budget.** (See also *API usage* below.) Each global section is one GitHub search (the search API allows 30 a minute), made when you
   focus the section, change the scope or press `r` (favorites scope: one search per four repos, at most 16 repos).
   Nothing searches in the background and unopened search tabs show `?`. A section never costs more than 8 searches,
   `r` while one is running is ignored, and a refresh the rest of the minute can't pay for is refused with the reset time.
@@ -299,6 +308,20 @@ Font glyphs.
 `t` cycles auto / unified / split (auto goes side-by-side when each half has 60+ columns). Long lines soft-wrap
 at word boundaries with a `↪` marker; `w` switches to clipping. `f` zooms the right pane to full width.
 
+## API usage and rate limits
+
+- One GraphQL request fills the first screen; other panels load when first focused, at most 4 `gh` processes run at
+  once, and what you ask for goes before anything automatic.
+- **Tab counts** are `lazy` by default (`[api] counts = "lazy" | "eager" | "off"`); search-backed tabs show `?` until opened.
+- **Quota chip.** `⚡ 412/5000` in the header means a quota is under 20% (`low_quota_percent`; `rate_header = false` hides it).
+- **Pause.** Under 10% (`pause_percent`) everything automatic stops (counts, extra comment pages, the inbox badge)
+  until the window resets (`resets HH:MM`); your own actions still work. `Retry-After` and secondary-limit messages are honored.
+- **Cache.** Slow-changing lookups (repo list, header facts, labels, templates, tags) are cached on disk;
+  `r` / `R` skip it, `[api] cache = false` disables it, `--clear-cache` wipes it.
+- The only polling is the unread badge (2 min) and a free `gh api rate_limit` check (5 min).
+
+Details and every `[api]` key: [docs/configuration.md](docs/configuration.md#api-etiquette).
+
 ## FAQ and troubleshooting
 
 - **"not in a GitHub repo" / "repo not found or no access".** The first only appears with `--start repo`; by default
@@ -309,23 +332,16 @@ at word boundaries with a `↪` marker; `w` switches to clipping. `f` zooms the 
 - **"Terminal too small".** The minimum is 50x12. On short terminals unfocused panels collapse to one line.
 - **Colors look washed out or odd.** Your terminal probably lacks truecolor: set `COLORTERM=truecolor` if it
   supports it, or try `--theme light` on light backgrounds.
-- **A `⚡ 412/5000` chip appears in the header / "paused background refresh".** GitHub's API quota is running
-  low (under 20%, configurable). Below 10% gh-pulse stops everything it does by itself (tab counts, extra comment
-  pages, the inbox badge) until the window resets, shown as `resets HH:MM`; what you ask for still works. At
-  `Retry-After` / secondary-limit messages it backs off for the time given.
-- **How much API does it use?** One GraphQL request fills the first screen (PRs, issues, repo facts), other panels
-  load when first focused, at most 4 `gh` processes run at once, and the only polling is the unread badge (2 min)
-  and a free `gh api rate_limit` check (5 min). Tab counts of search-backed tabs show `?` until opened. See
-  [docs/configuration.md](docs/configuration.md#api-etiquette).
 - **Boxes and icons are garbled.** Use `--ascii`, or install a Nerd Font and use `--nerd`.
 - **A huge PR shows its diff anyway.** Over 300 files `gh pr diff` refuses; gh-pulse falls back to the files API.
 
 ## Roadmap
 
-- Sync viewed marks with GitHub's own viewed state (a mutation, so it would go through the confirm popup).
-- Open PR/issue counts in more places; org-level views.
+- Polish for the Commits tab and PR creation.
+- GitHub Enterprise Server support is untested.
+- Windows is unsupported.
 
-See [docs/BACKLOG.md](docs/BACKLOG.md).
+See [docs/BACKLOG.md](docs/BACKLOG.md) for known limitations, and [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
 
 ## Contributing
 

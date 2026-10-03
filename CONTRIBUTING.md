@@ -48,7 +48,7 @@ toolchain.
 
 ## Releases
 
-1. Bump `version` in `Cargo.toml` (and `Cargo.lock`, via `cargo build`) in a PR and merge it.
+1. Bump `version` in `Cargo.toml` (and `Cargo.lock`, via `cargo build`) and add the release's section to `CHANGELOG.md` in a PR and merge it.
 2. Tag the merge commit `vX.Y.Z` (or `vX.Y.Z-rc.1`, published as a pre-release) and push the tag.
 3. The `Release` workflow builds `gh-pulse-<os>-<arch>` for macOS and Linux (arm64, amd64), writes `SHA256SUMS`,
    attests provenance and creates the GitHub release. It fails if the tag does not match the `Cargo.toml` version.

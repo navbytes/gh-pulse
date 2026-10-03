@@ -1160,6 +1160,24 @@ impl Keymap {
 mod tests {
     use super::*;
 
+    #[test]
+    fn doc_toml_examples_parse() {
+        for file in ["README.md", "docs/configuration.md"] {
+            let text =
+                std::fs::read_to_string(format!("{}/{file}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+            let mut n = 0;
+            for block in text.split("```toml\n").skip(1) {
+                let block = block.split("```").next().unwrap();
+                if block.contains("# partial") {
+                    continue;
+                }
+                n += 1;
+                parse(block, file).unwrap_or_else(|e| panic!("{e}\n{block}"));
+            }
+            assert!(n > 0, "{file}: no toml blocks found");
+        }
+    }
+
     fn keys(toml: &str) -> BTreeMap<String, Keys> {
         parse(toml, "t").unwrap().keys
     }
