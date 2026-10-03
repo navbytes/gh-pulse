@@ -42,10 +42,15 @@ pub struct Hl {
 #[cfg(feature = "syntax")]
 impl Hl {
     pub fn new(theme_name: &str, conv: Box<dyn Fn((u8, u8, u8)) -> Color>) -> Self {
-        // Leaked once per process: HighlightLines borrows both, and the cache outlives any scope.
-        let ps: &'static SyntaxSet = Box::leak(Box::new(SyntaxSet::load_defaults_newlines()));
-        let mut themes = ThemeSet::load_defaults().themes;
-        let theme = themes.remove(theme_name).unwrap_or_default();
+        // Loaded once per process (parsing the dumps is slow, esp. in debug); HighlightLines borrows both.
+        static SETS: std::sync::OnceLock<(SyntaxSet, ThemeSet)> = std::sync::OnceLock::new();
+        let (ps, themes) = SETS.get_or_init(|| {
+            (
+                SyntaxSet::load_defaults_newlines(),
+                ThemeSet::load_defaults(),
+            )
+        });
+        let theme = themes.themes.get(theme_name).cloned().unwrap_or_default();
         Hl {
             ps,
             theme: Box::leak(Box::new(theme)),

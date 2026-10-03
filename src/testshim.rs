@@ -12,10 +12,10 @@ pub struct Shim {
 }
 
 const SCRIPT: &str = r#"#!/bin/sh
-d="$(cd "$(dirname "$0")" && pwd)"
+d="${0%/*}"
 echo "$*" >> "$d/calls.log"
 echo "${XDG_CACHE_HOME:-}" >> "$d/env.log"
-if [ -f "$d/sleep" ]; then exec sleep "$(cat "$d/sleep")"; fi
+if [ -f "$d/sleep" ]; then read -r s < "$d/sleep"; exec sleep "$s"; fi
 pick() {
   if [ -f "$d/$1.err" ]; then cat "$d/$1.err" >&2; exit 1; fi
   if [ -f "$d/$1.out" ]; then cat "$d/$1.out"; exit 0; fi
@@ -49,7 +49,7 @@ impl Shim {
             if crate::pool::global().idle() {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         let dir = std::env::temp_dir().join(format!(
             "gh-pulse-shim-{}-{}",

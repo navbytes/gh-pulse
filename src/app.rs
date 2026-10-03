@@ -4251,14 +4251,25 @@ mod tests {
 
     fn wait(a: &mut App, what: &str, ok: impl Fn(&App) -> bool) {
         // a generous deadline (30 s): it only matters when something is really wrong
-        for _ in 0..3000 {
+        for _ in 0..15000 {
             a.poll();
             if ok(a) {
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
         panic!("timed out waiting for {what}");
+    }
+
+    /// Waits for queued and running jobs to finish, so a "nothing was fetched" check sees every call.
+    fn quiesce() {
+        for _ in 0..30000 {
+            if crate::pool::global().idle() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("pool never went idle");
     }
 
     fn list_calls(shim: &crate::testshim::Shim) -> Vec<String> {
@@ -4348,7 +4359,7 @@ mod tests {
         for _ in 0..5 {
             a.ensure();
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        quiesce();
         assert_eq!(work(&shim), before, "no retry loop while backing off");
         // once the time has passed everything resumes
         rate::reset_for_test();
@@ -4799,7 +4810,7 @@ mod tests {
         // closing and reopening does not ask again: the names are known
         a.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
         a.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        quiesce();
         assert_eq!(
             shim.calls()
                 .iter()
@@ -4960,11 +4971,10 @@ mod tests {
         // press the loop idles 100ms and runs a tick, then the next key arrives
         for _ in 0..10 {
             key(&mut a, 'j');
-            std::thread::sleep(std::time::Duration::from_millis(110));
-            a.ensure();
             a.last_input = std::time::Instant::now() - std::time::Duration::from_millis(120);
+            a.ensure();
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        quiesce();
         assert_eq!(
             views(&shim),
             0,
@@ -4976,7 +4986,7 @@ mod tests {
         a.ensure();
         a.ensure();
         wait(&mut a, "the overview", |_| views(&shim) >= 1);
-        std::thread::sleep(std::time::Duration::from_millis(150));
+        quiesce();
         assert_eq!(views(&shim), 1, "{:?}", shim.calls());
         assert!(
             shim.calls()
@@ -5004,15 +5014,14 @@ mod tests {
         // selecting a PR on its Overview, Checks and Diff tabs, however many ticks pass: no comments request
         for _ in 0..4 {
             a.ensure();
-            std::thread::sleep(std::time::Duration::from_millis(130));
+            quiesce();
         }
         key(&mut a, ']'); // Checks
         a.last_input = std::time::Instant::now() - std::time::Duration::from_secs(1);
         for _ in 0..3 {
             a.ensure();
-            std::thread::sleep(std::time::Duration::from_millis(40));
+            quiesce();
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
         assert!(
             shim.calls()
                 .iter()
@@ -5035,7 +5044,7 @@ mod tests {
         for _ in 0..6 {
             a.ensure();
             a.poll();
-            std::thread::sleep(std::time::Duration::from_millis(30));
+            quiesce();
         }
         assert_eq!(
             comments(&shim),
@@ -5051,7 +5060,7 @@ mod tests {
             a.last_input = std::time::Instant::now() - std::time::Duration::from_secs(1);
             a.ensure();
             a.poll();
-            std::thread::sleep(std::time::Duration::from_millis(40));
+            quiesce();
         }
         assert_eq!(comments(&shim), before, "already cached: not fetched again");
     }
@@ -5068,9 +5077,9 @@ mod tests {
         wait(&mut a, "checks", |_| {
             shim.calls().iter().any(|c| c.contains("pr checks"))
         });
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        quiesce();
         a.fetch(pr(3), Tab::Checks);
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        quiesce();
         let n = shim
             .calls()
             .iter()
@@ -6099,7 +6108,7 @@ mod tests {
         for _ in 0..3 {
             a.ensure();
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        quiesce();
         assert!(
             shim.calls()
                 .iter()
