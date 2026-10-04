@@ -12,6 +12,8 @@ pub struct Action {
     pub local_of: Option<String>,
     /// Opens a form instead of running `build`.
     pub form: Option<FormKind>,
+    /// Index of the `[[actions]]` entry this runs instead (then `build` is unused).
+    pub custom: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -32,6 +34,7 @@ fn form_act(label: &str, kind: FormKind) -> Action {
         build: Box::new(|_| vec![]),
         local_of: None,
         form: Some(kind),
+        custom: None,
     }
 }
 
@@ -60,6 +63,7 @@ fn act(
         build: Box::new(build),
         local_of: None,
         form: None,
+        custom: None,
     }
 }
 

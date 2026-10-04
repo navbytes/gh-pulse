@@ -2606,6 +2606,23 @@ fn modal(f: &mut Frame, app: &App) {
                 );
             }
         }
+        Modal::Run(p) => {
+            let w = f.area().width.saturating_sub(4).clamp(20, 100);
+            let mode = match p.mode {
+                crate::custom::Mode::Foreground => "takes over the terminal until it exits",
+                crate::custom::Mode::Detach => "starts in the background",
+            };
+            let mut lines: Vec<String> =
+                vec![format!("{} ({mode})", crate::sanitize::clean(&p.name))];
+            lines.push(String::new());
+            for l in crate::sanitize::clean(&p.shown).lines() {
+                lines.extend(wrap(l, w as usize - 2));
+            }
+            let h = (lines.len() as u16 + 2).min(f.area().height.saturating_sub(2));
+            let area = popup(f, app, w, h, "Run this command?  [y yes, n/Esc no]");
+            let lines: Vec<Line> = lines.into_iter().map(Line::raw).collect();
+            f.render_widget(Paragraph::new(lines), area);
+        }
         Modal::Form(form) => form_popup(f, app, form),
     }
 }

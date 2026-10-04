@@ -95,3 +95,36 @@
 # title  = "Needs my review"
 # kind   = "prs"
 # filter = "is:open review-requested:@me -author:app/dependabot draft:false"
+
+# --- Your own commands on the selected row (up to 30) -------------------------------------------------
+# Shown at the end of the x menu on rows they fit, and on their own key when you give one.
+#   name     shown in the menu
+#   on       what rows: pr, issue, repo, run, workflow, branch, release, tag or any (one word or a list)
+#   run      the command as a list; {url} {repo} {owner} {name} {number} {kind} {author} {ref} are filled in
+#            per element, never pasted into a shell line ({{ and }} give a literal brace)
+#   shell    instead of run: a `sh -c` script (pipes, &&). Row data arrives as $GHTUI_URL, $GHTUI_REPO,
+#            $GHTUI_OWNER, $GHTUI_NAME, $GHTUI_NUMBER, $GHTUI_KIND, $GHTUI_AUTHOR, $GHTUI_REF, $GHTUI_TITLE,
+#            $GHTUI_STATE. Run commands get the same variables.
+#   mode     foreground (default): gh-tui steps aside, the command gets the terminal, and the row is
+#            re-read when it exits. detach: started and left alone, for tmux, roost, a browser.
+#   key      run it from the list: "ctrl-o", "O". Can't be a built-in or navigation key.
+#   pause    foreground only: wait for Enter before coming back (default: only when it failed)
+#   confirm  show the full command and ask first (default false)
+#
+# [[actions]]
+# name = "Claude review"
+# on   = "pr"
+# run  = ["claude", "Review {url}. Focus on correctness and security."]
+#
+# [[actions]]
+# name = "Review in a roost tab"
+# on   = "pr"
+# mode = "detach"
+# run  = ["roost", "spawn", "claude", "--tab", "--title", "pr-{number}", "--input", "Review {url}"]
+#
+# [[actions]]
+# name = "Review in a tmux window"
+# on   = "pr"
+# mode = "detach"
+# key  = "ctrl-o"
+# run  = ["tmux", "new-window", "-n", "pr-{number}", "claude", "Review {url}"]

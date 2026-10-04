@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Custom actions: `[[actions]]` in `config.toml` define commands that run on the selected row, from the `x` menu or
+  their own key (`name`, `on`, `run` or `shell`, `mode`, `key`, `pause`, `confirm`). `foreground` hands the terminal to
+  the command (an interactive `claude`, `lazygit`) as `E` does for the editor, then re-reads the row; `detach` starts it
+  and carries on, for `tmux new-window`, `roost spawn` and the like, reporting only a failure. `{url}`, `{repo}`,
+  `{number}` and friends fill whole arguments, never a shell line; the `shell` form gets `$GHTUI_*` variables.
 - Tab counts in the repo home come from one GraphQL request instead of one list fetch per tab: exact totals (`412`,
   not `100+`), and the Mine / Review requested / Assigned / Mine tabs, which used to show `?` until opened, count too.
   The answer is kept on disk for `warm_s`. If the request fails the old per-tab path takes over.

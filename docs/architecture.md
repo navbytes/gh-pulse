@@ -19,6 +19,7 @@ gh-tui is a single binary: a synchronous ratatui event loop that talks to GitHub
 | `src/cache.rs` | `0600` JSON cache store in `$XDG_CACHE_HOME/gh-tui` (entries with a stored time, byte-and-count pruning) and the directory `gh --cache` uses |
 | `src/dcache.rs` | PR/issue lists and details on top of that store: the freshness rules per kind of data (`updatedAt` stamps, TTL tiers from `[cache]`), per-account keys, cleaning on read |
 | `src/help.rs` | The rows of the `?` keybindings menu (section, key, description) and its filter |
+| `src/custom.rs` | `[[actions]]`: the entry model and its validation, placeholder expansion into `argv` / `$GHTUI_*` (never into a shell line), the foreground runner (the caller hands the terminal over) and the detached spawn |
 | `src/editor.rs` | Finding `$VISUAL` / `$EDITOR`, creating the config from the template on first use, running the editor |
 | `src/global.rs` | The global home: scopes, the exact `gh search` arguments per section / tab / favorites chunk, merge-and-sort, hidden-repo filtering with top-up, the organizations list, Repos-panel rows |
 | `src/start.rs` | The start decision (`auto` / `repo` / `global` x `-R` x clone), pure and table-tested |

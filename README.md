@@ -113,6 +113,10 @@ Regenerate with `GH_TUI_SHOT_BLOCKLIST=word,word python3 scripts/screenshots.py`
 - **Custom sections**: add your own GitHub searches as panels with `[[sections]]` in the config (gh-dash style), for the
   global home, the repo home or both, e.g. `filter = "is:open review-requested:@me org:acme"`. They load when focused,
   cost one search per refresh, and the scope picker applies unless the filter names its own `repo:` / `org:` / `user:`.
+- **Custom actions**: `[[actions]]` in the config run your own commands on the selected row, from the `x` menu or a key:
+  `claude "Review {url}"` in the terminal (gh-tui steps aside, then re-reads the row), or `tmux new-window` /
+  `roost spawn` in the background while you keep triaging. Row data fills whole arguments or `$GHTUI_*` variables,
+  never a shell line ([configuration](docs/configuration.md#custom-actions)).
 - **Mouse and keyboard**: click panels, rows and tabs; wheel scrolls. `?` shows every key.
 - **Themes**: dark and light palettes, truecolor with a 256-color fallback, ASCII and Nerd Font icon sets.
 - **Create from the terminal**: new issue (labels validated, `.md` templates and YAML issue forms, body in a multi-line field), new PR
@@ -287,7 +291,7 @@ The full reference is in [docs/keybindings.md](docs/keybindings.md). The essenti
 |---|---|---|
 | Global | `?` / `q` | Help / quit |
 | Global | `1`-`7`, `Tab`, `Shift-Tab` | Focus panel (as many as are shown) |
-| Global | `x` | Action menu for the selected item |
+| Global | `x` | Action menu for the selected item (and your `[[actions]]`) |
 | Global | `o` `y` `c` | Open in browser / copy URL / check out PR |
 | Global | `r` `R` `L` | Refresh selected item / reload everything / command log |
 | Global | `E` | Edit the config in your editor (applied when it exits) |
