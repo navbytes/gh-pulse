@@ -359,6 +359,9 @@ Details and every `[api]` key: [docs/configuration.md](docs/configuration.md#api
 - **"Terminal too small".** The minimum is 50x12. On short terminals unfocused panels collapse to one line.
 - **Colors look washed out or odd.** Your terminal probably lacks truecolor: set `COLORTERM=truecolor` if it
   supports it, or try `--theme light` on light backgrounds.
+- **No colors at all (no green accent, no highlighted tab).** `NO_COLOR` is set in your environment: gh-tui follows
+  that convention and drops every color, keeping only bold and underline. Check `echo $NO_COLOR`, then `unset NO_COLOR`
+  (or remove it from your shell profile) to get them back.
 - **Boxes and icons are garbled.** Use `--ascii`, or install a Nerd Font and use `--nerd`.
 - **A huge PR shows its diff anyway.** Over 300 files `gh pr diff` refuses; gh-tui falls back to the files API.
 
