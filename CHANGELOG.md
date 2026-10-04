@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0]
+
 ### Added
 - Custom actions: `[[actions]]` in `config.toml` define commands that run on the selected row, from the `x` menu or
   their own key (`name`, `on`, `run` or `shell`, `mode`, `key`, `pause`, `confirm`). `foreground` hands the terminal to
@@ -19,16 +21,6 @@ All notable changes to this project are documented here. The format follows
   hint for a dropdown) and fills in its default title, labels and assignees. The file comes from the repo, so its
   size, aliases, item counts and text are bounded and neutralized.
 - The `?` menu lists `g` and `W` (they were missing), and the README has screenshots of the grouped list and the menu.
-
-### Fixed
-- The on-disk cache now works with a token from the environment (`GH_TOKEN`, `GITHUB_TOKEN`; Codespaces and CI use
-  these). It is keyed by who you are, which came only from `gh`'s `hosts.yml`: with an environment token that was
-  missing, and, worse, could name a different account than the token in use. gh-tui now asks GitHub once at startup
-  (`gh api user`, one REST call) in that case, holds the first load until it answers, and caches under that login.
-
-## [0.5.0]
-
-### Added
 - Edit the config in your own editor: `E` (action `edit_config`) opens it in `$VISUAL` / `$EDITOR` and applies it when
   the editor exits; `gh-tui --edit-config` does the same without the UI and checks the result. The first time, the file
   is created from a commented template that lists every setting with its default and a note (`gh-tui --print-config`
@@ -39,6 +31,12 @@ All notable changes to this project are documented here. The format follows
 ### Changed
 - Pressing `f` or `H` on a repo now edits only the `[repos]` lists in `config.toml`, in place, instead of rewriting the
   whole file: your comments, ordering and every other setting are left exactly as written.
+
+### Fixed
+- The on-disk cache now works with a token from the environment (`GH_TOKEN`, `GITHUB_TOKEN`; Codespaces and CI use
+  these). It is keyed by who you are, which came only from `gh`'s `hosts.yml`: with an environment token that was
+  missing, and, worse, could name a different account than the token in use. gh-tui now asks GitHub once at startup
+  (`gh api user`, one REST call) in that case, holds the first load until it answers, and caches under that login.
 
 ## [0.4.0]
 
