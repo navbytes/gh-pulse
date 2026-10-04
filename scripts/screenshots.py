@@ -35,7 +35,8 @@ pyte.Screen.display = property(_disp)
 class T:
     def __init__(s, args, env, cwd=None, clean=False):
         s.scr = pyte.Screen(COLS, ROWS); s.st = pyte.ByteStream(s.scr)
-        e = dict(env, TERM='xterm-256color', COLORTERM='truecolor') if clean else dict(os.environ, TERM='xterm-256color', COLORTERM='truecolor', **env)
+        env = {k: v for k, v in env.items() if k != 'NO_COLOR'}
+        e = dict(env, TERM='xterm-256color', COLORTERM='truecolor') if clean else {k: v for k, v in os.environ.items() if k != 'NO_COLOR'} | dict(env, TERM='xterm-256color', COLORTERM='truecolor')
         s.pid, s.fd = pty.fork()
         if s.pid == 0:
             if cwd: os.chdir(cwd)
