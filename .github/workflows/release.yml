@@ -3,8 +3,14 @@ name: Release
 on:
   push:
     tags: ['v*']
-  # manual runs build and upload artifacts only, never publish
+  # Run workflow on the Actions tab: with a version it validates, builds, creates the tag and publishes
+  # (after the `release` environment's approval); without one it only builds and uploads artifacts.
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, e.g. 0.5.0 (must equal Cargo.toml on main). Empty: build only, publish nothing.'
+        required: false
+        type: string
 
 permissions: {}
 
@@ -19,8 +25,55 @@ env:
   TAG_RE: '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'
 
 jobs:
+  # Everything that decides whether this run may publish, in one place and before any build.
+  meta:
+    name: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      publish: ${{ steps.v.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Validate the release
+        id: v
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          fail() { echo "::error::$*" >&2; exit 1; }
+          if [ "$EVENT" = push ]; then
+            tag="$REF_NAME"
+          elif [ -n "$INPUT_VERSION" ]; then
+            tag="v${INPUT_VERSION#v}"
+            [ "$REF" = refs/heads/main ] || fail "run the release from main, not $REF"
+          else
+            echo "no version given: building artifacts only, nothing is published"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [[ "$tag" =~ $TAG_RE ]] || fail "bad version: $tag"
+          ver=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || fail "$tag is not on main"
+          [ "v$ver" = "$tag" ] || fail "$tag does not match the Cargo.toml version $ver"
+          if [ "$EVENT" != push ] && gh api "repos/$GH_REPO/git/ref/tags/$tag" > /dev/null 2>&1; then
+            fail "tag $tag already exists"
+          fi
+          echo "releasing $tag at $GITHUB_SHA"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
   build:
     name: build ${{ matrix.asset }}
+    needs: meta
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -40,15 +93,6 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: Validate tag and Cargo.toml version
-        if: github.event_name == 'push'
-        env:
-          TAG: ${{ github.ref_name }}
-        run: |
-          [[ "$TAG" =~ $TAG_RE ]] || { echo "bad tag: $TAG" >&2; exit 1; }
-          ver=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "$TAG is not on main" >&2; exit 1; }
-          [ "v$ver" = "$TAG" ] || { echo "tag $TAG does not match Cargo.toml version $ver" >&2; exit 1; }
       - name: Install toolchain
         env:
           TARGET: ${{ matrix.target }}
@@ -95,10 +139,22 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # The binaries are built and checksummed; publishing waits for a person to approve the `release`
+  # environment (Settings > Environments > release > Required reviewers).
+  approve:
+    name: approve release
+    needs: [meta, package]
+    if: needs.meta.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions: {}
+    steps:
+      - run: echo "approved ${{ needs.meta.outputs.tag }}"
+
   attest:
     name: provenance
-    needs: package
-    if: github.event_name == 'push'
+    needs: [meta, approve]
+    if: needs.meta.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -115,8 +171,8 @@ jobs:
 
   release:
     name: publish release
-    needs: [package, attest]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [meta, attest]
+    if: needs.meta.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -125,11 +181,22 @@ jobs:
         with:
           name: release-assets
           path: dist
+      # a tag pushed by hand already exists; one started from the Actions tab is made here, at the
+      # validated commit. (A tag created with GITHUB_TOKEN does not start another run of this workflow.)
+      - name: Create tag
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          [[ "$TAG" =~ $TAG_RE ]] || { echo "bad tag: $TAG" >&2; exit 1; }
+          gh api "repos/$GH_REPO/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$GITHUB_SHA" > /dev/null
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.meta.outputs.tag }}
         run: |
           [[ "$TAG" =~ $TAG_RE ]] || { echo "bad tag: $TAG" >&2; exit 1; }
           flags=()

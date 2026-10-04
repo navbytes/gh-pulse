@@ -372,7 +372,7 @@ See [docs/BACKLOG.md](docs/BACKLOG.md) for known limitations, and [CHANGELOG.md]
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/architecture.md](docs/architecture.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/architecture.md](docs/architecture.md); releases are cut from the Actions tab or a tag, see [docs/releasing.md](docs/releasing.md).
 
 ## License
 
