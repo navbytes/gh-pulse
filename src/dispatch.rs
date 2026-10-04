@@ -21,12 +21,12 @@ pub struct InputDef {
 }
 
 /// Largest workflow file we will parse.
-const MAX_YAML: usize = 256 * 1024;
+pub(crate) const MAX_YAML: usize = 256 * 1024;
 /// A "billion laughs" file needs many aliases; real workflows have a handful at most.
-const MAX_ALIASES: usize = 20;
+pub(crate) const MAX_ALIASES: usize = 20;
 
 /// Counts `*name` alias tokens (not cron's `* * *` or `*/5`).
-fn alias_count(yaml: &str) -> usize {
+pub(crate) fn alias_count(yaml: &str) -> usize {
     let b = yaml.as_bytes();
     (0..b.len())
         .filter(|&i| {
@@ -42,7 +42,7 @@ fn alias_count(yaml: &str) -> usize {
         .count()
 }
 
-fn scalar(v: &Value) -> String {
+pub(crate) fn scalar(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),

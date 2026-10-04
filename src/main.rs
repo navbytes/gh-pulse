@@ -11,6 +11,7 @@ mod form;
 mod gh;
 mod global;
 mod help;
+mod issueform;
 mod md;
 mod paths;
 mod pool;

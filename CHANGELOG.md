@@ -9,6 +9,10 @@ All notable changes to this project are documented here. The format follows
 - Tab counts in the repo home come from one GraphQL request instead of one list fetch per tab: exact totals (`412`,
   not `100+`), and the Mine / Review requested / Assigned / Mine tabs, which used to show `?` until opened, count too.
   The answer is kept on disk for `warm_s`. If the request fails the old per-tab path takes over.
+- YAML issue forms (`.github/ISSUE_TEMPLATE/*.yml`) are offered in the new-issue Template picker, next to the `.md`
+  templates: a form becomes the `### Label` sections GitHub would write (a task list for checkboxes, the options as a
+  hint for a dropdown) and fills in its default title, labels and assignees. The file comes from the repo, so its
+  size, aliases, item counts and text are bounded and neutralized.
 - The `?` menu lists `g` and `W` (they were missing), and the README has screenshots of the grouped list and the menu.
 
 ### Fixed

@@ -2616,7 +2616,7 @@ pub fn run_with(cmd: &[String], stdin: Option<&str>) -> Result<String, String> {
 #[derive(Default)]
 pub struct FormData {
     pub labels: Vec<String>,
-    pub templates: Vec<(String, String)>,
+    pub templates: Vec<crate::issueform::Template>,
     pub default_branch: String,
     pub branches: Vec<String>,
     pub tags: Vec<String>,
@@ -2647,7 +2647,8 @@ pub fn split_front_matter(t: &str) -> (Option<String>, String) {
     )
 }
 
-/// (display name, path) of the Markdown files in a contents-API directory listing.
+/// (display name, path) of the templates in a contents-API directory listing: Markdown files and
+/// YAML issue forms (not the `config.yml` that configures the chooser).
 pub fn parse_template_list(json_text: &str) -> Vec<(String, String)> {
     let v: Value = serde_json::from_str(json_text).unwrap_or_default();
     v.as_array()
@@ -2656,10 +2657,28 @@ pub fn parse_template_list(json_text: &str) -> Vec<(String, String)> {
         .filter(|f| f["type"] == "file")
         .filter_map(|f| {
             let (name, path) = (f["name"].as_str()?, f["path"].as_str()?);
-            let stem = name.strip_suffix(".md")?; // YAML issue forms can't prefill a body
+            let stem = name.strip_suffix(".md").or_else(|| {
+                crate::issueform::is_form_file(name)
+                    .then(|| name.rsplit_once('.').map(|(s, _)| s))
+                    .flatten()
+            })?;
             Some((stem.replace(['_', '-'], " "), path.to_string()))
         })
         .collect()
+}
+
+/// A template from the text of its file: a Markdown file prefills the body, an issue form becomes the
+/// same sections GitHub would write. None for a form that is not usable (it is just not offered).
+pub fn template_from(name: &str, path: &str, text: &str) -> Option<crate::issueform::Template> {
+    if crate::issueform::is_form_file(path.rsplit('/').next().unwrap_or(path)) {
+        return crate::issueform::parse(text, name).ok();
+    }
+    let (fm_name, body) = split_front_matter(text);
+    Some(crate::issueform::Template {
+        name: fm_name.unwrap_or_else(|| name.to_string()),
+        body,
+        ..Default::default()
+    })
 }
 
 /// A file from the default branch via the contents API. Path segments are percent-encoded and `..` is refused.
@@ -2758,9 +2777,10 @@ pub fn form_data(repo: &str, head: Option<&str>, workflow_path: Option<&str>) ->
                 false,
             ) {
                 for (name, path) in parse_template_list(&list).into_iter().take(10) {
-                    if let Some(text) = raw_file(repo, &path) {
-                        let (fm_name, body) = split_front_matter(&text);
-                        d.templates.push((fm_name.unwrap_or(name), body));
+                    if let Some(text) = raw_file(repo, &path)
+                        && let Some(t) = template_from(&name, &path, &text)
+                    {
+                        d.templates.push(t);
                     }
                 }
             }
@@ -3629,11 +3649,34 @@ mod tests {
                        {"name":"sub","path":".github/ISSUE_TEMPLATE/sub","type":"dir"}]"#;
         assert_eq!(
             parse_template_list(list),
-            [(
-                "bug report".to_string(),
-                ".github/ISSUE_TEMPLATE/bug_report.md".to_string()
-            )],
-            "only Markdown templates can prefill a body"
+            [
+                (
+                    "bug report".to_string(),
+                    ".github/ISSUE_TEMPLATE/bug_report.md".to_string()
+                ),
+                (
+                    "form".to_string(),
+                    ".github/ISSUE_TEMPLATE/form.yml".to_string()
+                ),
+            ],
+            "Markdown templates and issue forms, but not the chooser's config.yml or a directory"
+        );
+        // a Markdown file prefills the body; a form becomes the sections GitHub would write
+        let md = template_from("bug report", ".github/ISSUE_TEMPLATE/bug_report.md", t).unwrap();
+        assert_eq!(
+            (md.name.as_str(), md.body.as_str()),
+            ("Bug report", "### Steps\n1. do\n")
+        );
+        let yml = "name: Crash\ntitle: \"[Crash]: \"\nbody:\n  - type: input\n    attributes:\n      label: Where\n";
+        let f = template_from("form", ".github/ISSUE_TEMPLATE/form.yml", yml).unwrap();
+        assert_eq!(
+            (f.name.as_str(), f.title.as_deref()),
+            ("Crash", Some("[Crash]: "))
+        );
+        assert!(f.body.starts_with("### Where"));
+        assert!(
+            template_from("x", ".github/ISSUE_TEMPLATE/x.yml", "body: nope\n").is_none(),
+            "an unusable form is not offered"
         );
         assert!(parse_template_list("not json").is_empty());
     }

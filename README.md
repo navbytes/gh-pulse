@@ -115,7 +115,7 @@ Regenerate with `GH_TUI_SHOT_BLOCKLIST=word,word python3 scripts/screenshots.py`
   cost one search per refresh, and the scope picker applies unless the filter names its own `repo:` / `org:` / `user:`.
 - **Mouse and keyboard**: click panels, rows and tabs; wheel scrolls. `?` shows every key.
 - **Themes**: dark and light palettes, truecolor with a 256-color fallback, ASCII and Nerd Font icon sets.
-- **Create from the terminal**: new issue (labels validated, `.md` templates, body in a multi-line field), new PR
+- **Create from the terminal**: new issue (labels validated, `.md` templates and YAML issue forms, body in a multi-line field), new PR
   (base picker, draft, reviewers, `--fill`, PR template, warns if the branch isn't pushed), and run a workflow with
   a form generated from its `workflow_dispatch` inputs (read from the default branch; branches and tags offered as the ref). Each ends in the exact-command confirm popup.
 - **Viewed files**: remembered locally per PR head; optionally mirrored to GitHub (`sync_viewed`).
