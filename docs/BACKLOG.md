@@ -12,9 +12,11 @@
 - Inbox: `Enter` looks for a PR/issue in the *open* lists; a merged/closed one is opened on GitHub in the browser instead (no in-app view of closed items). Only unread notifications are listed (the API default); 100 at most.
 - Tag detail makes two API calls per selected tag (commit, release); the Tags tab lists 300 at most (`300+`).
 - README's "Diff view" block and screenshots still show the old 8-panel layout until they are regenerated.
-- Tab counts are fetched in full (one list call per hidden tab); a cheaper count endpoint per source could replace that.
+- Tab counts are fetched in full (one list call per hidden tab) unless a fresh copy of that list is in the disk cache, which they now share; a cheaper count endpoint per source could still replace that.
 - The cache identity comes from gh's `hosts.yml` (`user:`); with a token from the environment and no `gh auth login`, the repo list and header facts are simply not cached.
 - API throttling: in-flight `gh` processes for work the user moved past are left to finish (not killed). Counts for search-backed tabs have no cheap source (they show `?` until opened).
+- Cached PR details are exact only as far as `updatedAt` tracks them: a new reaction on a comment, or a re-run of a CI job, does not bump it, so those can be as stale as `detail_s` / `overview_s` (a day / 5 min) until `r`. Branches, releases, workflows and runs lists, notifications and logs are not cached.
+- `E` hands the terminal to the editor: one that returns at once (`code`, `subl`) needs its wait flag (`EDITOR="code --wait"`). Panels, `[[sections]]`, `[ui] start` and `[api] max_concurrent` changes need a restart.
 - `r` / `R` fetch fresh data but cannot overwrite `gh --cache`'s stored copy: it expires on its own TTL (a plain request would otherwise repeat the old answer within that window).
 - Startup fetches only the PR and Issues lists in the batch; the Actions and Repo panels (REST) load on first focus and show a placeholder until then.
 - Reaction names make one extra call per commented card the first time `e` is pressed.
