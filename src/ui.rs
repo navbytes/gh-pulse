@@ -4691,9 +4691,18 @@ diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@
 
     #[test]
     fn counts_that_are_not_fetched_by_themselves_show_a_question_mark() {
-        let a = app(false, IconSet::Unicode);
+        let mut a = app(false, IconSet::Unicode);
         let s = render_app(&a, 120, 40);
         let prs = line_of(&s, "[1]");
+        assert!(
+            prs.contains("Rev \u{2026}")
+                && prs.contains("All \u{2026}")
+                && prs.contains("Mrg \u{2026}"),
+            "every PR tab is on its way with the one-request batch: {prs}"
+        );
+        // when that request failed the search-backed tabs wait to be opened, the plain lists still come
+        a.fail_counts_batch_for_test();
+        let prs = line_of(&render_app(&a, 120, 40), "[1]");
         assert!(
             prs.contains("Rev ?"),
             "search-backed tabs wait to be opened: {prs}"

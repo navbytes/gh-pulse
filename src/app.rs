@@ -292,6 +292,15 @@ fn source_of(kind: PK, id: usize) -> Option<(usize, usize)> {
 /// `source()` ids that make a panel's tab count meaningful.
 type CountKey = (PK, usize);
 
+/// The repo home's tab counts come from one request; the per-tab path below is its fallback.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CountsBatch {
+    Todo,
+    Pending,
+    Done,
+    Failed,
+}
+
 /// The unread-notifications view (`N`).
 pub struct Inbox {
     pub items: Vec<Item>,
@@ -589,10 +598,14 @@ enum Msg {
     Meta(String, gh::RepoMeta),
     /// (list generation, panel, tab id, (rows, more)) for the other tabs' counts.
     Count(u64, CountKey, Result<(usize, bool), String>),
+    /// All the repo home's tab counts from one request (list generation, answer or error).
+    Counts(u64, Result<gh::RepoCounts, String>),
     /// Unread notifications, for the badge (and the inbox when open).
     Inbox(u64, Result<Vec<Item>, String>),
     /// The viewer's login (from the startup request).
     User(u64, String),
+    /// `gh api user` answered (host, login; empty when it failed): the first load was waiting for it.
+    Identity(String, String),
     /// A queued detail fetch that was dropped before it started: forget its placeholder.
     Dropped(String, Tab, u64),
     /// The batched startup request failed (not a rate limit): load the panels one by one instead.
@@ -644,6 +657,7 @@ pub struct App {
     cpending: HashSet<CountKey>,
     /// Count lookups that failed (timeout, error): not retried until the next reload.
     pub count_failed: HashSet<CountKey>,
+    counts_batch: CountsBatch,
     /// Bumped when the lists are reloaded, so late counts for the old ones are dropped.
     cgen: u64,
     pub inbox: Option<Inbox>,
@@ -665,6 +679,8 @@ pub struct App {
     pub group: GroupBy,
     /// `E` was pressed: the main loop hands the terminal to the editor, then calls `apply_config`.
     edit_config: bool,
+    /// The first load waits until the login is known, so that it can use the on-disk cache.
+    identity_wait: bool,
     pub help_typing: bool,
     pub help_top: Cell<usize>,
     /// Set by the renderer: how far the help popup can scroll.
@@ -982,6 +998,7 @@ impl App {
             counts: HashMap::new(),
             cpending: HashSet::new(),
             count_failed: HashSet::new(),
+            counts_batch: CountsBatch::Todo,
             cgen: 0,
             cgen_a: Arc::new(AtomicU64::new(0)),
             dgen_a: Arc::new(AtomicU64::new(0)),
@@ -1010,6 +1027,7 @@ impl App {
             window,
             group: GroupBy::None,
             edit_config: false,
+            identity_wait: false,
             help_typing: false,
             help_top: Cell::new(0),
             help_max: Cell::new(0),
@@ -1087,7 +1105,24 @@ impl App {
                     Err(e) => app.status = format!("state not saved: {e}"),
                 }
             }
-            if app.global {
+            if gh::identity().is_none() {
+                // `gh` has no login on record for this account (a token from the environment, say), and
+                // the on-disk cache is keyed by who you are: ask once, then load with the cache
+                app.identity_wait = true;
+                app.status = "checking who you are...".into();
+                let tx = app.tx.clone();
+                app.user_job_or(
+                    {
+                        let tx = tx.clone();
+                        move || {
+                            let _ = tx.send(Msg::Identity(gh::host(), gh::user()));
+                        }
+                    },
+                    move || {
+                        let _ = tx.send(Msg::Identity(gh::host(), String::new()));
+                    },
+                );
+            } else if app.global {
                 app.load_global_side();
             } else {
                 app.load_repo_side();
@@ -1459,6 +1494,7 @@ impl App {
         self.counts.clear();
         self.cpending.clear();
         self.count_failed.clear();
+        self.counts_batch = CountsBatch::Todo;
         self.cgen += 1;
         self.cgen_a.store(self.cgen, Relaxed);
         if !self.global {
@@ -1595,6 +1631,14 @@ impl App {
         (n, n >= cap)
     }
 
+    /// Record a tab's count. A list shows at most a page, so its `100+` never replaces an exact total.
+    fn set_count(counts: &mut HashMap<CountKey, (usize, bool)>, key: CountKey, new: (usize, bool)) {
+        if new.1 && counts.get(&key).is_some_and(|old| !old.1 && old.0 >= new.0) {
+            return;
+        }
+        counts.insert(key, new);
+    }
+
     /// Show the copy of a list kept on disk, if any. Returns true when it is still fresh and
     /// nothing needs fetching; a stale copy stays on screen, marked, while the refresh runs.
     fn show_cached_list(&mut self, i: usize, key: Option<&str>) -> bool {
@@ -1610,7 +1654,7 @@ impl App {
         (p.hidden, p.not_shown, p.error, p.unloaded) = (c.hidden, c.not_shown, None, false);
         p.cached_at = (!fresh).then(|| rate::now().saturating_sub(c.age));
         p.loading = !fresh;
-        self.counts.insert((kind, tab_id), count);
+        Self::set_count(&mut self.counts, (kind, tab_id), count);
         fresh
     }
 
@@ -1648,6 +1692,12 @@ impl App {
         }
         self.reset_view();
         self.rebuild_header();
+    }
+
+    /// Test helper: as if the one-request counts had failed (the per-tab path then takes over).
+    #[cfg(test)]
+    pub fn fail_counts_batch_for_test(&mut self) {
+        self.counts_batch = CountsBatch::Failed;
     }
 
     /// True once after `E` was pressed.
@@ -1861,6 +1911,39 @@ impl App {
         {
             return;
         }
+        // every PR, issue and repo tab count in one request (a fresh copy on disk needs none); the
+        // per-tab path below only covers what that cannot (Actions) or when it failed
+        match self.counts_batch {
+            CountsBatch::Pending => return,
+            CountsBatch::Todo => {
+                self.counts_batch = CountsBatch::Pending;
+                let (tx, tx2, repo, g) = (
+                    self.tx.clone(),
+                    self.tx.clone(),
+                    self.repo.clone(),
+                    self.cgen,
+                );
+                let gen_a = self.cgen_a.clone();
+                let (ttl, floor) = (self.cfg.cache.warm_s, self.disk_floor);
+                self.queue(
+                    Prio::Background,
+                    move || gen_a.load(Relaxed) != g,
+                    move || {
+                        let now = rate::now();
+                        let res = match dcache::read_counts(&repo, now, floor) {
+                            Some((c, age)) if age <= ttl => Ok(c),
+                            _ => gh::counts(&repo).inspect(|c| dcache::write_counts(&repo, c, now)),
+                        };
+                        let _ = tx.send(Msg::Counts(g, res));
+                    },
+                    move || {
+                        let _ = tx2.send(Msg::Counts(g, Err("dropped".into())));
+                    },
+                );
+                return;
+            }
+            CountsBatch::Done | CountsBatch::Failed => {}
+        }
         let focus = self.focus;
         let todo = self.panels.iter().enumerate().find_map(|(i, p)| {
             if (lazy && i != focus) || p.tabs.len() < 2 {
@@ -2072,11 +2155,34 @@ impl App {
                         // a parked home keeps its own counts
                         if loc == Loc::Other {
                             if let Some(o) = self.other.as_mut() {
-                                o.counts.insert(key, r);
+                                Self::set_count(&mut o.counts, key, r);
                             }
                         } else {
                             self.cpending.remove(&key);
-                            self.counts.insert(key, r);
+                            Self::set_count(&mut self.counts, key, r);
+                        }
+                    }
+                }
+                Msg::Counts(g, res) => {
+                    if g == self.cgen {
+                        match res {
+                            Ok(rc) => {
+                                self.counts_batch = CountsBatch::Done;
+                                for (kind, ns) in [
+                                    (PK::Prs, &rc.prs[..]),
+                                    (PK::Issues, &rc.issues[..]),
+                                    (PK::Repo, &rc.repo[..]),
+                                ] {
+                                    for (id, n) in ns.iter().enumerate() {
+                                        if let Some(n) = n {
+                                            self.counts.insert((kind, id), (*n, false));
+                                            self.count_failed.remove(&(kind, id));
+                                        }
+                                    }
+                                }
+                            }
+                            // the per-tab path takes over
+                            Err(_) => self.counts_batch = CountsBatch::Failed,
                         }
                     }
                 }
@@ -2317,6 +2423,17 @@ impl App {
                         self.status = format!("could not list your organizations: {e}");
                     }
                 },
+                Msg::Identity(host, login) => {
+                    gh::resolve_identity(&host, &login);
+                    if std::mem::take(&mut self.identity_wait) {
+                        self.status.clear();
+                        if self.global {
+                            self.load_global_side();
+                        } else {
+                            self.load_repo_side();
+                        }
+                    }
+                }
                 Msg::User(g, u) => {
                     if g == self.hgen && !u.is_empty() {
                         self.user = u;
@@ -2816,9 +2933,12 @@ impl App {
         let Some(t) = p.tabs.get(ti) else {
             return false;
         };
+        // the PR, issue and repo tabs, searches included, are answered by the one-request batch
+        let batched = matches!(self.counts_batch, CountsBatch::Todo | CountsBatch::Pending)
+            && matches!(p.kind, PK::Prs | PK::Issues | PK::Repo);
         self.cfg.api.counts != config::Counts::Off
             && !self.global
-            && !Panel::search_backed(p.kind, t.id)
+            && (batched || !Panel::search_backed(p.kind, t.id))
     }
 
     /// Open PRs of the repo, when the PR list's "All" tab has been counted.
@@ -3795,6 +3915,7 @@ impl App {
         self.cgen += 1;
         self.cgen_a.store(self.cgen, Relaxed);
         (self.cpending, self.count_failed) = (HashSet::new(), HashSet::new());
+        self.counts_batch = CountsBatch::Todo;
         self.detail_focus = false;
         self.reset_view();
         self.rebuild_header();
@@ -4925,6 +5046,15 @@ mod tests {
         panic!("timed out waiting for {what}");
     }
 
+    /// The one-request count batch runs first (the fake `gh` answers it with a list, so it fails and the
+    /// per-tab path takes over): tick until it is out of the way.
+    fn counts_batch_settled(a: &mut App) {
+        a.ensure();
+        wait(a, "the counts batch", |a| {
+            a.counts_batch != CountsBatch::Pending
+        });
+    }
+
     /// Waits for queued and running jobs to finish, so a "nothing was fetched" check sees every call.
     fn quiesce() {
         for _ in 0..30000 {
@@ -5039,6 +5169,7 @@ mod tests {
         shim.set("issuelist.out", "[]");
         let mut a = live("");
         // PRs focused: Mine and Review are search-backed (`?`), All and Merged are plain lists
+        counts_batch_settled(&mut a);
         a.ensure();
         wait(&mut a, "first count", |a| !a.counts.is_empty());
         for _ in 0..3 {
@@ -5073,6 +5204,113 @@ mod tests {
         let mut off = live("[api]\ncounts = \"off\"\n");
         off.ensure();
         assert!(off.cpending.is_empty() && !off.count_wanted(0, 2));
+    }
+
+    const COUNTS_JSON: &str = r#"{"data":{"repository":{"prAll":{"totalCount":74},"prMerged":{"totalCount":312},"isAll":{"totalCount":9},"branches":{"totalCount":32},"tags":{"totalCount":14},"releases":{"totalCount":81}},"prMine":{"issueCount":2},"prReview":{"issueCount":0},"isAssigned":{"issueCount":3},"isMine":{"issueCount":5}}}"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn every_pr_issue_and_repo_tab_count_comes_from_one_request_kept_for_the_next_run() {
+        let shim = crate::testshim::Shim::new();
+        shim.set("graphql.out", COUNTS_JSON);
+        let batches =
+            |s: &crate::testshim::Shim| s.calls().iter().filter(|c| c.contains("prMine")).count();
+        let mut a = live("");
+        assert!(
+            a.count_wanted(0, 1),
+            "a search-backed tab shows `…` while the batch is on its way"
+        );
+        a.ensure();
+        wait(&mut a, "the batch", |a| a.counts_batch == CountsBatch::Done);
+        for (key, want) in [
+            ((PK::Prs, 0), 2),
+            ((PK::Prs, 1), 0),
+            ((PK::Prs, 2), 74),
+            ((PK::Prs, 3), 312),
+            ((PK::Issues, 0), 3),
+            ((PK::Issues, 1), 5),
+            ((PK::Issues, 2), 9),
+            ((PK::Repo, 0), 32),
+            ((PK::Repo, 1), 14),
+            ((PK::Repo, 2), 81),
+        ] {
+            assert_eq!(a.counts.get(&key), Some(&(want, false)), "{key:?}");
+        }
+        // the search-backed tabs have counts now, too
+        assert_eq!(a.tab_count(0, 1), Some((0, false)));
+        assert_eq!(a.tab_count(0, 3), Some((312, false)));
+        assert!(
+            !a.count_wanted(0, 1),
+            "nothing left to wait for once the batch is done"
+        );
+        // no list was fetched to count anything in these panels
+        for _ in 0..3 {
+            a.ensure();
+            a.poll();
+        }
+        quiesce();
+        let c = shim.calls();
+        assert!(
+            c.iter()
+                .all(|c| !c.contains("pr list") && !c.contains("issue list")),
+            "{c:?}"
+        );
+        assert_eq!(batches(&shim), 1);
+        // a new run within the cache time asks for nothing
+        let mut b = live("");
+        b.ensure();
+        wait(&mut b, "the batch from disk", |b| {
+            b.counts_batch == CountsBatch::Done
+        });
+        assert_eq!(
+            (batches(&shim), b.counts.get(&(PK::Prs, 2)).copied()),
+            (1, Some((74, false)))
+        );
+        // R skips the copy on disk
+        b.reload_all();
+        for _ in 0..500 {
+            // a reload puts the panels into loading first; the counts follow once they are idle
+            b.ensure();
+            b.poll();
+            if b.counts_batch == CountsBatch::Done && batches(&shim) == 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(batches(&shim), 2, "{:?}", shim.calls());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_batch_leaves_the_per_tab_counts_to_do_the_job() {
+        let shim = crate::testshim::Shim::new();
+        shim.set("graphql.err", "boom");
+        shim.set("prlist.out", "[]");
+        shim.set("issuelist.out", "[]");
+        let mut a = live("");
+        counts_batch_settled(&mut a);
+        assert_eq!(a.counts_batch, CountsBatch::Failed);
+        a.ensure();
+        wait(&mut a, "a per-tab count", |a| {
+            a.counts.contains_key(&(PK::Prs, 2))
+        });
+        assert!(
+            !a.counts.contains_key(&(PK::Prs, 0)),
+            "search-backed tabs still wait to be opened on this path"
+        );
+    }
+
+    #[test]
+    fn a_page_of_rows_never_replaces_an_exact_total() {
+        let mut m: HashMap<CountKey, (usize, bool)> = HashMap::new();
+        let k = (PK::Prs, 2);
+        m.insert(k, (412, false));
+        App::set_count(&mut m, k, (100, true)); // the open tab shows one page: "100+"
+        assert_eq!(m[&k], (412, false), "the exact total stays");
+        App::set_count(&mut m, k, (7, false)); // a list that is complete is the truth
+        assert_eq!(m[&k], (7, false));
+        App::set_count(&mut m, (PK::Prs, 3), (100, true));
+        assert_eq!(m[&(PK::Prs, 3)], (100, true), "nothing exact to keep");
     }
 
     #[cfg(unix)]
@@ -5992,6 +6230,7 @@ mod tests {
         );
         // a count lookup that fails stays unknown, shows the cross, and is asked for once
         shim.set("prlist.err", "boom");
+        counts_batch_settled(&mut a);
         a.ensure();
         wait(&mut a, "the failed count", |a| {
             a.count_failed.contains(&(PK::Prs, 2))
@@ -7230,6 +7469,65 @@ mod tests {
             press(&mut a, 'W');
         }
         assert_eq!(a.window, config::Window::Week, "all, 24h, 7d");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn without_a_stored_login_startup_asks_who_you_are_once_and_then_uses_the_cache() {
+        let shim = crate::testshim::Shim::new();
+        shim.set("graphql.out", include_str!("../tests/startup.json"));
+        let calls_of = |what: &str| shim.calls().iter().filter(|c| c.contains(what)).count();
+        let start = || {
+            // gh has no login on record (a token from the environment): nothing is known yet
+            gh::set_identity(None);
+            let mut a = App::build_start(
+                Some("o/r".into()),
+                false,
+                Theme::new(false, IconSet::Unicode, true),
+                true,
+                Config::default(),
+            );
+            assert!(
+                a.identity_wait && gh::identity().is_none(),
+                "the first load waits"
+            );
+            assert!(a.status.contains("who you are"), "{}", a.status);
+            wait(&mut a, "the first load", |a| {
+                !a.identity_wait && !a.panels[0].loading && a.meta.is_some()
+            });
+            a
+        };
+        let a = start();
+        assert_eq!(
+            gh::identity(),
+            Some(("github.com".into(), "octocat".into()))
+        );
+        assert_eq!((calls_of("api user"), calls_of("api graphql")), (1, 1));
+        assert_eq!(a.panels[0].items.len(), 2);
+        // the lists and the facts were stored under the resolved login: the next start asks for them
+        // from disk and makes no startup request at all, only the one question about the login
+        let b = start();
+        assert_eq!(b.panels[0].items.len(), 2, "shown from the cache");
+        assert_eq!((calls_of("api user"), calls_of("api graphql")), (2, 1));
+        // a failed question (an empty answer) still loads, without the cache: the app never waits on it
+        let before = calls_of("api graphql");
+        gh::set_identity(None);
+        let mut c = live("");
+        c.identity_wait = true;
+        c.tx.send(Msg::Identity("github.com".into(), String::new()))
+            .unwrap();
+        c.poll();
+        assert!(
+            !c.identity_wait && gh::identity().is_none(),
+            "nothing is made up"
+        );
+        wait(&mut c, "the load", |a| {
+            !a.panels[0].loading && a.meta.is_some()
+        });
+        assert_eq!(calls_of("api graphql"), before + 1, "it went to GitHub");
+        // and an implausible login is never adopted
+        gh::resolve_identity("github.com", "../../etc");
+        assert!(gh::identity().is_none());
     }
 
     #[test]

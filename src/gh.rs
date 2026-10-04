@@ -833,6 +833,82 @@ pub fn startup(repo: &str, want: &StartupWant) -> Result<Startup, String> {
     parse_startup(&graphql(a)?, repo, want)
 }
 
+/// Every tab count of the repo home in one request: open / merged PRs and open issues from the
+/// repository's own totals, "mine" and "review requested" from search (as the lists themselves do),
+/// and the Repo panel's branches, tags and releases. `first:1` keeps every connection well formed;
+/// no nodes are selected, so the cost stays at about one point.
+const COUNTS_Q: &str = "\
+query($o:String!,$n:String!,$pm:String!,$pr:String!,$im:String!,$iu:String!){\
+ rateLimit{cost remaining resetAt limit}\
+ repository(owner:$o,name:$n){\
+  prAll:pullRequests(states:OPEN,first:1){totalCount}\
+  prMerged:pullRequests(states:MERGED,first:1){totalCount}\
+  isAll:issues(states:OPEN,first:1){totalCount}\
+  branches:refs(refPrefix:\"refs/heads/\",first:1){totalCount}\
+  tags:refs(refPrefix:\"refs/tags/\",first:1){totalCount}\
+  releases(first:1){totalCount}\
+ }\
+ prMine:search(query:$pm,type:ISSUE,first:1){issueCount}\
+ prReview:search(query:$pr,type:ISSUE,first:1){issueCount}\
+ isAssigned:search(query:$im,type:ISSUE,first:1){issueCount}\
+ isMine:search(query:$iu,type:ISSUE,first:1){issueCount}\
+}";
+
+/// The tab counts of one repo, by tab id: PRs (mine, review requested, all open, merged), issues
+/// (assigned, mine, all open) and the Repo panel (branches, tags, releases). None = not answered.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoCounts {
+    pub prs: [Option<usize>; 4],
+    pub issues: [Option<usize>; 3],
+    pub repo: [Option<usize>; 3],
+}
+
+pub fn parse_counts(body: &str) -> Result<RepoCounts, String> {
+    let v: Value = json(body)?;
+    if let Some(e) = v["errors"][0]["message"].as_str() {
+        return Err(e.to_string());
+    }
+    let (d, r) = (&v["data"], &v["data"]["repository"]);
+    if !r.is_object() {
+        return Err("no counts in the answer".into());
+    }
+    let n = |x: &Value| {
+        x["totalCount"]
+            .as_u64()
+            .or_else(|| x["issueCount"].as_u64())
+            .map(|n| n as usize)
+    };
+    Ok(RepoCounts {
+        prs: [
+            n(&d["prMine"]),
+            n(&d["prReview"]),
+            n(&r["prAll"]),
+            n(&r["prMerged"]),
+        ],
+        issues: [n(&d["isAssigned"]), n(&d["isMine"]), n(&r["isAll"])],
+        repo: [n(&r["branches"]), n(&r["tags"]), n(&r["releases"])],
+    })
+}
+
+/// One GraphQL request for all the tab counts of `repo`.
+pub fn counts(repo: &str) -> Result<RepoCounts, String> {
+    let (o, n) = repo.split_once('/').ok_or("bad repo")?;
+    let q = |kind: &str, qual: &str| format!("repo:{repo} is:{kind} is:open {qual}");
+    let mut a: Vec<String> = ["api", "graphql", "-f"].map(String::from).to_vec();
+    a.push(format!("query={COUNTS_Q}"));
+    for (k, v) in [
+        ("o", o.to_string()),
+        ("n", n.to_string()),
+        ("pm", q("pr", "author:@me")),
+        ("pr", q("pr", "review-requested:@me")),
+        ("im", q("issue", "assignee:@me")),
+        ("iu", q("issue", "author:@me")),
+    ] {
+        a.extend(["-f".to_string(), format!("{k}={v}")]);
+    }
+    parse_counts(&graphql(a)?)
+}
+
 /// GraphQL nodes -> the `Item`s `gh pr list` / `gh issue list` would have produced.
 fn graphql_items(nodes: &Value, kind: Kind, repo: &str) -> Vec<Item> {
     nodes
@@ -953,8 +1029,16 @@ pub fn host() -> String {
         .unwrap_or_else(|| "github.com".into())
 }
 
+/// A login as GitHub spells them (plus `_` and `.` for odd hosts): safe to use in a file name.
+fn valid_login(u: &str) -> bool {
+    !u.is_empty()
+        && u.len() <= 100
+        && u.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+}
+
 /// The active login for `host` as gh's own `hosts.yml` records it: a local read, no API call, and
-/// never the token. None when it isn't recorded (a token from the environment, say).
+/// never the token. None when it isn't recorded.
 pub fn login_in(hosts_yml: &str, host: &str) -> Option<String> {
     let mut in_host = false;
     for l in hosts_yml.lines() {
@@ -962,13 +1046,33 @@ pub fn login_in(hosts_yml: &str, host: &str) -> Option<String> {
             in_host = l.trim_end().strip_suffix(':') == Some(host);
         } else if in_host && let Some(u) = l.trim().strip_prefix("user:") {
             let u = u.trim().trim_matches(['"', '\'']);
-            let ok = !u.is_empty()
-                && u.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
-            return ok.then(|| u.to_string());
+            return valid_login(u).then(|| u.to_string());
         }
     }
     None
+}
+
+/// Does the environment carry a token for `host`? Such a token overrides whatever `gh auth login`
+/// stored, so `hosts.yml` cannot say whose requests these are.
+pub fn env_token_in(host: &str, var: impl Fn(&str) -> Option<String>) -> bool {
+    let set = |n: &str| var(n).is_some_and(|v| !v.trim().is_empty());
+    if host == "github.com" || host.ends_with(".ghe.com") {
+        set("GH_TOKEN") || set("GITHUB_TOKEN")
+    } else {
+        set("GH_ENTERPRISE_TOKEN") || set("GITHUB_ENTERPRISE_TOKEN")
+    }
+}
+
+/// The identity `hosts.yml` gives, unless a token from the environment is in charge of the account.
+pub fn stored_identity(
+    hosts_yml: Option<&str>,
+    host: &str,
+    env_token: bool,
+) -> Option<(String, String)> {
+    if env_token {
+        return None;
+    }
+    Some((host.to_string(), login_in(hosts_yml?, host)?))
 }
 
 #[cfg(test)]
@@ -982,6 +1086,26 @@ pub fn clear_identity() {
 #[cfg(test)]
 pub fn set_identity(id: Option<(String, String)>) {
     *IDENTITY.lock().unwrap() = Some(id);
+}
+
+/// The login asked of GitHub once (`gh api user`) when `hosts.yml` could not say, with its host.
+static RESOLVED: Mutex<Option<(String, String)>> = Mutex::new(None);
+
+/// Remember who the token is, as GitHub answered. Anything that is not a plausible login is ignored.
+pub fn resolve_identity(host: &str, login: &str) {
+    if !valid_login(login) {
+        return;
+    }
+    let id = (host.to_string(), login.to_string());
+    // tests pin the identity through their override, which also wins over a resolved one
+    #[cfg(test)]
+    {
+        *IDENTITY.lock().unwrap() = Some(Some(id));
+    }
+    #[cfg(not(test))]
+    if let Ok(mut r) = RESOLVED.lock() {
+        *r = Some(id);
+    }
 }
 
 /// (host, login) that on-disk caches are keyed by; None means nothing user-specific is cached.
@@ -1002,12 +1126,14 @@ pub fn identity() -> Option<(String, String)> {
             })
             .or_else(|| {
                 std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".config/gh"))
-            })?;
+            });
         let host = host();
-        let login = login_in(&std::fs::read_to_string(dir.join("hosts.yml")).ok()?, &host)?;
-        Some((host, login))
+        let env_token = env_token_in(&host, |n| std::env::var(n).ok());
+        let yml = dir.and_then(|d| std::fs::read_to_string(d.join("hosts.yml")).ok());
+        stored_identity(yml.as_deref(), &host, env_token)
     })
     .clone()
+    .or_else(|| RESOLVED.lock().ok().and_then(|r| r.clone()))
 }
 
 /// Repo facts alone (the fallback when the batched request failed).
@@ -2490,7 +2616,7 @@ pub fn run_with(cmd: &[String], stdin: Option<&str>) -> Result<String, String> {
 #[derive(Default)]
 pub struct FormData {
     pub labels: Vec<String>,
-    pub templates: Vec<(String, String)>,
+    pub templates: Vec<crate::issueform::Template>,
     pub default_branch: String,
     pub branches: Vec<String>,
     pub tags: Vec<String>,
@@ -2521,7 +2647,8 @@ pub fn split_front_matter(t: &str) -> (Option<String>, String) {
     )
 }
 
-/// (display name, path) of the Markdown files in a contents-API directory listing.
+/// (display name, path) of the templates in a contents-API directory listing: Markdown files and
+/// YAML issue forms (not the `config.yml` that configures the chooser).
 pub fn parse_template_list(json_text: &str) -> Vec<(String, String)> {
     let v: Value = serde_json::from_str(json_text).unwrap_or_default();
     v.as_array()
@@ -2530,10 +2657,28 @@ pub fn parse_template_list(json_text: &str) -> Vec<(String, String)> {
         .filter(|f| f["type"] == "file")
         .filter_map(|f| {
             let (name, path) = (f["name"].as_str()?, f["path"].as_str()?);
-            let stem = name.strip_suffix(".md")?; // YAML issue forms can't prefill a body
+            let stem = name.strip_suffix(".md").or_else(|| {
+                crate::issueform::is_form_file(name)
+                    .then(|| name.rsplit_once('.').map(|(s, _)| s))
+                    .flatten()
+            })?;
             Some((stem.replace(['_', '-'], " "), path.to_string()))
         })
         .collect()
+}
+
+/// A template from the text of its file: a Markdown file prefills the body, an issue form becomes the
+/// same sections GitHub would write. None for a form that is not usable (it is just not offered).
+pub fn template_from(name: &str, path: &str, text: &str) -> Option<crate::issueform::Template> {
+    if crate::issueform::is_form_file(path.rsplit('/').next().unwrap_or(path)) {
+        return crate::issueform::parse(text, name).ok();
+    }
+    let (fm_name, body) = split_front_matter(text);
+    Some(crate::issueform::Template {
+        name: fm_name.unwrap_or_else(|| name.to_string()),
+        body,
+        ..Default::default()
+    })
 }
 
 /// A file from the default branch via the contents API. Path segments are percent-encoded and `..` is refused.
@@ -2632,9 +2777,10 @@ pub fn form_data(repo: &str, head: Option<&str>, workflow_path: Option<&str>) ->
                 false,
             ) {
                 for (name, path) in parse_template_list(&list).into_iter().take(10) {
-                    if let Some(text) = raw_file(repo, &path) {
-                        let (fm_name, body) = split_front_matter(&text);
-                        d.templates.push((fm_name.unwrap_or(name), body));
+                    if let Some(text) = raw_file(repo, &path)
+                        && let Some(t) = template_from(&name, &path, &text)
+                    {
+                        d.templates.push(t);
                     }
                 }
             }
@@ -2726,6 +2872,100 @@ pub fn checkout(repo: &str, n: u64) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn counts_parse_every_tab_and_reject_anything_that_is_not_an_answer() {
+        let body = r#"{"data":{"rateLimit":{"cost":1,"remaining":4999,"resetAt":"2030-01-01T00:00:00Z","limit":5000},
+          "repository":{"prAll":{"totalCount":74},"prMerged":{"totalCount":312},"isAll":{"totalCount":9},
+            "branches":{"totalCount":32},"tags":{"totalCount":14},"releases":{"totalCount":81}},
+          "prMine":{"issueCount":2},"prReview":{"issueCount":0},"isAssigned":{"issueCount":3},"isMine":{"issueCount":5}}}"#;
+        let c = parse_counts(body).unwrap();
+        assert_eq!(c.prs, [Some(2), Some(0), Some(74), Some(312)]);
+        assert_eq!(c.issues, [Some(3), Some(5), Some(9)]);
+        assert_eq!(c.repo, [Some(32), Some(14), Some(81)]);
+        // a part that did not come back stays None; the rest still counts
+        let part = r#"{"data":{"repository":{"prAll":{"totalCount":7}}}}"#;
+        let c = parse_counts(part).unwrap();
+        assert_eq!((c.prs[2], c.prs[0], c.repo[0]), (Some(7), None, None));
+        // an error, a plain list (what gh prints for an unknown query in tests), garbage: all errors
+        assert!(
+            parse_counts(r#"{"errors":[{"message":"Field 'x' doesn't exist"}]}"#)
+                .unwrap_err()
+                .contains("doesn't exist")
+        );
+        assert!(parse_counts("[]").is_err() && parse_counts("nope").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn counts_are_one_graphql_request_with_the_repo_and_the_search_terms_as_variables() {
+        let shim = crate::testshim::Shim::new();
+        shim.set(
+            "graphql.out",
+            r#"{"data":{"repository":{"prAll":{"totalCount":1}},"prMine":{"issueCount":4}}}"#,
+        );
+        let c = counts("o/r").unwrap();
+        assert_eq!((c.prs[0], c.prs[2]), (Some(4), Some(1)));
+        let calls = shim.calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        let q = &calls[0];
+        for want in [
+            "api graphql",
+            "o=o",
+            "n=r",
+            "pm=repo:o/r is:pr is:open author:@me",
+            "pr=repo:o/r is:pr is:open review-requested:@me",
+            "im=repo:o/r is:issue is:open assignee:@me",
+            "iu=repo:o/r is:issue is:open author:@me",
+            "refs/heads/",
+            "refs/tags/",
+        ] {
+            assert!(q.contains(want), "missing {want:?}: {q}");
+        }
+        assert!(counts("no-slash").is_err());
+    }
+
+    #[test]
+    fn a_token_from_the_environment_means_hosts_yml_cannot_name_the_account() {
+        let yml = "github.com:\n    user: alice\n    git_protocol: https\n";
+        let alice = Some(("github.com".to_string(), "alice".to_string()));
+        assert_eq!(stored_identity(Some(yml), "github.com", false), alice);
+        // GH_TOKEN wins over what `gh auth login` stored, so the stored user may be someone else
+        assert_eq!(stored_identity(Some(yml), "github.com", true), None);
+        assert_eq!(
+            stored_identity(None, "github.com", false),
+            None,
+            "no hosts.yml"
+        );
+        // which variables count, per host; blank ones do not
+        let with = |names: &'static [&'static str]| {
+            move |n: &str| names.contains(&n).then(|| "token".to_string())
+        };
+        assert!(env_token_in("github.com", with(&["GH_TOKEN"])));
+        assert!(env_token_in("github.com", with(&["GITHUB_TOKEN"])));
+        assert!(!env_token_in("github.com", with(&["GH_ENTERPRISE_TOKEN"])));
+        assert!(env_token_in(
+            "ghe.example.com",
+            with(&["GH_ENTERPRISE_TOKEN"])
+        ));
+        assert!(env_token_in(
+            "ghe.example.com",
+            with(&["GITHUB_ENTERPRISE_TOKEN"])
+        ));
+        assert!(!env_token_in("ghe.example.com", with(&["GH_TOKEN"])));
+        assert!(env_token_in("acme.ghe.com", with(&["GH_TOKEN"])));
+        assert!(!env_token_in("github.com", |_| Some("  ".to_string())));
+        assert!(!env_token_in("github.com", |_| None));
+        // a stored login that is not a plausible name is not used as a file name
+        assert_eq!(
+            login_in("github.com:\n    user: ../etc\n", "github.com"),
+            None
+        );
+        assert_eq!(
+            login_in("github.com:\n    user: octo-cat_1.x\n", "github.com").as_deref(),
+            Some("octo-cat_1.x")
+        );
+    }
+
     #[test]
     fn the_local_repo_comes_from_git_remotes_without_an_api_call() {
         let r = |s: &str| repo_from_remotes(s, "github.com");
@@ -3409,11 +3649,34 @@ mod tests {
                        {"name":"sub","path":".github/ISSUE_TEMPLATE/sub","type":"dir"}]"#;
         assert_eq!(
             parse_template_list(list),
-            [(
-                "bug report".to_string(),
-                ".github/ISSUE_TEMPLATE/bug_report.md".to_string()
-            )],
-            "only Markdown templates can prefill a body"
+            [
+                (
+                    "bug report".to_string(),
+                    ".github/ISSUE_TEMPLATE/bug_report.md".to_string()
+                ),
+                (
+                    "form".to_string(),
+                    ".github/ISSUE_TEMPLATE/form.yml".to_string()
+                ),
+            ],
+            "Markdown templates and issue forms, but not the chooser's config.yml or a directory"
+        );
+        // a Markdown file prefills the body; a form becomes the sections GitHub would write
+        let md = template_from("bug report", ".github/ISSUE_TEMPLATE/bug_report.md", t).unwrap();
+        assert_eq!(
+            (md.name.as_str(), md.body.as_str()),
+            ("Bug report", "### Steps\n1. do\n")
+        );
+        let yml = "name: Crash\ntitle: \"[Crash]: \"\nbody:\n  - type: input\n    attributes:\n      label: Where\n";
+        let f = template_from("form", ".github/ISSUE_TEMPLATE/form.yml", yml).unwrap();
+        assert_eq!(
+            (f.name.as_str(), f.title.as_deref()),
+            ("Crash", Some("[Crash]: "))
+        );
+        assert!(f.body.starts_with("### Where"));
+        assert!(
+            template_from("x", ".github/ISSUE_TEMPLATE/x.yml", "body: nope\n").is_none(),
+            "an unusable form is not offered"
         );
         assert!(parse_template_list("not json").is_empty());
     }

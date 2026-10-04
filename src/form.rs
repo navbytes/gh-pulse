@@ -1,6 +1,7 @@
 //! Multi-field popups for creating issues and pull requests. The form only collects text; `build`
 //! turns it into the exact `gh` argv (validated), which then goes through the usual confirm popup.
 use crate::dispatch::{InputDef, InputKind};
+use crate::issueform::Template;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Bodies above this go through `--body-file -` on stdin instead of argv.
@@ -88,8 +89,11 @@ pub struct Form {
     pub note: Option<String>,
     /// Label names of the repo once loaded; unknown labels are rejected only after that.
     pub labels: Option<Vec<String>>,
-    /// Issue templates (name, body) once loaded.
-    pub templates: Vec<(String, String)>,
+    /// Issue templates and forms once loaded.
+    pub templates: Vec<Template>,
+    /// What the last picked template put in the title, labels and assignees, so that a later pick may
+    /// replace it (and the user's own text is never touched).
+    meta_prefill: [String; 3],
     /// `Some(false)`: the PR head branch is not on the remote.
     pub head_pushed: Option<bool>,
     prefilled: Option<String>,
@@ -261,6 +265,7 @@ impl Form {
             note: Some("loading labels and templates...".into()),
             labels: None,
             templates: vec![],
+            meta_prefill: Default::default(),
             head_pushed: None,
             prefilled: None,
             typed: false,
@@ -295,14 +300,14 @@ impl Form {
         self.labels = (labels.len() < LABELS_MAX).then_some(labels);
     }
 
-    /// Adds a "Template" picker (first field) when the repo has .md issue templates.
-    pub fn set_templates(&mut self, templates: Vec<(String, String)>) {
+    /// Adds a "Template" picker (first field) when the repo has issue templates or forms.
+    pub fn set_templates(&mut self, templates: Vec<Template>) {
         if templates.is_empty() || self.field("template").is_some() {
             return;
         }
         let mut f = Field::new("template", "Template (left/right)", Kind::Pick);
         f.options = std::iter::once("(none)".to_string())
-            .chain(templates.iter().map(|t| t.0.clone()))
+            .chain(templates.iter().map(|t| t.name.clone()))
             .collect();
         self.fields.insert(0, f);
         self.focus += 1;
@@ -340,17 +345,30 @@ impl Form {
         }
     }
 
-    /// After the template picker moved: replace the body, unless the user has typed their own.
+    /// After the template picker moved: replace the body, unless the user has typed their own, and
+    /// likewise the title, labels and assignees a form comes with.
     pub fn apply_template(&mut self) {
         let idx = self.field("template").map_or(0, |f| f.idx);
-        let new = if idx == 0 {
-            String::new()
-        } else {
-            self.templates
-                .get(idx - 1)
-                .map(|t| t.1.clone())
-                .unwrap_or_default()
-        };
+        let t = idx
+            .checked_sub(1)
+            .and_then(|i| self.templates.get(i))
+            .cloned();
+        let new = t.as_ref().map(|t| t.body.clone()).unwrap_or_default();
+        let meta = [
+            t.as_ref().and_then(|t| t.title.clone()).unwrap_or_default(),
+            t.as_ref().map(|t| t.labels.join(", ")).unwrap_or_default(),
+            t.as_ref()
+                .map(|t| t.assignees.join(", "))
+                .unwrap_or_default(),
+        ];
+        for (i, key) in ["title", "labels", "assignees"].into_iter().enumerate() {
+            let old = std::mem::replace(&mut self.meta_prefill[i], meta[i].clone());
+            if let Some(f) = self.field_mut(key)
+                && (f.text.is_empty() || f.text == old)
+            {
+                f.text = meta[i].clone();
+            }
+        }
         let body = self.text("body").to_string();
         if (body.is_empty() || self.prefilled.as_deref() == Some(body.as_str()))
             && let Some(f) = self.field_mut("body")
@@ -684,10 +702,12 @@ mod tests {
     #[test]
     fn templates_prefill_the_body_unless_the_user_wrote_their_own() {
         let mut f = Form::issue("o/r");
-        f.set_templates(vec![
-            ("Bug".into(), "## Steps\n".into()),
-            ("Idea".into(), "## Why\n".into()),
-        ]);
+        let md = |n: &str, b: &str| Template {
+            name: n.into(),
+            body: b.into(),
+            ..Default::default()
+        };
+        f.set_templates(vec![md("Bug", "## Steps\n"), md("Idea", "## Why\n")]);
         assert_eq!(f.fields[0].key, "template");
         assert_eq!(f.focus, 1, "focus stays on Title");
         f.focus = 0;
@@ -711,6 +731,68 @@ mod tests {
             f.text("body").ends_with("my own words"),
             "edited text is never overwritten"
         );
+    }
+
+    #[test]
+    fn an_issue_form_also_fills_the_title_labels_and_assignees_it_comes_with() {
+        let mut f = Form::issue("o/r");
+        f.set_templates(vec![
+            Template {
+                name: "Bug".into(),
+                body: "### What\n".into(),
+                title: Some("[Bug]: ".into()),
+                labels: vec!["bug".into(), "triage".into()],
+                assignees: vec!["octocat".into()],
+            },
+            Template {
+                name: "Idea".into(),
+                body: "### Why\n".into(),
+                title: Some("[Idea]: ".into()),
+                ..Default::default()
+            },
+        ]);
+        f.focus = 0;
+        press(&mut f, KeyCode::Right);
+        f.apply_template();
+        assert_eq!(f.text("title"), "[Bug]: ");
+        assert_eq!(f.text("labels"), "bug, triage");
+        assert_eq!(f.text("assignees"), "octocat");
+        // the next form replaces what the last one put there, field by field
+        press(&mut f, KeyCode::Right);
+        f.apply_template();
+        assert_eq!(
+            (f.text("title"), f.text("labels"), f.text("assignees")),
+            ("[Idea]: ", "", "")
+        );
+        // what the user typed after the prefix is theirs: not replaced, not cleared
+        let title = f.fields.iter().position(|x| x.key == "title").unwrap();
+        f.fields[title].text.push_str("it crashes");
+        press(&mut f, KeyCode::Left);
+        f.apply_template();
+        assert_eq!(f.text("title"), "[Idea]: it crashes");
+        // "(none)" clears an untouched prefill
+        let mut g = Form::issue("o/r");
+        g.set_templates(vec![Template {
+            name: "Bug".into(),
+            body: "b".into(),
+            labels: vec!["bug".into()],
+            ..Default::default()
+        }]);
+        g.focus = 0;
+        press(&mut g, KeyCode::Right);
+        g.apply_template();
+        assert_eq!(g.text("labels"), "bug");
+        press(&mut g, KeyCode::Left);
+        g.apply_template();
+        assert_eq!(g.text("labels"), "");
+        // and the command carries them, validated as always
+        press(&mut g, KeyCode::Right);
+        g.apply_template();
+        let title = g.fields.iter().position(|x| x.key == "title").unwrap();
+        g.fields[title].text = "A bug".into();
+        g.set_labels(vec!["bug".into(), "other".into()]);
+        let cmd = g.build().unwrap().argv.join(" ");
+        assert!(cmd.contains("--label bug"), "{cmd}");
     }
 
     #[test]

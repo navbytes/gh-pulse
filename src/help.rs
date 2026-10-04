@@ -102,6 +102,16 @@ pub fn entries(app: &App) -> Vec<Entry> {
     );
     add(
         "Global home",
+        s("g"),
+        "group by author / repo / none (longest wait first)",
+    );
+    add(
+        "Global home",
+        s("W"),
+        "PR window: 24h / 7d / 30d / all (sections search again)",
+    );
+    add(
+        "Global home",
         s("[[sections]]"),
         "your own searches as panels (see docs/configuration.md)",
     );
@@ -235,4 +245,34 @@ pub fn visible<'a>(all: &'a [Entry], filter: &str) -> Vec<&'a Entry> {
             words.iter().all(|w| hay.contains(w))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::{IconSet, Theme};
+
+    #[test]
+    fn every_key_the_global_home_adds_is_in_the_menu() {
+        let a = App::build_start(
+            Some("o/r".into()),
+            true,
+            Theme::new(false, IconSet::Unicode, true),
+            false,
+            crate::config::Config::default(),
+        );
+        let rows = entries(&a);
+        for key in ["s", "S", "H", "g", "W", "[[sections]]"] {
+            assert!(
+                rows.iter()
+                    .any(|e| e.section == "Global home" && e.key == key),
+                "{key} is missing from the Global home section of the ? menu"
+            );
+        }
+        let anywhere = |what: &str| {
+            rows.iter()
+                .any(|e| e.section == "Anywhere" && e.desc.contains(what))
+        };
+        assert!(anywhere("edit the config") && anywhere("command log"));
+    }
 }
