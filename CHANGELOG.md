@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.5.0]
 
 ### Added
 - Edit the config in your own editor: `E` (action `edit_config`) opens it in `$VISUAL` / `$EDITOR` and applies it when
