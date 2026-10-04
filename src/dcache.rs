@@ -20,6 +20,7 @@ pub const KEEP_LISTS: usize = 200;
 const LISTS_BYTES: u64 = 20 * 1024 * 1024;
 pub const DETAIL_PREFIX: &str = "d-";
 pub const LIST_PREFIX: &str = "l-";
+pub const COUNT_PREFIX: &str = "n-";
 
 /// Items whose details are cached and revalidated by `updatedAt`; other kinds keep the old
 /// behaviour (loaded once per session, `r` to reload).
@@ -70,6 +71,12 @@ struct StoredDetail {
     data: Data,
 }
 
+/// Was an entry stored after the reload floor? Strictly after: a copy stored in the same second as `R`
+/// may be the very one it was meant to skip. A floor of 0 is no floor.
+fn stored_after(stored_at: u64, floor: u64) -> bool {
+    floor == 0 || stored_at > floor
+}
+
 fn safe(s: &str) -> String {
     s.replace('/', "_")
 }
@@ -105,7 +112,10 @@ pub fn read_detail(
     let st = Store::default_if_enabled()?;
     let (mut d, age): (StoredDetail, u64) =
         st.read(&detail_key(&host, &login, repo, kind, number, tab), now)?;
-    if d.host != host || !d.viewer.eq_ignore_ascii_case(&login) || now.saturating_sub(age) < floor {
+    if d.host != host
+        || !d.viewer.eq_ignore_ascii_case(&login)
+        || !stored_after(now.saturating_sub(age), floor)
+    {
         return None;
     }
     gh::reclean(&mut d.data);
@@ -264,6 +274,41 @@ pub fn write_list(key: &str, items: &[Item], hidden: usize, not_shown: usize, no
     let _ = st.write(&list_file(&host, &login, key), &l, now);
 }
 
+#[derive(Serialize, Deserialize)]
+struct StoredCounts {
+    host: String,
+    viewer: String,
+    counts: gh::RepoCounts,
+}
+
+fn counts_file(host: &str, login: &str, repo: &str) -> String {
+    format!("{COUNT_PREFIX}{host}-{login}-{}", safe(repo))
+}
+
+/// The tab counts of a repo as stored for this host and login, and their age. `floor` ignores copies
+/// stored before it (the user asked for a reload).
+pub fn read_counts(repo: &str, now: u64, floor: u64) -> Option<(gh::RepoCounts, u64)> {
+    let (host, login) = gh::identity()?;
+    let st = Store::default_if_enabled()?;
+    let (c, age): (StoredCounts, u64) = st.read(&counts_file(&host, &login, repo), now)?;
+    let ok = c.host == host
+        && c.viewer.eq_ignore_ascii_case(&login)
+        && stored_after(now.saturating_sub(age), floor);
+    ok.then_some((c.counts, age))
+}
+
+pub fn write_counts(repo: &str, counts: &gh::RepoCounts, now: u64) {
+    let (Some((host, login)), Some(st)) = (gh::identity(), Store::default_if_enabled()) else {
+        return;
+    };
+    let c = StoredCounts {
+        host: host.clone(),
+        viewer: login.clone(),
+        counts: counts.clone(),
+    };
+    let _ = st.write(&counts_file(&host, &login, repo), &c, now);
+}
+
 /// A short stable digest for cache keys (favorites, hidden repos, a custom filter).
 pub fn digest<I: IntoIterator<Item = S>, S: AsRef<str>>(parts: I) -> String {
     // FNV-1a: no dependency, stable across runs (unlike the std hasher)
@@ -282,6 +327,7 @@ pub fn prune() {
     if let Some(st) = Store::default_if_enabled() {
         st.prune(DETAIL_PREFIX, KEEP_DETAILS, DETAILS_BYTES);
         st.prune(LIST_PREFIX, KEEP_LISTS, LISTS_BYTES);
+        st.prune(COUNT_PREFIX, KEEP_LISTS, 1024 * 1024);
     }
 }
 

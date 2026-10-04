@@ -5,6 +5,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Tab counts in the repo home come from one GraphQL request instead of one list fetch per tab: exact totals (`412`,
+  not `100+`), and the Mine / Review requested / Assigned / Mine tabs, which used to show `?` until opened, count too.
+  The answer is kept on disk for `warm_s`. If the request fails the old per-tab path takes over.
+- The `?` menu lists `g` and `W` (they were missing), and the README has screenshots of the grouped list and the menu.
+
 ### Fixed
 - The on-disk cache now works with a token from the environment (`GH_TOKEN`, `GITHUB_TOKEN`; Codespaces and CI use
   these). It is keyed by who you are, which came only from `gh`'s `hosts.yml`: with an environment token that was

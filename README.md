@@ -334,7 +334,7 @@ at word boundaries with a `↪` marker; `w` switches to clipping. `f` zooms the 
 
 - One GraphQL request fills the first screen; other panels load when first focused, at most 4 `gh` processes run at
   once, and what you ask for goes before anything automatic.
-- **Tab counts** are `lazy` by default (`[api] counts = "lazy" | "eager" | "off"`); search-backed tabs show `?` until opened.
+- **Tab counts** in the repo home (PR, issue and repo tabs) come from one GraphQL request (`[api] counts = "lazy" | "eager" | "off"`), exact and kept on disk for a few minutes; the global home's search-backed tabs show `?` until opened.
 - **Quota chip.** `⚡ 412/5000` in the header means a quota is under 20% (`low_quota_percent`; `rate_header = false` hides it).
 - **Pause.** Under 10% (`pause_percent`) everything automatic stops (counts, extra comment pages, the inbox badge)
   until the window resets (`resets HH:MM`); your own actions still work. `Retry-After` and secondary-limit messages are honored.

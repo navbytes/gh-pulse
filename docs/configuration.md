@@ -114,10 +114,15 @@ work for something you have already moved past is dropped before it starts (an a
   check itself still runs) and the status line says `paused background refresh (rate limit low, resets HH:MM)`.
   Your own actions keep working; at exhaustion the usual rate-limit message includes the reset time. A secondary
   limit or `Retry-After` message backs the automatic work off for the time GitHub names.
-- **Tab counts** (`[panels]` titles; a list or count that failed shows `✗`, never `0`, and a failed count is not retried until the next reload). `lazy` (default): the focused panel's other tabs, one at a time, after a second
-  of idling; never in the global view; never for tabs backed by GitHub's search (Mine / Review requested PRs,
-  Assigned / Mine issues), which show `?` until you open them. `eager` fetches every panel's tabs (still skipping
-  search-backed ones); `off` never fetches (`?`). The tab you are on always counts its own list.
+- **Tab counts** (`[panels]` titles; a list or count that failed shows `✗`, never `0`, and a failed count is not retried
+  until the next reload). In the repo home every PR, issue and repo count (Mine / Review / All / Merged, Assigned /
+  Mine / All, Branches / Tags / Releases) comes from **one GraphQL request**, about a point of quota: exact totals
+  (`412`, not `100+`), including the tabs GitHub's REST search would have rationed. It is kept in the on-disk cache
+  for `warm_s`, so a restart inside that time makes no request. `lazy` (default) and `eager` behave the same for
+  these; `off` never fetches (`?`). The Actions tabs (Runs / Workflows), and every tab if that request fails, use
+  the older per-tab path: `lazy` counts the focused panel's other tabs one at a time after a second of idling,
+  `eager` every panel's, never in the global home and never for tabs backed by GitHub's search (those show `?`
+  until you open them). The tab you are on always counts its own list.
 - **Comments.** The first request fetches 50 items per connection and 20 replies per thread, reactions as counts
   only; `e` fetches the names of one comment's reactors. The rest pages in as background work (5 pages, then
   scroll or `m`), and not at all while the quota is low.

@@ -833,6 +833,82 @@ pub fn startup(repo: &str, want: &StartupWant) -> Result<Startup, String> {
     parse_startup(&graphql(a)?, repo, want)
 }
 
+/// Every tab count of the repo home in one request: open / merged PRs and open issues from the
+/// repository's own totals, "mine" and "review requested" from search (as the lists themselves do),
+/// and the Repo panel's branches, tags and releases. `first:1` keeps every connection well formed;
+/// no nodes are selected, so the cost stays at about one point.
+const COUNTS_Q: &str = "\
+query($o:String!,$n:String!,$pm:String!,$pr:String!,$im:String!,$iu:String!){\
+ rateLimit{cost remaining resetAt limit}\
+ repository(owner:$o,name:$n){\
+  prAll:pullRequests(states:OPEN,first:1){totalCount}\
+  prMerged:pullRequests(states:MERGED,first:1){totalCount}\
+  isAll:issues(states:OPEN,first:1){totalCount}\
+  branches:refs(refPrefix:\"refs/heads/\",first:1){totalCount}\
+  tags:refs(refPrefix:\"refs/tags/\",first:1){totalCount}\
+  releases(first:1){totalCount}\
+ }\
+ prMine:search(query:$pm,type:ISSUE,first:1){issueCount}\
+ prReview:search(query:$pr,type:ISSUE,first:1){issueCount}\
+ isAssigned:search(query:$im,type:ISSUE,first:1){issueCount}\
+ isMine:search(query:$iu,type:ISSUE,first:1){issueCount}\
+}";
+
+/// The tab counts of one repo, by tab id: PRs (mine, review requested, all open, merged), issues
+/// (assigned, mine, all open) and the Repo panel (branches, tags, releases). None = not answered.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoCounts {
+    pub prs: [Option<usize>; 4],
+    pub issues: [Option<usize>; 3],
+    pub repo: [Option<usize>; 3],
+}
+
+pub fn parse_counts(body: &str) -> Result<RepoCounts, String> {
+    let v: Value = json(body)?;
+    if let Some(e) = v["errors"][0]["message"].as_str() {
+        return Err(e.to_string());
+    }
+    let (d, r) = (&v["data"], &v["data"]["repository"]);
+    if !r.is_object() {
+        return Err("no counts in the answer".into());
+    }
+    let n = |x: &Value| {
+        x["totalCount"]
+            .as_u64()
+            .or_else(|| x["issueCount"].as_u64())
+            .map(|n| n as usize)
+    };
+    Ok(RepoCounts {
+        prs: [
+            n(&d["prMine"]),
+            n(&d["prReview"]),
+            n(&r["prAll"]),
+            n(&r["prMerged"]),
+        ],
+        issues: [n(&d["isAssigned"]), n(&d["isMine"]), n(&r["isAll"])],
+        repo: [n(&r["branches"]), n(&r["tags"]), n(&r["releases"])],
+    })
+}
+
+/// One GraphQL request for all the tab counts of `repo`.
+pub fn counts(repo: &str) -> Result<RepoCounts, String> {
+    let (o, n) = repo.split_once('/').ok_or("bad repo")?;
+    let q = |kind: &str, qual: &str| format!("repo:{repo} is:{kind} is:open {qual}");
+    let mut a: Vec<String> = ["api", "graphql", "-f"].map(String::from).to_vec();
+    a.push(format!("query={COUNTS_Q}"));
+    for (k, v) in [
+        ("o", o.to_string()),
+        ("n", n.to_string()),
+        ("pm", q("pr", "author:@me")),
+        ("pr", q("pr", "review-requested:@me")),
+        ("im", q("issue", "assignee:@me")),
+        ("iu", q("issue", "author:@me")),
+    ] {
+        a.extend(["-f".to_string(), format!("{k}={v}")]);
+    }
+    parse_counts(&graphql(a)?)
+}
+
 /// GraphQL nodes -> the `Item`s `gh pr list` / `gh issue list` would have produced.
 fn graphql_items(nodes: &Value, kind: Kind, repo: &str) -> Vec<Item> {
     nodes
@@ -2776,6 +2852,58 @@ pub fn checkout(repo: &str, n: u64) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn counts_parse_every_tab_and_reject_anything_that_is_not_an_answer() {
+        let body = r#"{"data":{"rateLimit":{"cost":1,"remaining":4999,"resetAt":"2030-01-01T00:00:00Z","limit":5000},
+          "repository":{"prAll":{"totalCount":74},"prMerged":{"totalCount":312},"isAll":{"totalCount":9},
+            "branches":{"totalCount":32},"tags":{"totalCount":14},"releases":{"totalCount":81}},
+          "prMine":{"issueCount":2},"prReview":{"issueCount":0},"isAssigned":{"issueCount":3},"isMine":{"issueCount":5}}}"#;
+        let c = parse_counts(body).unwrap();
+        assert_eq!(c.prs, [Some(2), Some(0), Some(74), Some(312)]);
+        assert_eq!(c.issues, [Some(3), Some(5), Some(9)]);
+        assert_eq!(c.repo, [Some(32), Some(14), Some(81)]);
+        // a part that did not come back stays None; the rest still counts
+        let part = r#"{"data":{"repository":{"prAll":{"totalCount":7}}}}"#;
+        let c = parse_counts(part).unwrap();
+        assert_eq!((c.prs[2], c.prs[0], c.repo[0]), (Some(7), None, None));
+        // an error, a plain list (what gh prints for an unknown query in tests), garbage: all errors
+        assert!(
+            parse_counts(r#"{"errors":[{"message":"Field 'x' doesn't exist"}]}"#)
+                .unwrap_err()
+                .contains("doesn't exist")
+        );
+        assert!(parse_counts("[]").is_err() && parse_counts("nope").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn counts_are_one_graphql_request_with_the_repo_and_the_search_terms_as_variables() {
+        let shim = crate::testshim::Shim::new();
+        shim.set(
+            "graphql.out",
+            r#"{"data":{"repository":{"prAll":{"totalCount":1}},"prMine":{"issueCount":4}}}"#,
+        );
+        let c = counts("o/r").unwrap();
+        assert_eq!((c.prs[0], c.prs[2]), (Some(4), Some(1)));
+        let calls = shim.calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        let q = &calls[0];
+        for want in [
+            "api graphql",
+            "o=o",
+            "n=r",
+            "pm=repo:o/r is:pr is:open author:@me",
+            "pr=repo:o/r is:pr is:open review-requested:@me",
+            "im=repo:o/r is:issue is:open assignee:@me",
+            "iu=repo:o/r is:issue is:open author:@me",
+            "refs/heads/",
+            "refs/tags/",
+        ] {
+            assert!(q.contains(want), "missing {want:?}: {q}");
+        }
+        assert!(counts("no-slash").is_err());
+    }
+
     #[test]
     fn a_token_from_the_environment_means_hosts_yml_cannot_name_the_account() {
         let yml = "github.com:\n    user: alice\n    git_protocol: https\n";
