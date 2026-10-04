@@ -957,6 +957,12 @@ pub fn path() -> Option<PathBuf> {
     Some(crate::paths::data_dir(&base).join("config.toml"))
 }
 
+/// The commented default config: every setting with its default, ready to be uncommented. What
+/// `--print-config` prints and what a first `E` creates (a test keeps it equal to `Config::default()`).
+pub fn template() -> &'static str {
+    include_str!("config.default.toml")
+}
+
 /// 1-based line of `key` inside the `nth` table headed `header`; the header's line if the key is implied.
 fn key_line(src: &str, header: &str, nth: usize, key: &str) -> usize {
     let lines: Vec<&str> = src.lines().collect();
@@ -1022,6 +1028,14 @@ pub fn load_from(path: &Path) -> Result<Config, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
+}
+
+/// Load the file and build its key bindings, as startup does: any problem is one message that names
+/// the file (and the line, when it has one).
+pub fn load_checked(path: &Path) -> Result<(Config, Keymap), String> {
+    let cfg = load_from(path)?;
+    let keys = Keymap::build(&cfg.keys).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok((cfg, keys))
 }
 
 /// Write `[repos] favorites` and `hidden` into the file, touching nothing else: comments, ordering and
@@ -1134,10 +1148,11 @@ pub enum Act {
     Inbox,
     Scope,
     SwitchRepoContext,
+    EditConfig,
 }
 
 impl Act {
-    pub const ALL: [Act; 19] = [
+    pub const ALL: [Act; 20] = [
         Act::Quit,
         Act::Help,
         Act::Refresh,
@@ -1157,6 +1172,7 @@ impl Act {
         Act::Inbox,
         Act::Scope,
         Act::SwitchRepoContext,
+        Act::EditConfig,
     ];
 
     pub fn name(self) -> &'static str {
@@ -1180,6 +1196,7 @@ impl Act {
             Act::Inbox => "inbox",
             Act::Scope => "scope",
             Act::SwitchRepoContext => "switch_repo_context",
+            Act::EditConfig => "edit_config",
         }
     }
 
@@ -1204,6 +1221,7 @@ impl Act {
             Act::Inbox => &["N"],
             Act::Scope => &["s"],
             Act::SwitchRepoContext => &["S"],
+            Act::EditConfig => &["E"],
         }
     }
 }
@@ -1472,6 +1490,93 @@ mod tests {
         assert!(err("[keys]\nactions = []\n").contains("at least one"));
     }
 
+    /// The template with every `#key = value` / `#[table]` line uncommented (notes start with "# ").
+    fn uncommented() -> String {
+        template()
+            .lines()
+            .map(|l| match l.strip_prefix('#') {
+                Some(r) if r.starts_with(|c: char| c.is_ascii_alphabetic() || c == '[') => r,
+                _ => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_template_is_the_default_config_with_every_setting_listed() {
+        // uncommenting every setting line loads, and changes nothing: they are exactly the defaults
+        let c = parse(&uncommented(), "template").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(c, Config::default());
+        // the shipped file is all comments until the user opts in
+        assert_eq!(parse(template(), "template").unwrap(), Config::default());
+        assert!(
+            template()
+                .lines()
+                .all(|l| l.is_empty() || l.starts_with('#')),
+            "no live setting in the template"
+        );
+        // no setting of any table is missing from it
+        let doc: toml::Table = toml::from_str(&uncommented()).unwrap();
+        let keys = |t: &str| -> Vec<String> {
+            toml::Table::try_from(
+                match t {
+                    "api" => toml::Value::try_from(ApiCfg::default()),
+                    "ui" => toml::Value::try_from(UiCfg::default()),
+                    "cache" => toml::Value::try_from(CacheCfg::default()),
+                    _ => toml::Value::try_from(PanelsCfg::default()),
+                }
+                .unwrap(),
+            )
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
+        };
+        for table in ["api", "ui", "cache", "panels"] {
+            for k in keys(table) {
+                // panels.prs / issues / actions / repo have no default value to list: they are notes
+                if table == "panels" && ["prs", "issues", "actions", "repo"].contains(&k.as_str()) {
+                    continue;
+                }
+                assert!(
+                    doc.get(table).and_then(|t| t.get(&k)).is_some(),
+                    "[{table}] {k} is missing from src/config.default.toml"
+                );
+            }
+        }
+        for k in ["ascii", "nerd", "sync_viewed"] {
+            assert!(doc.contains_key(k), "{k} is missing from the template");
+        }
+        // every remappable action and the unusual panel names are mentioned
+        for a in Act::ALL {
+            assert!(
+                template().contains(a.name()),
+                "action {} is not listed",
+                a.name()
+            );
+        }
+    }
+
+    #[test]
+    fn load_checked_reports_one_message_that_names_the_file() {
+        let dir = tmp_dir("checked");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        assert!(load_checked(&path).is_ok(), "no file: the defaults");
+        std::fs::write(&path, "ascii = true\n[keys]\nquit = \"Q\"\n").unwrap();
+        let (c, k) = load_checked(&path).unwrap();
+        assert!(c.ascii && k.labels(Act::Quit) == "Q");
+        // a typo names the file and the line
+        std::fs::write(&path, "ascii = true\nnerdd = true\n").unwrap();
+        let e = load_checked(&path).err().unwrap();
+        assert!(e.contains("config.toml:2") && e.contains("nerdd"), "{e}");
+        // a key that cannot be bound is an error naming the file too
+        std::fs::write(&path, "[keys]\nquit = \"j\"\n").unwrap();
+        let e = load_checked(&path).err().unwrap();
+        assert!(e.contains("config.toml"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn tmp_dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("gh-tui-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -1636,7 +1741,7 @@ max_concurrent = 2   # be gentle
         assert_eq!(tabs, [4, 0, 3, 2, 3]);
         assert!(!c.panels.hide_empty);
         // the inbox key is part of the closed key set
-        assert_eq!(Act::ALL.len(), 19);
+        assert_eq!(Act::ALL.len(), 20);
         assert_eq!(
             Keymap::build(&BTreeMap::new()).unwrap().label(Act::Inbox),
             "N"

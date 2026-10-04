@@ -1,0 +1,97 @@
+# gh-tui configuration
+#
+# Every setting is listed here with its default, commented out. To change one, remove the "#" in
+# front of its line (and in front of its [table] header, if it has one) and edit the value. Lines
+# that start with "# " (a hash and a space) are notes, not settings.
+#
+# Changes apply when you save and close the editor (press E in gh-tui, or run `gh-tui --edit-config`).
+# Settings marked (restart) are read once at startup. A mistake is reported with its line number and the
+# old settings stay in force. `gh-tui --print-config` prints this file again, `gh-tui --config-path` says
+# where it lives. Command-line flags override this file. Full reference:
+# https://github.com/navbytes/gh-tui/blob/main/docs/configuration.md
+#
+# gh-tui itself rewrites only the favorites and hidden lists in [repos] (when you press f or H on a
+# repo); every other line, and every comment, is left exactly as you wrote it.
+
+# --- General -------------------------------------------------------------------------------------
+
+# theme = "dark"          # "dark" or "light"
+#ascii = false            # ASCII icons and borders
+#nerd = false             # Nerd Font icons
+#sync_viewed = false      # also mark files viewed on GitHub when you press v (a write to GitHub: opting in is the consent)
+
+# --- Where it opens and how far back it looks -----------------------------------------------------
+
+#[ui]
+#start = "auto"           # (restart) auto: the current repo, else the global home | repo: always a repo | global: always the home
+#window = "7d"            # global home: PRs updated within 24h | 7d | 30d | all (press W to cycle it)
+
+# --- Panels ---------------------------------------------------------------------------------------
+
+#[panels]
+#show = ["prs", "files", "issues", "actions", "repo"]   # (restart) the repo home, in order; also notifications, status, repos, section:<title>
+#global = ["review", "mine", "assigned", "repos"]       # (restart) the global home; also involved, files, section:<title>
+#hide_empty = false       # (restart) collapse a panel with nothing in any tab to one line
+
+# Which list tabs a panel offers, in order, and which opens first (restart):
+#   [panels.prs]      tabs: mine review all merged     [panels.issues]  tabs: assigned mine all
+#   [panels.actions]  tabs: runs workflows             [panels.repo]    tabs: branches tags releases
+# [panels.repo]
+# tabs = ["branches", "releases"]
+# default_tab = "branches"
+
+# --- Speed and politeness toward the GitHub API ----------------------------------------------------
+
+#[api]
+#max_concurrent = 4       # (restart) gh processes at once, 1..8
+#counts = "lazy"          # how tab counts are fetched: lazy | eager | off
+#low_quota_percent = 20   # show the quota chip in the header below this share of the quota
+#pause_percent = 10       # pause all background refreshing below this share (at most low_quota_percent)
+#rate_header = true       # show the quota chip at all
+#settle_ms = 250          # idle time before a Comments / Diff / Commits / Checks fetch, 0..5000
+#timeout_s = 60           # seconds before a gh read is killed (pagination 2x, writes 5x), 5..600
+#cache = true             # the on-disk cache as a whole (false turns every [cache] setting off)
+
+# --- The on-disk cache: how long a copy counts as fresh (seconds, 5..604800) ----------------------
+# Older copies still show at once, marked "cached 3m ago", while a refresh runs. r and R skip the cache.
+
+#[cache]
+#details = true           # keep PR/issue details (comments, diffs, commits, checks) on disk between runs
+#hot_s = 120              # Review requested, My PRs (open), a repo's PR list
+#warm_s = 300             # Involved, issues, a repo's issue list
+#cold_s = 900             # merged and closed tabs
+#checks_s = 45            # CI checks while one is still pending
+#overview_s = 300         # PR overview (review state, mergeability) and finished checks
+#detail_s = 86400         # comments, diffs, commits: valid while the PR is unchanged, never longer than this
+#slow_s = 3600            # repo list, repo facts, tags, workflow files (labels, templates, organizations: 24x this)
+
+# --- Repos you favorite (f) or hide (H) -------------------------------------------------------------
+# Written by gh-tui when you press f or H; you can edit them by hand too. Names are owner/name.
+
+# [repos]
+# favorites = ["octocat/hello-world"]
+# hidden = ["octocat/old-experiments"]
+
+# --- Key bindings ---------------------------------------------------------------------------------
+# Remap an action to one key or a list of keys. A key is a single character (case matters: C is
+# shift-c), ctrl-<letter>, or one of tab, backtab, enter, esc, space, backspace, up, down, left, right,
+# home, end.
+# Navigation keys (j k h l g n p v t w e s S T H . [ ] { } 1-7, ctrl-c/d/u) cannot be reassigned, and two
+# actions cannot share a key.
+#
+# Actions: quit, help, refresh, refresh_all, actions, approve, comment, merge, open, copy_url,
+# checkout, command_log, filter, zoom, global, repo_browser, inbox, scope, switch_repo_context,
+# edit_config
+#
+# [keys]
+# quit = ["q", "ctrl-q"]
+# actions = "space"
+
+# --- Your own searches as panels (up to 12) ----------------------------------------------------------
+# kind is prs or issues; filter is a GitHub search (see docs/configuration.md, "Custom sections");
+# limit is 1..100 rows (default 30); where is global, repo or both (default both).
+#
+# [[sections]]
+# title  = "Needs my review"
+# kind   = "prs"
+# filter = "is:open review-requested:@me -author:app/dependabot draft:false"

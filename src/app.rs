@@ -663,6 +663,8 @@ pub struct App {
     /// How far back the global PR sections look (`W`), and how global lists are grouped (`g`).
     pub window: config::Window,
     pub group: GroupBy,
+    /// `E` was pressed: the main loop hands the terminal to the editor, then calls `apply_config`.
+    edit_config: bool,
     pub help_typing: bool,
     pub help_top: Cell<usize>,
     /// Set by the renderer: how far the help popup can scroll.
@@ -1007,6 +1009,7 @@ impl App {
             help_filter: String::new(),
             window,
             group: GroupBy::None,
+            edit_config: false,
             help_typing: false,
             help_top: Cell::new(0),
             help_max: Cell::new(0),
@@ -1619,9 +1622,15 @@ impl App {
         }
     }
 
-    /// `W`: the next window. Only the sections that search pull requests are looked at again.
+    /// `W`: the next window.
     fn cycle_window(&mut self) {
         self.window = self.window.next();
+        self.window_changed();
+        self.status = format!("pull requests updated in: {}", self.window.label());
+    }
+
+    /// The window changed: only the sections that search pull requests are looked at again.
+    fn window_changed(&mut self) {
         let pr_section = |p: &Panel| matches!(p.kind, PK::Review | PK::MyPrs | PK::Involved);
         for p in self.panels.iter_mut().filter(|p| pr_section(p)) {
             (p.unloaded, p.cursor, p.hidden, p.not_shown) = (true, 0, 0, 0);
@@ -1637,9 +1646,59 @@ impl App {
         if pr_section(&self.panels[f]) {
             self.load_panel(f, false);
         }
-        self.status = format!("pull requests updated in: {}", self.window.label());
         self.reset_view();
         self.rebuild_header();
+    }
+
+    /// True once after `E` was pressed.
+    pub fn take_edit_config(&mut self) -> bool {
+        std::mem::take(&mut self.edit_config)
+    }
+
+    pub fn set_status(&mut self, s: impl Into<String>) {
+        self.status = s.into();
+    }
+
+    /// Use a config the user just edited. What can change under the running app does (theme and icons,
+    /// key bindings, cache and API settings, favorites and hidden repos, the window); what the panels
+    /// were built from does not (layout, sections, start mode, worker count), so those keep their old
+    /// values until a restart. Returns the settings that need one.
+    pub fn apply_config(&mut self, new: Config, keys: Keymap, theme: Theme) -> Vec<&'static str> {
+        let old = std::mem::replace(&mut self.cfg, new);
+        let mut restart = vec![];
+        if old.ui.start != self.cfg.ui.start {
+            restart.push("[ui] start");
+        }
+        if old.api.max_concurrent != self.cfg.api.max_concurrent {
+            restart.push("[api] max_concurrent");
+        }
+        if old.panels != self.cfg.panels || old.sections != self.cfg.sections {
+            restart.push("panels and sections");
+        }
+        // the panels (and the section indexes they carry) were built from the old layout
+        (self.cfg.panels, self.cfg.sections) = (old.panels.clone(), old.sections.clone());
+        self.cfg.ui.start = old.ui.start;
+        self.cfg.api.max_concurrent = old.api.max_concurrent;
+        self.keys = keys;
+        self.theme = theme;
+        if let Some(h) = self.hl.get_mut() {
+            h.clear(); // highlighted lines carry the old palette
+        }
+        rate::set_limits(self.cfg.api.low_quota_percent, self.cfg.api.pause_percent);
+        crate::cache::set_enabled(self.cfg.api.cache);
+        crate::cache::set_slow(self.cfg.cache.slow_s);
+        gh::set_timeout(self.cfg.api.timeout_s);
+        gh::set_sync_viewed(self.cfg.sync_viewed);
+        if old.repos != self.cfg.repos {
+            // favorites or hidden repos changed by hand: the sections are searched again
+            self.stale_sections(true);
+        }
+        if old.ui.window != self.cfg.ui.window {
+            self.window = self.cfg.ui.window;
+            self.window_changed();
+        }
+        self.rebuild_header();
+        restart
     }
 
     /// `g`: flat, by author, by repo.
@@ -3401,6 +3460,7 @@ impl App {
             Act::Merge if self.comments_pending() => self.load_more(true),
             Act::Merge => self.open_menu(Some("Merge")),
             Act::CommandLog => self.show_log = !self.show_log,
+            Act::EditConfig => self.edit_config = true,
             Act::Open => self.open(),
             Act::CopyUrl => self.copy(),
             Act::Checkout => self.checkout(),
@@ -7170,6 +7230,63 @@ mod tests {
             press(&mut a, 'W');
         }
         assert_eq!(a.window, config::Window::Week, "all, 24h, 7d");
+    }
+
+    #[test]
+    fn e_asks_the_main_loop_to_edit_the_config_once() {
+        let mut a = plain();
+        assert!(!a.take_edit_config());
+        press(&mut a, 'E');
+        assert!(a.take_edit_config(), "E hands the terminal to the editor");
+        assert!(!a.take_edit_config(), "and only once");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_edited_config_applies_live_where_it_can_and_names_what_needs_a_restart() {
+        let _shim = crate::testshim::Shim::new(); // the cache and API switches are process-wide
+        let mut a = home();
+        let old_panels = a.cfg.panels.clone();
+        a.panels[0].items = vec![gitem("x/y", 1), gitem("a/b", 2)];
+        a.panels[0].unloaded = false;
+        let cfg = config::parse(
+            "ascii = true\n[ui]\nstart = \"global\"\nwindow = \"24h\"\n[api]\nmax_concurrent = 2\ntimeout_s = 30\n[cache]\nslow_s = 100\n[panels]\nhide_empty = true\n[keys]\nquit = \"Q\"\n[repos]\nhidden = [\"x/y\"]\n",
+            "t",
+        )
+        .unwrap();
+        let keys = Keymap::build(&cfg.keys).unwrap();
+        let restart = a.apply_config(cfg, keys, Theme::new(true, IconSet::Ascii, true));
+        crate::cache::set_slow(3600);
+        gh::set_timeout(60);
+        assert_eq!(
+            restart,
+            ["[ui] start", "[api] max_concurrent", "panels and sections"]
+        );
+        // applied now
+        assert!(a.theme.light, "the new palette");
+        assert_eq!(a.window, config::Window::Day);
+        assert!(a.header.contains("PRs: 24h"), "{}", a.header);
+        assert_eq!((a.cfg.cache.slow_s, a.cfg.api.timeout_s), (100, 30));
+        assert!(a.cfg.repos.is_hidden("x/y"));
+        assert!(
+            a.panels[0].items.is_empty() && a.panels[0].unloaded || a.panels[0].loading,
+            "hidden repos changed: the sections search again"
+        );
+        let q = KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::NONE);
+        assert!(a.on_key(q), "the remapped quit key works");
+        assert!(
+            !a.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            "and the old one no longer does"
+        );
+        // not applied until a restart: what the panels were built from stays as it was
+        assert_eq!(a.cfg.panels, old_panels);
+        assert_eq!(a.cfg.ui.start, config::StartMode::Auto);
+        assert_eq!(a.cfg.api.max_concurrent, 4);
+        // an unchanged file applies quietly
+        let same = a.cfg.clone();
+        let keys = Keymap::build(&same.keys).unwrap();
+        let theme = Theme::new(true, IconSet::Ascii, true);
+        assert!(a.apply_config(same, keys, theme).is_empty());
     }
 
     #[test]
