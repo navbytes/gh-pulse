@@ -4153,7 +4153,7 @@ impl App {
         let Some(path) = &self.cfg_path else {
             return true;
         };
-        match config::save_to(path, &self.cfg) {
+        match config::save_repos(path, &self.cfg.repos) {
             Ok(()) => true,
             Err(e) => {
                 self.status = e;
