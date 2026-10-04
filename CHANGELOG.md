@@ -3,6 +3,14 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+- The on-disk cache now works with a token from the environment (`GH_TOKEN`, `GITHUB_TOKEN`; Codespaces and CI use
+  these). It is keyed by who you are, which came only from `gh`'s `hosts.yml`: with an environment token that was
+  missing, and, worse, could name a different account than the token in use. gh-tui now asks GitHub once at startup
+  (`gh api user`, one REST call) in that case, holds the first load until it answers, and caches under that login.
+
 ## [0.5.0]
 
 ### Added

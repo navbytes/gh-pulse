@@ -593,6 +593,8 @@ enum Msg {
     Inbox(u64, Result<Vec<Item>, String>),
     /// The viewer's login (from the startup request).
     User(u64, String),
+    /// `gh api user` answered (host, login; empty when it failed): the first load was waiting for it.
+    Identity(String, String),
     /// A queued detail fetch that was dropped before it started: forget its placeholder.
     Dropped(String, Tab, u64),
     /// The batched startup request failed (not a rate limit): load the panels one by one instead.
@@ -665,6 +667,8 @@ pub struct App {
     pub group: GroupBy,
     /// `E` was pressed: the main loop hands the terminal to the editor, then calls `apply_config`.
     edit_config: bool,
+    /// The first load waits until the login is known, so that it can use the on-disk cache.
+    identity_wait: bool,
     pub help_typing: bool,
     pub help_top: Cell<usize>,
     /// Set by the renderer: how far the help popup can scroll.
@@ -1010,6 +1014,7 @@ impl App {
             window,
             group: GroupBy::None,
             edit_config: false,
+            identity_wait: false,
             help_typing: false,
             help_top: Cell::new(0),
             help_max: Cell::new(0),
@@ -1087,7 +1092,24 @@ impl App {
                     Err(e) => app.status = format!("state not saved: {e}"),
                 }
             }
-            if app.global {
+            if gh::identity().is_none() {
+                // `gh` has no login on record for this account (a token from the environment, say), and
+                // the on-disk cache is keyed by who you are: ask once, then load with the cache
+                app.identity_wait = true;
+                app.status = "checking who you are...".into();
+                let tx = app.tx.clone();
+                app.user_job_or(
+                    {
+                        let tx = tx.clone();
+                        move || {
+                            let _ = tx.send(Msg::Identity(gh::host(), gh::user()));
+                        }
+                    },
+                    move || {
+                        let _ = tx.send(Msg::Identity(gh::host(), String::new()));
+                    },
+                );
+            } else if app.global {
                 app.load_global_side();
             } else {
                 app.load_repo_side();
@@ -2317,6 +2339,17 @@ impl App {
                         self.status = format!("could not list your organizations: {e}");
                     }
                 },
+                Msg::Identity(host, login) => {
+                    gh::resolve_identity(&host, &login);
+                    if std::mem::take(&mut self.identity_wait) {
+                        self.status.clear();
+                        if self.global {
+                            self.load_global_side();
+                        } else {
+                            self.load_repo_side();
+                        }
+                    }
+                }
                 Msg::User(g, u) => {
                     if g == self.hgen && !u.is_empty() {
                         self.user = u;
@@ -7230,6 +7263,65 @@ mod tests {
             press(&mut a, 'W');
         }
         assert_eq!(a.window, config::Window::Week, "all, 24h, 7d");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn without_a_stored_login_startup_asks_who_you_are_once_and_then_uses_the_cache() {
+        let shim = crate::testshim::Shim::new();
+        shim.set("graphql.out", include_str!("../tests/startup.json"));
+        let calls_of = |what: &str| shim.calls().iter().filter(|c| c.contains(what)).count();
+        let start = || {
+            // gh has no login on record (a token from the environment): nothing is known yet
+            gh::set_identity(None);
+            let mut a = App::build_start(
+                Some("o/r".into()),
+                false,
+                Theme::new(false, IconSet::Unicode, true),
+                true,
+                Config::default(),
+            );
+            assert!(
+                a.identity_wait && gh::identity().is_none(),
+                "the first load waits"
+            );
+            assert!(a.status.contains("who you are"), "{}", a.status);
+            wait(&mut a, "the first load", |a| {
+                !a.identity_wait && !a.panels[0].loading && a.meta.is_some()
+            });
+            a
+        };
+        let a = start();
+        assert_eq!(
+            gh::identity(),
+            Some(("github.com".into(), "octocat".into()))
+        );
+        assert_eq!((calls_of("api user"), calls_of("api graphql")), (1, 1));
+        assert_eq!(a.panels[0].items.len(), 2);
+        // the lists and the facts were stored under the resolved login: the next start asks for them
+        // from disk and makes no startup request at all, only the one question about the login
+        let b = start();
+        assert_eq!(b.panels[0].items.len(), 2, "shown from the cache");
+        assert_eq!((calls_of("api user"), calls_of("api graphql")), (2, 1));
+        // a failed question (an empty answer) still loads, without the cache: the app never waits on it
+        let before = calls_of("api graphql");
+        gh::set_identity(None);
+        let mut c = live("");
+        c.identity_wait = true;
+        c.tx.send(Msg::Identity("github.com".into(), String::new()))
+            .unwrap();
+        c.poll();
+        assert!(
+            !c.identity_wait && gh::identity().is_none(),
+            "nothing is made up"
+        );
+        wait(&mut c, "the load", |a| {
+            !a.panels[0].loading && a.meta.is_some()
+        });
+        assert_eq!(calls_of("api graphql"), before + 1, "it went to GitHub");
+        // and an implausible login is never adopted
+        gh::resolve_identity("github.com", "../../etc");
+        assert!(gh::identity().is_none());
     }
 
     #[test]

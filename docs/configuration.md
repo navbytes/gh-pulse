@@ -169,7 +169,7 @@ whole cache off; `gh-tui --clear-cache` deletes it.
 | Labels, issue/PR templates, workflow YAML, tags, organizations | see above | `gh/...` (gh's own entries, via `gh api --cache`) | URL + token + request (verified: another token misses the cache) |
 
 Templates and workflow files are raw text from the repo you opened, private repos included. If something cannot be
-tied to your login (a token from the environment rather than `gh auth login`), it is not cached at all. Never
+tied to your login, it is not cached at all. The login comes from `gh`'s own `hosts.yml`; when a token from the environment (`GH_TOKEN`, `GITHUB_TOKEN`, or `GH_ENTERPRISE_TOKEN` for another host) is set it overrides what `gh auth login` stored and `hosts.yml` cannot say whose requests these are, so gh-tui asks GitHub once at startup (`gh api user`: one REST call, and the first load waits for the answer) and caches under that login. If that call fails nothing is cached for the run. Never
 cached: tokens, notifications, logs, anything from a write. `r` / `R` fetch fresh data (`r` the selected item and its
 list, `R` everything), skipping the disk copy.
 

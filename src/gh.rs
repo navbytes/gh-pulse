@@ -953,8 +953,16 @@ pub fn host() -> String {
         .unwrap_or_else(|| "github.com".into())
 }
 
+/// A login as GitHub spells them (plus `_` and `.` for odd hosts): safe to use in a file name.
+fn valid_login(u: &str) -> bool {
+    !u.is_empty()
+        && u.len() <= 100
+        && u.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+}
+
 /// The active login for `host` as gh's own `hosts.yml` records it: a local read, no API call, and
-/// never the token. None when it isn't recorded (a token from the environment, say).
+/// never the token. None when it isn't recorded.
 pub fn login_in(hosts_yml: &str, host: &str) -> Option<String> {
     let mut in_host = false;
     for l in hosts_yml.lines() {
@@ -962,13 +970,33 @@ pub fn login_in(hosts_yml: &str, host: &str) -> Option<String> {
             in_host = l.trim_end().strip_suffix(':') == Some(host);
         } else if in_host && let Some(u) = l.trim().strip_prefix("user:") {
             let u = u.trim().trim_matches(['"', '\'']);
-            let ok = !u.is_empty()
-                && u.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
-            return ok.then(|| u.to_string());
+            return valid_login(u).then(|| u.to_string());
         }
     }
     None
+}
+
+/// Does the environment carry a token for `host`? Such a token overrides whatever `gh auth login`
+/// stored, so `hosts.yml` cannot say whose requests these are.
+pub fn env_token_in(host: &str, var: impl Fn(&str) -> Option<String>) -> bool {
+    let set = |n: &str| var(n).is_some_and(|v| !v.trim().is_empty());
+    if host == "github.com" || host.ends_with(".ghe.com") {
+        set("GH_TOKEN") || set("GITHUB_TOKEN")
+    } else {
+        set("GH_ENTERPRISE_TOKEN") || set("GITHUB_ENTERPRISE_TOKEN")
+    }
+}
+
+/// The identity `hosts.yml` gives, unless a token from the environment is in charge of the account.
+pub fn stored_identity(
+    hosts_yml: Option<&str>,
+    host: &str,
+    env_token: bool,
+) -> Option<(String, String)> {
+    if env_token {
+        return None;
+    }
+    Some((host.to_string(), login_in(hosts_yml?, host)?))
 }
 
 #[cfg(test)]
@@ -982,6 +1010,26 @@ pub fn clear_identity() {
 #[cfg(test)]
 pub fn set_identity(id: Option<(String, String)>) {
     *IDENTITY.lock().unwrap() = Some(id);
+}
+
+/// The login asked of GitHub once (`gh api user`) when `hosts.yml` could not say, with its host.
+static RESOLVED: Mutex<Option<(String, String)>> = Mutex::new(None);
+
+/// Remember who the token is, as GitHub answered. Anything that is not a plausible login is ignored.
+pub fn resolve_identity(host: &str, login: &str) {
+    if !valid_login(login) {
+        return;
+    }
+    let id = (host.to_string(), login.to_string());
+    // tests pin the identity through their override, which also wins over a resolved one
+    #[cfg(test)]
+    {
+        *IDENTITY.lock().unwrap() = Some(Some(id));
+    }
+    #[cfg(not(test))]
+    if let Ok(mut r) = RESOLVED.lock() {
+        *r = Some(id);
+    }
 }
 
 /// (host, login) that on-disk caches are keyed by; None means nothing user-specific is cached.
@@ -1002,12 +1050,14 @@ pub fn identity() -> Option<(String, String)> {
             })
             .or_else(|| {
                 std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".config/gh"))
-            })?;
+            });
         let host = host();
-        let login = login_in(&std::fs::read_to_string(dir.join("hosts.yml")).ok()?, &host)?;
-        Some((host, login))
+        let env_token = env_token_in(&host, |n| std::env::var(n).ok());
+        let yml = dir.and_then(|d| std::fs::read_to_string(d.join("hosts.yml")).ok());
+        stored_identity(yml.as_deref(), &host, env_token)
     })
     .clone()
+    .or_else(|| RESOLVED.lock().ok().and_then(|r| r.clone()))
 }
 
 /// Repo facts alone (the fallback when the batched request failed).
@@ -2726,6 +2776,48 @@ pub fn checkout(repo: &str, n: u64) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_token_from_the_environment_means_hosts_yml_cannot_name_the_account() {
+        let yml = "github.com:\n    user: alice\n    git_protocol: https\n";
+        let alice = Some(("github.com".to_string(), "alice".to_string()));
+        assert_eq!(stored_identity(Some(yml), "github.com", false), alice);
+        // GH_TOKEN wins over what `gh auth login` stored, so the stored user may be someone else
+        assert_eq!(stored_identity(Some(yml), "github.com", true), None);
+        assert_eq!(
+            stored_identity(None, "github.com", false),
+            None,
+            "no hosts.yml"
+        );
+        // which variables count, per host; blank ones do not
+        let with = |names: &'static [&'static str]| {
+            move |n: &str| names.contains(&n).then(|| "token".to_string())
+        };
+        assert!(env_token_in("github.com", with(&["GH_TOKEN"])));
+        assert!(env_token_in("github.com", with(&["GITHUB_TOKEN"])));
+        assert!(!env_token_in("github.com", with(&["GH_ENTERPRISE_TOKEN"])));
+        assert!(env_token_in(
+            "ghe.example.com",
+            with(&["GH_ENTERPRISE_TOKEN"])
+        ));
+        assert!(env_token_in(
+            "ghe.example.com",
+            with(&["GITHUB_ENTERPRISE_TOKEN"])
+        ));
+        assert!(!env_token_in("ghe.example.com", with(&["GH_TOKEN"])));
+        assert!(env_token_in("acme.ghe.com", with(&["GH_TOKEN"])));
+        assert!(!env_token_in("github.com", |_| Some("  ".to_string())));
+        assert!(!env_token_in("github.com", |_| None));
+        // a stored login that is not a plausible name is not used as a file name
+        assert_eq!(
+            login_in("github.com:\n    user: ../etc\n", "github.com"),
+            None
+        );
+        assert_eq!(
+            login_in("github.com:\n    user: octo-cat_1.x\n", "github.com").as_deref(),
+            Some("octo-cat_1.x")
+        );
+    }
+
     #[test]
     fn the_local_repo_comes_from_git_remotes_without_an_api_call() {
         let r = |s: &str| repo_from_remotes(s, "github.com");
