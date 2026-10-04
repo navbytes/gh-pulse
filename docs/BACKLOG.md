@@ -11,7 +11,6 @@
 - Syntax highlighting: after jumping far into a huge diff, scrolling back up through the skipped lines shows them plain.
 - Inbox: `Enter` looks for a PR/issue in the *open* lists; a merged/closed one is opened on GitHub in the browser instead (no in-app view of closed items). Only unread notifications are listed (the API default); 100 at most.
 - Tag detail makes two API calls per selected tag (commit, release); the Tags tab lists 300 at most (`300+`).
-- README's "Diff view" block and screenshots still show the old 8-panel layout until they are regenerated.
 - Tab counts are fetched in full (one list call per hidden tab) unless a fresh copy of that list is in the disk cache, which they now share; a cheaper count endpoint per source could still replace that.
 - The cache identity comes from gh's `hosts.yml` (`user:`) unless `GH_TOKEN` / `GITHUB_TOKEN` (or the enterprise variants) is set: that token overrides what `gh auth login` stored, so gh-tui asks GitHub once at startup (`gh api user`, one REST call) and holds the first load until it answers. If that call fails the app loads without the on-disk cache.
 - API throttling: in-flight `gh` processes for work the user moved past are left to finish (not killed). Counts for search-backed tabs have no cheap source (they show `?` until opened).

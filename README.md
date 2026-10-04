@@ -16,7 +16,7 @@ see, gh-tui can see.
 ## Screenshots
 
 Captured from the real binary (`scripts/screenshots.py`) on public repositories: gh-tui itself (its own merged PRs, CI runs
-and v0.1.0 release) and [cli/cli](https://github.com/cli/cli) for the comment thread. The **global home** shots further down
+and v0.1.0 release) and [cli/cli](https://github.com/cli/cli) for the comment thread. The **global home** shots further down (and the keybindings menu)
 use **synthetic data**: the binary runs against a fake `gh` (`scripts/fake-gh`) serving made-up users, orgs, repos, PRs and
 notifications, so nothing of a real account appears.
 
@@ -48,16 +48,13 @@ notifications, so nothing of a real account appears.
 ![Confirm popup](docs/img/8b-confirm.png)
 *Every action is confirmed first and shows the exact `gh` command it will run (only `y` runs it; this one was cancelled).*
 
-![Help](docs/img/9-help.png)
-*`?` lists every key.*
-
 ![Compact layout at 80x24](docs/img/10-compact.png)
 *At 80x24 the panels shrink to short titles and the key hints truncate.*
 
 ### Global home (synthetic data)
 
 ![Global home](docs/img/11-global-home.png)
-*Started outside a repo: **Review requested**, **My PRs**, **Issues** and **Repos** on the left, the selected item's Overview on the right. Rows read `owner/repo#N`.*
+*Started outside a repo: **Review requested**, **My PRs**, **Issues** and **Repos** on the left, the selected item's Overview on the right. Rows read `age owner/repo#N` (the age is the time since the last update); the header shows the scope and the PR window (`PRs: 7d`, `W` cycles it).*
 
 ![Cross-repo diff](docs/img/12-global-diff.png)
 *Diff tab zoomed with `f`, split layout: diffs, checks and comments work on a row from any repo without switching.*
@@ -77,7 +74,13 @@ notifications, so nothing of a real account appears.
 ![Global home at 80x24](docs/img/17-global-compact.png)
 *The global home at 80x24.*
 
-Regenerate with `GH_TUI_SHOT_BLOCKLIST=word,word python3 scripts/screenshots.py` (needs `pyte`, `rsvg-convert` and `cargo build --release`; public repos only; the blocklist aborts a shot if a private string shows). The global-home shots are `python3 scripts/screenshots.py --fake [shot ...]`: offline, synthetic data from [scripts/fake-gh](scripts/fake-gh/README.md), in a throwaway `HOME` and config.
+![Grouped by author](docs/img/18-grouped.png)
+*`g` groups the list by PR author (again: by repo): each heading shows the count and the longest wait, and the group that has waited longest comes first.*
+
+![Keybindings menu](docs/img/19-help.png)
+*`?` opens the keybindings menu: grouped rows with a key column, a cursor, and `/` to filter them.*
+
+Regenerate with `GH_TUI_SHOT_BLOCKLIST=word,word python3 scripts/screenshots.py` (needs `pyte`, `rsvg-convert` and `cargo build --release`; public repos only; the blocklist aborts a shot if a private string shows). The global-home shots (11-19, including the grouped list and the `?` menu) are `python3 scripts/screenshots.py --fake [shot ...]`: offline, synthetic data from [scripts/fake-gh](scripts/fake-gh/README.md), in a throwaway `HOME` and config.
 
 ## Features
 

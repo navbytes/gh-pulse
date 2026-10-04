@@ -4,7 +4,7 @@
 Usage: GH_TUI_SHOT_BLOCKLIST=a,b scripts/screenshots.py [--fake] [shot ...]   (needs `pip install pyte`,
 `cargo build --release`; PNG conversion uses rsvg-convert if present). Read-only: never confirms an action.
 The header login becomes `you`, the unread badge is blanked, and a shot is aborted if a blocklisted string shows.
-`--fake` renders the global-home shots (11-17) offline against scripts/fake-gh, a `gh` stub with synthetic data,
+`--fake` renders the global-home shots (11-19, incl. the `?` menu) offline against scripts/fake-gh, a `gh` stub with synthetic data,
 in a throwaway HOME/config/state; your own account is never read.
 """
 import fcntl, html, os, pty, re, select, shutil, signal, struct, subprocess, sys, tempfile, termios, time
@@ -211,8 +211,6 @@ def s_menu(t):
     pr(t, [5]); t.send('x', 1)
 def s_confirm(t):  # picks Approve and stops at the confirm popup; 'y' is never sent
     pr(t, [5]); t.send('x', 1); t.send('j', .5); t.send('\r', 1); t.send('\x13', 1)  # Ctrl-S on the comment popup opens the confirm
-def s_help(t):
-    pr(t, [5]); t.send('?', 1)
 def s_compact(t):
     pr(t, [])  # the narrow layout moves the detail pane, so the row search in pr() would never match
     for _ in range(120):
@@ -233,7 +231,6 @@ SHOTS = {  # name -> (repo, steps, (cols, rows))
     '7-releases': (GP, s_releases, (140, 40)),
     '8-menu': (GP, s_menu, (140, 40)),
     '8b-confirm': (GP, s_confirm, (140, 40)),
-    '9-help': (GP, s_help, (140, 40)),
     '10-compact': (GP, s_compact, (80, 24)),
 }
 
@@ -266,6 +263,8 @@ def g_scope(t): g_home(t); t.send('s', 1)
 def g_repos(t): g_home(t); t.send('4', 2); t.send('j', .8)
 def g_browser(t): t.send('B', 3); t.send('\r', .8); t.send('.', 1)  # Enter leaves the search box; `.` shows the hidden repos
 def g_inbox(t): t.send('N', 3)
+def g_grouped(t): g_home(t); t.send('g', 1)  # g: group the list by PR author
+def g_help(t): g_home(t); t.send('?', 1)  # the keybindings menu over the global home
 
 
 FAKE_SHOTS = {  # name -> (steps, (cols, rows)); synthetic data from scripts/fake-gh
@@ -276,6 +275,8 @@ FAKE_SHOTS = {  # name -> (steps, (cols, rows)); synthetic data from scripts/fak
     '15-repo-browser': (g_browser, (140, 40)),
     '16-inbox': (g_inbox, (140, 40)),
     '17-global-compact': (g_home, (80, 24)),
+    '18-grouped': (g_grouped, (140, 40)),
+    '19-help': (g_help, (140, 40)),
 }
 
 
