@@ -22,6 +22,7 @@ Press `?` in the app for the same list. Keys are checked against `src/app.rs` (`
 | `r` | Refresh the selected item (its cached details) and the list tab it is in, skipping the on-disk cache |
 | `R` | Reload everything, skipping the on-disk cache |
 | `L` | Toggle the command log strip |
+| `E` | Edit the config in `$VISUAL` / `$EDITOR`, then apply it (see [configuration.md](configuration.md#editing-the-config)) |
 | `f` | Zoom the right pane to full width; `f` or `Esc` restores |
 | `B` / `Ctrl-r` | Repo browser (full screen) |
 | `N` | Inbox (full screen): unread notifications across repos. `j` `k` `g` `G` move, `Enter` opens the PR/issue in the app (switching repo; a closed or merged one opens in the browser), `m` marks read (confirm shows `gh api -X PATCH notifications/threads/<id>`), `o` opens in the browser, `r` refreshes, `N` / `Esc` / `q` close. Hidden repos are filtered |

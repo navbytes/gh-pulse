@@ -8,10 +8,34 @@ It does not migrate files. The same directory fallback applies to state and cach
 - An invalid file (syntax error, unknown key, bad value, clashing key binding) stops startup with a message like
   `~/.config/gh-tui/config.toml:7: unknown field `theem``, exit code 2. Nothing is ignored silently.
 - Command-line flags override the file.
-- The file is written by the repo browser (favorites, hidden). Saves are atomic (temp file + rename) and refused
-  if the file currently fails to parse, so hand edits in progress are never overwritten. Comments are not
-  preserved when the app rewrites the file.
+- The app writes only the `[repos]` favorites and hidden lists (when you press `f` or `H`), in place: your comments,
+  ordering and every other line stay exactly as you wrote them. Saves are atomic (temp file + rename) and refused
+  if the file currently fails to load, so hand edits in progress are never overwritten.
 - It never contains credentials. Authentication belongs to `gh`.
+
+## Editing the config
+
+You edit the file in your own editor; gh-tui helps you get there and picks the result up.
+
+| | |
+|---|---|
+| `E` (action `edit_config`) | In gh-tui: opens the config in `$VISUAL`, else `$EDITOR`, else `vi`; on exit the file is applied. |
+| `gh-tui --edit-config` | The same without the UI; afterwards it says `ok` or names the line that is wrong (exit code 1). |
+| `gh-tui --print-config` | Prints the commented default config and exits (`gh-tui --print-config > config.toml` to start one by hand). |
+| `gh-tui --config-path` | Prints where the file lives. |
+
+The first time, the file is created from a commented template: **every setting is listed with its default, commented
+out**, each with a one-line note. A line that starts with `#` directly followed by a name (`#window = "7d"`) is a
+setting: remove the `#` (and the one in front of its `[table]` header) to change it. Lines that start with `# ` are
+notes. Because defaults stay commented, a new release can change a default without leaving a stale copy in your file.
+The file is never created behind your back: only `E`, `--edit-config` or saving a favorite writes it.
+
+When the editor exits the file is loaded again. A mistake (a typo'd key, a bad value, a clashing key binding) shows
+`config not applied (E to fix it): file:line: message` and the old settings stay in force. What applies **now**: theme
+and icons (`theme`, `ascii`, `nerd`), `[keys]`, `sync_viewed`, `[cache]`, `[api]` except `max_concurrent`,
+`[ui] window`, and `[repos]`. What needs a **restart** (the status line names it): `[panels]` and `[[sections]]`, `[ui] start`,
+`[api] max_concurrent`. Command-line flags still override the file. Editors that return at once (`code`, `subl`, `zed`)
+need their wait flag, e.g. `EDITOR="code --wait"`, or the file is read before you have saved.
 
 ## Example
 
@@ -322,6 +346,7 @@ Keys are a single character (case matters: `C` is shift-c), `ctrl-<letter>`, or 
 | `help` | `?` | Help popup |
 | `refresh` | `r` | Refresh the selected item and its list tab |
 | `refresh_all` | `R` | Reload everything (skips the cache) |
+| `edit_config` | `E` | Open the config in your editor and apply it on exit |
 | `actions` | `x` | Action menu |
 | `approve` | `a` | Approve (PRs) |
 | `comment` | `C` | Comment |

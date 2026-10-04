@@ -3,6 +3,20 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+- Edit the config in your own editor: `E` (action `edit_config`) opens it in `$VISUAL` / `$EDITOR` and applies it when
+  the editor exits; `gh-tui --edit-config` does the same without the UI and checks the result. The first time, the file
+  is created from a commented template that lists every setting with its default and a note (`gh-tui --print-config`
+  prints it, `gh-tui --config-path` says where the file lives). Theme and icons, key bindings, cache and API settings,
+  the window and favorites/hidden repos apply at once; panels, sections, `[ui] start` and `[api] max_concurrent` are
+  named as needing a restart. A mistake is reported with its line and the old settings stay in force.
+
+### Changed
+- Pressing `f` or `H` on a repo now edits only the `[repos]` lists in `config.toml`, in place, instead of rewriting the
+  whole file: your comments, ordering and every other setting are left exactly as written.
+
 ## [0.4.0]
 
 ### Added

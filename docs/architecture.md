@@ -16,10 +16,13 @@ gh-tui is a single binary: a synchronous ratatui event loop that talks to GitHub
 | `src/syn.rs` | syntect highlighter (cargo feature `syntax`, on by default); a no-op stub with `--no-default-features` |
 | `src/pool.rs` | The worker pool every `gh` job runs on: two queues (user first), a cap on processes in flight, stale-job dropping, background work standing down under rate pressure |
 | `src/rate.rs` | Shared quota state (graphql / core / search, backoff), thresholds, the chip and pause rules (pure, take `now`) |
-| `src/cache.rs` | `0600` JSON cache in `$XDG_CACHE_HOME/gh-tui` (repo list, repo facts) and the directory `gh --cache` uses |
+| `src/cache.rs` | `0600` JSON cache store in `$XDG_CACHE_HOME/gh-tui` (entries with a stored time, byte-and-count pruning) and the directory `gh --cache` uses |
+| `src/dcache.rs` | PR/issue lists and details on top of that store: the freshness rules per kind of data (`updatedAt` stamps, TTL tiers from `[cache]`), per-account keys, cleaning on read |
+| `src/help.rs` | The rows of the `?` keybindings menu (section, key, description) and its filter |
+| `src/editor.rs` | Finding `$VISUAL` / `$EDITOR`, creating the config from the template on first use, running the editor |
 | `src/global.rs` | The global home: scopes, the exact `gh search` arguments per section / tab / favorites chunk, merge-and-sort, hidden-repo filtering with top-up, the organizations list, Repos-panel rows |
 | `src/start.rs` | The start decision (`auto` / `repo` / `global` x `-R` x clone), pure and table-tested |
-| `src/config.rs` | `config.toml` model (incl. `[panels]` layout and tab sets, `[[sections]]` and the filter parser), validation with line numbers, atomic save, the named-action `Keymap` |
+| `src/config.rs` | `config.toml` model (incl. `[panels]` layout and tab sets, `[[sections]]` and the filter parser), validation with line numbers, `save_repos` (edits only the `[repos]` lists in place with `toml_edit`, keeping comments), the commented default template (`src/config.default.toml`, kept equal to the defaults by a test), the named-action `Keymap` |
 | `src/browse.rs` | Repo browser: GraphQL page parser, filter/sort/favorite/hide logic, browser key handling |
 | `src/md.rs` | Markdown to styled, wrapped lines (pulldown-cmark): headings, code, quotes, lists, tables, folding of `<details>` and long comments |
 | `src/sanitize.rs` | Makes bidi/zero-width/control characters visible (`<U+202E>`) in everything GitHub-sourced and in confirm-popup commands |

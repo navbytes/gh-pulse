@@ -214,6 +214,11 @@ pub fn entries(app: &App) -> Vec<Entry> {
         k(Act::RefreshAll),
         "reload everything (skips the cache)",
     );
+    add(
+        "Anywhere",
+        k(Act::EditConfig),
+        "edit the config in your editor, applied when it exits",
+    );
     add("Anywhere", k(Act::CommandLog), "command log");
     add("Anywhere", k(Act::Help), "this menu");
     add("Anywhere", k(Act::Quit), "quit");

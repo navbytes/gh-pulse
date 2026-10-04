@@ -140,10 +140,13 @@ fn edit_config_in_tui(
     crossterm::execute!(
         out,
         crossterm::terminal::EnterAlternateScreen,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
         EnableMouseCapture,
         EnableBracketedPaste
     )?;
-    term.clear()?;
+    // a fresh terminal repaints everything; `Terminal::clear` would ask the terminal where the cursor
+    // is, and wait for an answer a slow link (or a terminal that never answers) may not give
+    *term = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
     if let Err(e) = edited {
         app.set_status(format!("editor: {e}"));
         return Ok(());
