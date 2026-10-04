@@ -1,6 +1,7 @@
 use crate::act::{self, Action, FormKind, Sel};
 use crate::browse::{self, Browser, Out, RepoRow};
 use crate::config::{self, Act, Config, Keymap, PanelName, TabDef};
+use crate::custom;
 use crate::dcache;
 use crate::diff::{self, DiffMode};
 use crate::form::{self, Form};
@@ -376,6 +377,8 @@ impl Confirm {
 
 pub enum Modal {
     Menu(Vec<Action>, usize),
+    /// An `[[actions]]` command with `confirm = true`: shown in full, run on `y`.
+    Run(Box<custom::Prepared>),
     Input {
         title: &'static str,
         buf: String,
@@ -679,6 +682,8 @@ pub struct App {
     pub group: GroupBy,
     /// `E` was pressed: the main loop hands the terminal to the editor, then calls `apply_config`.
     edit_config: bool,
+    /// A foreground `[[actions]]` command: the main loop hands it the terminal.
+    pending_run: Option<custom::Prepared>,
     /// The first load waits until the login is known, so that it can use the on-disk cache.
     identity_wait: bool,
     pub help_typing: bool,
@@ -1027,6 +1032,7 @@ impl App {
             window,
             group: GroupBy::None,
             edit_config: false,
+            pending_run: None,
             identity_wait: false,
             help_typing: false,
             help_top: Cell::new(0),
@@ -1703,6 +1709,72 @@ impl App {
     /// True once after `E` was pressed.
     pub fn take_edit_config(&mut self) -> bool {
         std::mem::take(&mut self.edit_config)
+    }
+
+    /// The foreground `[[actions]]` command waiting for the terminal, once.
+    pub fn take_run(&mut self) -> Option<custom::Prepared> {
+        self.pending_run.take()
+    }
+
+    /// The `[[actions]]` entries that apply to the selected row, as menu rows.
+    fn custom_actions(&self) -> Vec<Action> {
+        let Some(it) = self.selected() else {
+            return vec![];
+        };
+        self.cfg
+            .actions
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.applies_to(it.kind))
+            .map(|(i, a)| Action {
+                label: a.name.clone(),
+                prompt: None,
+                build: Box::new(|_| vec![]),
+                local_of: None,
+                form: None,
+                custom: Some(i),
+            })
+            .collect()
+    }
+
+    /// Prepare `[[actions]]` entry `i` for the selected row; with `confirm` it opens the popup first.
+    fn start_custom(&mut self, i: usize) -> Option<Modal> {
+        let a = self.cfg.actions.get(i)?.clone();
+        let Some(it) = self.selected().filter(|it| a.applies_to(it.kind)) else {
+            self.status = format!("{}: not available on this row", a.name);
+            return None;
+        };
+        if !it.repo_ok() {
+            self.status = "this repo's name looks unsafe: actions are disabled for it".into();
+            return None;
+        }
+        match a.prepare(&custom::Vars::of(it)) {
+            Err(e) => {
+                self.status = e;
+                None
+            }
+            Ok(p) if a.confirm => Some(Modal::Run(Box::new(p))),
+            Ok(p) => {
+                self.launch(p);
+                None
+            }
+        }
+    }
+
+    fn launch(&mut self, p: custom::Prepared) {
+        match p.mode {
+            custom::Mode::Foreground => self.pending_run = Some(p),
+            custom::Mode::Detach => {
+                self.status = format!("{}: started", p.name);
+                let tx = self.tx.clone();
+                custom::spawn_detached(&p, move |r| {
+                    // success is silent after "started"; only a failure interrupts
+                    if let Err(e) = r {
+                        let _ = tx.send(Msg::Status(Err(e)));
+                    }
+                });
+            }
+        }
     }
 
     pub fn set_status(&mut self, s: impl Into<String>) {
@@ -3380,6 +3452,10 @@ impl App {
         if let Some(a) = self.keys.get(&k) {
             return self.run_act(a, k);
         }
+        if let Some(i) = self.keys.custom(&k) {
+            self.modal = self.start_custom(i);
+            return false;
+        }
         match k.code {
             KeyCode::Tab => self.set_focus(self.focus + 1),
             KeyCode::BackTab => self.set_focus(self.focus + self.panels.len() - 1),
@@ -3504,6 +3580,8 @@ impl App {
         );
         if let Some(f) = filter {
             items.retain(|a| a.label.starts_with(f));
+        } else {
+            items.extend(self.custom_actions());
         }
         match items.len() {
             0 => self.status = "no such action here".into(),
@@ -3513,6 +3591,9 @@ impl App {
     }
 
     fn pick(&mut self, a: Action) -> Option<Modal> {
+        if let Some(i) = a.custom {
+            return self.start_custom(i);
+        }
         if let Some(kind) = a.form {
             return self.form_for(kind);
         }
@@ -4300,7 +4381,7 @@ impl App {
     }
 
     /// `r`: just the selected item (its cached details) and the list tab it sits in.
-    fn refresh_selected(&mut self) {
+    pub fn refresh_selected(&mut self) {
         // a search for this section is already out: asking again would only spend the minute's budget
         let p = &self.panels[self.focus];
         if self.ctx.is_none() && p.kind.is_global_search() && p.loading {
@@ -4365,6 +4446,14 @@ impl App {
                     let i = mv(i, items.len());
                     Some(Modal::Menu(items, i))
                 }
+            },
+            Modal::Run(p) => match k.code {
+                KeyCode::Char('y') => {
+                    self.launch(*p);
+                    None
+                }
+                KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => None,
+                _ => Some(Modal::Run(p)),
             },
             Modal::Input {
                 title,
@@ -7753,5 +7842,126 @@ mod tests {
             b.status
         );
         assert!(std::fs::read_dir(&target).unwrap().next().is_none());
+    }
+
+    fn with_actions(toml: &str) -> App {
+        let mut a = home();
+        a.cfg = config::parse(toml, "t").unwrap();
+        a.keys = Keymap::build(&a.cfg.keys)
+            .unwrap()
+            .bind_actions(&a.cfg.actions)
+            .unwrap();
+        a.panels[0].items = vec![gitem("a/b", 7)];
+        a.panels[0].unloaded = false;
+        a.focus = 0;
+        a
+    }
+
+    const REVIEW: &str = "[[actions]]\nname = \"Claude review\"\non = \"pr\"\nrun = [\"claude\", \"Review {url}\"]\n\n[[actions]]\nname = \"Open a branch\"\non = \"branch\"\nrun = [\"true\"]\n";
+
+    #[test]
+    fn the_menu_offers_the_actions_that_fit_the_row() {
+        let mut a = with_actions(REVIEW);
+        press(&mut a, 'x');
+        let Some(Modal::Menu(items, _)) = &a.modal else {
+            panic!("menu")
+        };
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"Claude review"), "{labels:?}");
+        assert!(!labels.contains(&"Open a branch"), "a PR is not a branch");
+        assert_eq!(labels.last(), Some(&"Claude review"), "after the built-ins");
+    }
+
+    #[test]
+    fn a_foreground_action_hands_its_filled_in_command_to_the_main_loop() {
+        let mut a = with_actions(REVIEW);
+        press(&mut a, 'x');
+        let n = match &a.modal {
+            Some(Modal::Menu(items, _)) => items.len() - 1,
+            _ => panic!("menu"),
+        };
+        for _ in 0..n {
+            press(&mut a, 'j');
+        }
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(a.modal.is_none(), "no confirm unless asked for");
+        let p = a.take_run().expect("waiting for the terminal");
+        assert_eq!(p.argv, ["claude", "Review https://github.com/a/b/pull/7"]);
+        assert_eq!(p.name, "Claude review");
+        assert!(a.take_run().is_none(), "once");
+    }
+
+    #[test]
+    fn confirm_shows_the_command_and_runs_only_on_y() {
+        let mut a = with_actions(
+            "[[actions]]\nname = \"Ask\"\non = \"pr\"\nrun = [\"echo\", \"{repo}\"]\nconfirm = true\n",
+        );
+        a.modal = a.start_custom(0);
+        assert!(matches!(a.modal, Some(Modal::Run(_))));
+        press(&mut a, 'n');
+        assert!(a.modal.is_none() && a.take_run().is_none(), "n cancels");
+        a.modal = a.start_custom(0);
+        press(&mut a, 'x'); // anything else keeps it open
+        assert!(matches!(a.modal, Some(Modal::Run(_))));
+        press(&mut a, 'y');
+        assert!(a.modal.is_none());
+        assert_eq!(a.take_run().unwrap().argv, ["echo", "a/b"]);
+    }
+
+    #[test]
+    fn a_key_runs_the_action_on_the_selected_row() {
+        let mut a = with_actions(
+            "[[actions]]\nname = \"Rev\"\non = \"pr\"\nkey = \"ctrl-o\"\nrun = [\"echo\", \"{number}\"]\n",
+        );
+        a.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert_eq!(a.take_run().unwrap().argv, ["echo", "7"]);
+        // the wrong kind of row says so
+        a.panels[0].items[0].kind = Kind::Branch;
+        a.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(
+            a.take_run().is_none() && a.status.contains("not available"),
+            "{}",
+            a.status
+        );
+    }
+
+    #[test]
+    fn a_detached_action_starts_at_once_and_a_failure_reaches_the_status_line() {
+        let mut a = with_actions(
+            "[[actions]]\nname = \"Bg\"\non = \"pr\"\nmode = \"detach\"\nshell = \"echo nope >&2; exit 4\"\n",
+        );
+        a.modal = a.start_custom(0);
+        assert!(a.take_run().is_none(), "never takes the terminal");
+        assert_eq!(a.status, "Bg: started");
+        for _ in 0..200 {
+            a.poll();
+            if a.status != "Bg: started" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert_eq!(a.status, "Bg: exited with status 4: nope");
+    }
+
+    #[test]
+    fn an_action_never_runs_for_an_unsafe_repo_name() {
+        let mut a = with_actions(REVIEW);
+        a.panels[0].items[0].repo = "a/b; reboot".into();
+        a.modal = a.start_custom(0);
+        assert!(a.modal.is_none() && a.take_run().is_none());
+        assert!(a.status.contains("unsafe"), "{}", a.status);
+    }
+
+    #[test]
+    fn actions_with_keys_are_in_the_help_menu() {
+        let a = with_actions(
+            "[[actions]]\nname = \"Rev\"\non = \"pr\"\nkey = \"ctrl-o\"\nmode = \"detach\"\nrun = [\"true\"]\n",
+        );
+        let rows = crate::help::entries(&a);
+        let r = rows.iter().find(|e| e.section == "Your actions").unwrap();
+        assert_eq!(
+            (r.key.as_str(), r.desc.as_str()),
+            ("ctrl-o", "Rev, in the background")
+        );
     }
 }

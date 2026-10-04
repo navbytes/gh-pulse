@@ -27,3 +27,8 @@ unicode-width = "0.2"
 default = ["syntax"]
 # Syntax-highlighted diffs and code blocks (adds ~2.8 MB; `--no-default-features` gives the small plain build).
 syntax = ["dep:syntect"]
+
+# Already in the tree through crossterm. Used to keep Ctrl-C from ending gh-tui while a foreground
+# `[[actions]]` command owns the terminal (the command itself still gets it).
+[target.'cfg(unix)'.dependencies]
+signal-hook = { version = "0.3", default-features = false }

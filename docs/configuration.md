@@ -330,6 +330,70 @@ filter = "is:open (author:alice OR author:bob)"
 where  = "both"
 ```
 
+## Custom actions
+
+`[[actions]]` entries are commands you define and run on the selected row. They appear at the end of the `x` menu on
+the rows they fit, and on their own key if you give one (listed in the `?` menu). The idea is lazygit's custom
+commands: your command, your terminal.
+
+```toml
+# Talk it through with Claude, then come back
+[[actions]]
+name = "Claude review"
+on   = "pr"
+run  = ["claude", "Review {url}. Focus on correctness and security."]
+
+# A review per roost tab, while you keep triaging
+[[actions]]
+name = "Review in a roost tab"
+on   = "pr"
+mode = "detach"
+run  = ["roost", "spawn", "claude", "--tab", "--title", "pr-{number}", "--input", "Review {url}"]
+
+# The same in tmux, from a key
+[[actions]]
+name = "Review in a tmux window"
+on   = "pr"
+mode = "detach"
+key  = "ctrl-o"
+run  = ["tmux", "new-window", "-n", "pr-{number}", "claude", "Review {url}"]
+
+# A pipeline: row data arrives as variables
+[[actions]]
+name  = "Headless review to a file"
+on    = "pr"
+mode  = "detach"
+shell = 'claude -p "Review $GHTUI_URL" > ~/reviews/$GHTUI_OWNER-$GHTUI_NAME-$GHTUI_NUMBER.md'
+```
+
+| Key | Meaning |
+|---|---|
+| `name` | The menu label (unique, up to 40 characters). |
+| `on` | The rows it applies to: `pr`, `issue`, `repo`, `run`, `workflow`, `branch`, `release`, `tag` or `any`; one word or a list. While you are inside a PR (files, checks, comments, diff) the row is that PR. |
+| `run` | The command as a list. `{url}`, `{repo}` (`owner/name`), `{owner}`, `{name}`, `{number}`, `{kind}`, `{author}` and `{ref}` (the exact branch, tag or release name) are filled in per element. `{{` and `}}` give a literal brace. A typo is an error when the config loads. |
+| `shell` | Instead of `run`: a `sh -c` script for pipes and `&&`. Nothing is filled into it; row data comes as `$GHTUI_URL`, `$GHTUI_REPO`, `$GHTUI_OWNER`, `$GHTUI_NAME`, `$GHTUI_NUMBER`, `$GHTUI_KIND`, `$GHTUI_AUTHOR`, `$GHTUI_REF`, `$GHTUI_TITLE` and `$GHTUI_STATE`. `run` commands get the same variables. |
+| `mode` | `foreground` (default) or `detach`, below. |
+| `key` | A key that runs it from the list: `"ctrl-o"`, `"O"`. Built-in keys, navigation keys and other actions' keys are refused. |
+| `pause` | Foreground only. `true`: wait for Enter before returning; `false`: never. Unset: only when the command failed, so its error stays readable. |
+| `confirm` | `true` shows the full command and asks first. |
+
+**Foreground** (the default) is the terminal handoff `E` uses for your editor: gh-tui leaves the alternate screen, the
+command gets the real terminal (an interactive `claude`, `lazygit`, `vim`, `less`), and gh-tui comes back when it exits,
+re-reading the row it ran on, since the command may have changed it. Ctrl-C reaches the command and not gh-tui. A
+non-zero exit is shown in the status line.
+
+**Detach** starts the command and returns at once; gh-tui never gives up the terminal. Its output is discarded, it
+runs in its own process group, and it keeps running if you quit. `started` is shown, and only a failure
+(`name: exited with status 2: <last line of stderr>`) is reported afterwards. This is for commands that open
+somewhere else: `tmux new-window` / `split-window`, `roost spawn`, a browser, a notification.
+
+Trust: the commands are yours, run with your permissions, like `$EDITOR`. The data they run on is not: titles, branch
+names and authors are written by other people. So `{...}` becomes a whole argument and is never parsed by a shell, and
+the `shell` form gets `$GHTUI_*` variables instead of pasted text. Keep to those and a branch called `x; rm -rf ~` is
+only a strange name. Actions come only from your own `config.toml`, never from a repository. If your command hands a PR's
+text to an AI tool, treat that text as untrusted input to the tool: pass `{url}` and let it fetch what it needs, and
+don't give a reviewer on someone else's PR write or shell access.
+
 ## Syncing viewed marks with GitHub
 
 `v` always remembers viewed files locally (`$XDG_STATE_HOME/gh-tui/viewed.json`). With `sync_viewed = true` it also

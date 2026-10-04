@@ -232,6 +232,18 @@ pub fn entries(app: &App) -> Vec<Entry> {
     add("Anywhere", k(Act::CommandLog), "command log");
     add("Anywhere", k(Act::Help), "this menu");
     add("Anywhere", k(Act::Quit), "quit");
+    // your own [[actions]]: the ones with a key; the rest are in the x menu
+    for a in app.cfg.actions.iter().filter(|a| a.key.is_some()) {
+        let how = match a.mode {
+            crate::custom::Mode::Foreground => "",
+            crate::custom::Mode::Detach => ", in the background",
+        };
+        v.push(Entry {
+            section: "Your actions",
+            key: a.key.clone().unwrap_or_default(),
+            desc: format!("{}{how}", crate::sanitize::clean(&a.name)),
+        });
+    }
     v
 }
 

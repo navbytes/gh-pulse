@@ -3,6 +3,7 @@ mod app;
 mod browse;
 mod cache;
 mod config;
+mod custom;
 mod dcache;
 mod diff;
 mod dispatch;
@@ -117,6 +118,40 @@ fn edit_config_cli() -> std::io::Result<()> {
 }
 
 /// `E`: hand the terminal to the editor, take it back, and apply the file if it loads.
+/// Give the terminal to another program: leave the alternate screen and raw mode, run `f`, then take
+/// the terminal back with a fresh `Terminal` (a repaint of everything).
+fn hand_over<T>(term: &mut ratatui::DefaultTerminal, f: impl FnOnce() -> T) -> std::io::Result<T> {
+    let mut out = std::io::stdout();
+    crossterm::execute!(out, DisableMouseCapture, DisableBracketedPaste)?;
+    ratatui::restore();
+    let result = f();
+    crossterm::terminal::enable_raw_mode()?;
+    crossterm::execute!(
+        out,
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
+    // a fresh terminal repaints everything; `Terminal::clear` would ask the terminal where the cursor
+    // is, and wait for an answer a slow link (or a terminal that never answers) may not give
+    *term = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
+    Ok(result)
+}
+
+/// A foreground `[[actions]]` command: it gets the terminal, then the row it ran on is re-read, since
+/// the command may well have changed it (a review posted, a branch pushed).
+fn run_custom_in_tui(
+    term: &mut ratatui::DefaultTerminal,
+    app: &mut app::App,
+    p: custom::Prepared,
+) -> std::io::Result<()> {
+    let line = hand_over(term, || custom::run_foreground(&p))?;
+    app.refresh_selected();
+    app.set_status(line);
+    Ok(())
+}
+
 fn edit_config_in_tui(
     term: &mut ratatui::DefaultTerminal,
     app: &mut app::App,
@@ -133,21 +168,7 @@ fn edit_config_in_tui(
             return Ok(());
         }
     };
-    let mut out = std::io::stdout();
-    crossterm::execute!(out, DisableMouseCapture, DisableBracketedPaste)?;
-    ratatui::restore();
-    let edited = editor::edit(&path);
-    crossterm::terminal::enable_raw_mode()?;
-    crossterm::execute!(
-        out,
-        crossterm::terminal::EnterAlternateScreen,
-        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-        EnableMouseCapture,
-        EnableBracketedPaste
-    )?;
-    // a fresh terminal repaints everything; `Terminal::clear` would ask the terminal where the cursor
-    // is, and wait for an answer a slow link (or a terminal that never answers) may not give
-    *term = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
+    let edited = hand_over(term, || editor::edit(&path))?;
     if let Err(e) = edited {
         app.set_status(format!("editor: {e}"));
         return Ok(());
@@ -227,10 +248,12 @@ fn main() -> std::io::Result<()> {
         Some(p) => config::load_from(&p).unwrap_or_else(|e| die(&e)),
         None => config::Config::default(),
     };
-    let keys = config::Keymap::build(&cfg.keys).unwrap_or_else(|e| {
-        let at = config::path().map_or_else(|| "config".into(), |p| p.display().to_string());
-        die(&format!("{at}: {e}"))
-    });
+    let keys = config::Keymap::build(&cfg.keys)
+        .and_then(|k| k.bind_actions(&cfg.actions))
+        .unwrap_or_else(|e| {
+            let at = config::path().map_or_else(|| "config".into(), |p| p.display().to_string());
+            die(&format!("{at}: {e}"))
+        });
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         die("gh-tui needs an interactive terminal");
     }
@@ -279,8 +302,16 @@ fn main() -> std::io::Result<()> {
                     if app.take_edit_config() {
                         edit_config_in_tui(term, &mut app, look)?;
                     }
+                    if let Some(p) = app.take_run() {
+                        run_custom_in_tui(term, &mut app, p)?;
+                    }
                 }
-                Event::Mouse(m) if !matches!(m.kind, MouseEventKind::Moved) => app.on_mouse(m),
+                Event::Mouse(m) if !matches!(m.kind, MouseEventKind::Moved) => {
+                    app.on_mouse(m);
+                    if let Some(p) = app.take_run() {
+                        run_custom_in_tui(term, &mut app, p)?;
+                    }
+                }
                 Event::Paste(t) => app.on_paste(&t),
                 _ => {} // Resize: the next draw re-lays-out from the new size
             }

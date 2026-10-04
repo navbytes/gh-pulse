@@ -12,7 +12,7 @@ Press `?` in the app for the same list. Keys are checked against `src/app.rs` (`
 | `Ctrl-C` | Quit, from anywhere including popups |
 | `1`-`7` | Focus panel by number (`1` to the number of panels shown, at most `7`; `Tab` / `Shift-Tab` reach any beyond that, e.g. with custom `[[sections]]`; a PR drill-in has 4). Pressing the number of the already focused panel steps to its next list tab |
 | `Tab` / `Shift-Tab` | Next / previous panel |
-| `x` | Action menu for the selected item or row |
+| `x` | Action menu for the selected item or row, with your own `[[actions]]` at the end |
 | `a` | Approve (shortcut into the menu, PRs) |
 | `C` | Comment (PRs and issues) |
 | `m` | Merge (open PRs) |

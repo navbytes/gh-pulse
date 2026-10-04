@@ -504,6 +504,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "signal-hook",
  "syntect",
  "toml",
  "toml_edit",

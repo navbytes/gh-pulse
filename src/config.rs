@@ -28,6 +28,9 @@ pub struct Config {
     /// `[[sections]]`: your own search-based panels. Last, so the file stays valid TOML when saved.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sections: Vec<SectionCfg>,
+    /// `[[actions]]`: your own commands, run on the selected row.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<crate::custom::CustomCfg>,
 }
 
 /// Where gh-tui opens: the repo of the current directory, or the cross-repo home.
@@ -1006,6 +1009,12 @@ pub fn parse(src: &str, name: &str) -> Result<Config, String> {
             key_line(src, "[[sections]]", i, key)
         ));
     }
+    if let Err((i, key, msg)) = check_actions(&cfg.actions) {
+        return Err(format!(
+            "{name}:{}: {msg}",
+            key_line(src, "[[actions]]", i, key)
+        ));
+    }
     if let Err((section, key, msg)) = cfg.panels.check(&cfg.sections) {
         return Err(format!("{name}:{}: {msg}", key_line(src, section, 0, key)));
     }
@@ -1021,6 +1030,41 @@ pub fn parse(src: &str, name: &str) -> Result<Config, String> {
     Ok(cfg)
 }
 
+fn check_actions(acts: &[crate::custom::CustomCfg]) -> Result<(), (usize, &'static str, String)> {
+    use crate::custom::MAX_ACTIONS;
+    if acts.len() > MAX_ACTIONS {
+        return Err((
+            MAX_ACTIONS,
+            "name",
+            format!("actions: at most {MAX_ACTIONS} actions"),
+        ));
+    }
+    for (i, a) in acts.iter().enumerate() {
+        a.check().map_err(|(k, m)| (i, k, m))?;
+        if let Some(key) = &a.key {
+            let id = parse_key(key).map_err(|e| (i, "key", format!("actions.key: {e}")))?;
+            if reserved(id) {
+                return Err((
+                    i,
+                    "key",
+                    format!("actions.key: {key:?} is a built-in navigation key"),
+                ));
+            }
+        }
+        if acts[..i]
+            .iter()
+            .any(|b| b.name.eq_ignore_ascii_case(&a.name))
+        {
+            return Err((
+                i,
+                "name",
+                format!("actions.name: {} is used twice", shown(&a.name)),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// A missing file means defaults; an unreadable or invalid one is an error.
 pub fn load_from(path: &Path) -> Result<Config, String> {
     match std::fs::read_to_string(path) {
@@ -1034,7 +1078,9 @@ pub fn load_from(path: &Path) -> Result<Config, String> {
 /// the file (and the line, when it has one).
 pub fn load_checked(path: &Path) -> Result<(Config, Keymap), String> {
     let cfg = load_from(path)?;
-    let keys = Keymap::build(&cfg.keys).map_err(|e| format!("{}: {e}", path.display()))?;
+    let keys = Keymap::build(&cfg.keys)
+        .and_then(|k| k.bind_actions(&cfg.actions))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok((cfg, keys))
 }
 
@@ -1289,6 +1335,8 @@ pub fn parse_key(s: &str) -> Result<KeyId, String> {
 pub struct Keymap {
     by_key: HashMap<KeyId, Act>,
     shown: HashMap<Act, Vec<String>>,
+    /// Keys of `[[actions]]` entries, by index.
+    custom: HashMap<KeyId, usize>,
 }
 
 impl Keymap {
@@ -1338,7 +1386,36 @@ impl Keymap {
         Ok(Keymap {
             by_key,
             shown: want,
+            custom: HashMap::new(),
         })
+    }
+
+    /// Add the keys of `[[actions]]`; one that is already a built-in key or another action's is an error.
+    pub fn bind_actions(mut self, acts: &[crate::custom::CustomCfg]) -> Result<Keymap, String> {
+        for (i, a) in acts.iter().enumerate() {
+            let Some(k) = &a.key else { continue };
+            let id = parse_key(k).map_err(|e| format!("[[actions]] {:?}: {e}", a.name))?;
+            if let Some(act) = self.by_key.get(&id) {
+                return Err(format!(
+                    "[[actions]] {:?}: key {k:?} is already {}",
+                    a.name,
+                    act.name()
+                ));
+            }
+            if let Some(j) = self.custom.insert(id, i) {
+                return Err(format!(
+                    "[[actions]] {:?}: key {k:?} is also {:?}'s",
+                    a.name, acts[j].name
+                ));
+            }
+        }
+        Ok(self)
+    }
+
+    /// The `[[actions]]` entry bound to this key.
+    pub fn custom(&self, k: &KeyEvent) -> Option<usize> {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        self.custom.get(&(k.code, ctrl)).copied()
     }
 
     pub fn get(&self, k: &KeyEvent) -> Option<Act> {
@@ -1367,6 +1444,101 @@ impl Keymap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actions_parse_validate_and_bind_their_keys() {
+        let ok = parse(
+            "[[actions]]\nname = \"A\"\non = [\"pr\", \"issue\"]\nrun = [\"x\", \"{url}\"]\nkey = \"ctrl-o\"\n\n[[actions]]\nname = \"B\"\non = \"any\"\nmode = \"detach\"\nshell = \"true\"\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(ok.actions.len(), 2);
+        assert_eq!(ok.actions[1].mode, crate::custom::Mode::Detach);
+        let km = Keymap::build(&ok.keys)
+            .unwrap()
+            .bind_actions(&ok.actions)
+            .unwrap();
+        let ctrl_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert_eq!(km.custom(&ctrl_o), Some(0));
+
+        // errors name the line of the entry
+        let e = parse(
+            "\n[[actions]]\nname = \"A\"\non = \"prs\"\nrun = [\"x\"]\n",
+            "t",
+        )
+        .unwrap_err();
+        assert!(e.starts_with("t:4:") && e.contains("prs"), "{e}");
+        let e = parse(
+            "[[actions]]\nname = \"A\"\non = \"pr\"\nrun = [\"{nope}\"]\n",
+            "t",
+        )
+        .unwrap_err();
+        assert!(e.contains("{nope}"), "{e}");
+        let dup = "[[actions]]\nname = \"A\"\non = \"pr\"\nrun = [\"x\"]\n[[actions]]\nname = \"a\"\non = \"pr\"\nrun = [\"x\"]\n";
+        assert!(parse(dup, "t").unwrap_err().contains("used twice"));
+        // keys: navigation keys, built-ins and each other are refused
+        let with_key = |k: &str| {
+            format!("[[actions]]\nname = \"A\"\non = \"pr\"\nrun = [\"x\"]\nkey = \"{k}\"\n")
+        };
+        assert!(
+            parse(&with_key("j"), "t")
+                .unwrap_err()
+                .contains("navigation")
+        );
+        assert!(parse(&with_key("nonsense-key"), "t").is_err());
+        let c = parse(&with_key("r"), "t").unwrap();
+        let e = Keymap::build(&c.keys)
+            .unwrap()
+            .bind_actions(&c.actions)
+            .err()
+            .unwrap();
+        assert!(e.contains("already refresh"), "{e}");
+        let two = format!(
+            "{}{}",
+            with_key("ctrl-o"),
+            with_key("ctrl-o").replace("\"A\"", "\"B\"")
+        );
+        let c = parse(&two, "t").unwrap();
+        let e = Keymap::build(&c.keys)
+            .unwrap()
+            .bind_actions(&c.actions)
+            .err()
+            .unwrap();
+        assert!(e.contains("also"), "{e}");
+        // unknown keys inside an entry are errors, and the table is capped
+        assert!(
+            parse(
+                "[[actions]]\nname = \"A\"\non = \"pr\"\nrun = [\"x\"]\nwat = 1\n",
+                "t"
+            )
+            .is_err()
+        );
+        let many: String = (0..31)
+            .map(|i| format!("[[actions]]\nname = \"n{i}\"\non = \"pr\"\nrun = [\"x\"]\n"))
+            .collect();
+        assert!(parse(&many, "t").unwrap_err().contains("at most"));
+    }
+
+    #[test]
+    fn saving_favorites_keeps_the_actions_the_user_wrote() {
+        let dir = std::env::temp_dir().join(format!("gh-tui-actions-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let text = "# mine\n[[actions]]\nname = \"A\"  # review\non = \"pr\"\nrun = [\"claude\", \"{url}\"]\n";
+        std::fs::write(&path, text).unwrap();
+        let mut repos = ReposCfg::default();
+        repos.favorites.push("o/r".into());
+        save_repos(&path, &repos).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("name = \"A\"  # review") && after.contains("# mine"),
+            "{after}"
+        );
+        assert!(after.contains("o/r"));
+        assert_eq!(load_from(&path).unwrap().actions.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_cache_section_has_tiered_defaults_and_validates_ranges() {
