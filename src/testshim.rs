@@ -105,6 +105,7 @@ impl Drop for Shim {
         crate::gh::set_program(None);
         crate::rate::reset_for_test();
         crate::cache::set_dir(None);
+        crate::cache::set_slow(3600);
         crate::rate::set_limits(20, 10);
         crate::gh::set_timeout(60);
         crate::gh::clear_identity();

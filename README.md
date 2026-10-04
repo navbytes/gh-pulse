@@ -195,13 +195,16 @@ brings the old "not in a GitHub repo" message back).
 | `--ascii` | ASCII icons and borders. Also automatic when the locale is not UTF-8. |
 | `--nerd` | Nerd Font icons. |
 | `--clear-cache` | Delete gh-tui's on-disk cache (`~/.cache/gh-tui`) and exit. |
+| `--edit-config` | Open the config in `$VISUAL` / `$EDITOR` (created from the commented template if missing) and check it afterwards. `E` does this inside the app. |
+| `--print-config` | Print the commented default config (every setting with its default) and exit. |
+| `--config-path` | Print where the config file lives and exit. |
 
 gh-tui needs an interactive terminal; piping stdin/stdout prints a message and exits.
 
 ## Configuration
 
 Optional `~/.config/gh-tui/config.toml` (`$XDG_CONFIG_HOME` is honored): theme and icons, start mode, panels and
-tabs, custom sections, API tuning, favorite and hidden repos (written by the repo browser), and key remapping. Flags override the file; a missing file means
+tabs, custom sections, API tuning, cache times, favorite and hidden repos, and key remapping. Press `E` (or run `gh-tui --edit-config`) to edit it in your editor: the first time it is created from a template that lists every setting, commented out, with its default and a note. Only favorites and hidden repos are ever written by the app, in place, so your comments survive. Flags override the file; a missing file means
 defaults; an invalid file stops startup with `file:line: message`. See [docs/configuration.md](docs/configuration.md).
 The file never contains credentials; authentication stays entirely with `gh`.
 If `gh-tui` has no config directory and `gh-pulse` does, gh-tui keeps using the old directory for reads and writes.
@@ -284,6 +287,7 @@ The full reference is in [docs/keybindings.md](docs/keybindings.md). The essenti
 | Global | `x` | Action menu for the selected item |
 | Global | `o` `y` `c` | Open in browser / copy URL / check out PR |
 | Global | `r` `R` `L` | Refresh selected item / reload everything / command log |
+| Global | `E` | Edit the config in your editor (applied when it exits) |
 | Global | `B` `N` | Repo browser / inbox |
 | Global home | `G` | Swap between the repo home and the global home |
 | Global home | `s` `S` | Scope picker / open the row's repo (`G` returns) |

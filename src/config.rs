@@ -957,6 +957,12 @@ pub fn path() -> Option<PathBuf> {
     Some(crate::paths::data_dir(&base).join("config.toml"))
 }
 
+/// The commented default config: every setting with its default, ready to be uncommented. What
+/// `--print-config` prints and what a first `E` creates (a test keeps it equal to `Config::default()`).
+pub fn template() -> &'static str {
+    include_str!("config.default.toml")
+}
+
 /// 1-based line of `key` inside the `nth` table headed `header`; the header's line if the key is implied.
 fn key_line(src: &str, header: &str, nth: usize, key: &str) -> usize {
     let lines: Vec<&str> = src.lines().collect();
@@ -1024,19 +1030,100 @@ pub fn load_from(path: &Path) -> Result<Config, String> {
     }
 }
 
-/// Write to a temp file in the same directory, then rename over the target. Refuses to overwrite a
-/// file that no longer parses (the user may be mid-edit): their text is never clobbered.
-pub fn save_to(path: &Path, cfg: &Config) -> Result<(), String> {
-    load_from(path).map_err(|e| format!("not saving, config has errors: {e}"))?;
+/// Load the file and build its key bindings, as startup does: any problem is one message that names
+/// the file (and the line, when it has one).
+pub fn load_checked(path: &Path) -> Result<(Config, Keymap), String> {
+    let cfg = load_from(path)?;
+    let keys = Keymap::build(&cfg.keys).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok((cfg, keys))
+}
+
+/// Write `[repos] favorites` and `hidden` into the file, touching nothing else: comments, ordering and
+/// every other setting stay exactly as the user wrote them. The text goes to a temp file in the same
+/// directory and is renamed over the target. Refuses when the file currently fails to load (the user may
+/// be mid-edit): their text is never clobbered.
+pub fn save_repos(path: &Path, repos: &ReposCfg) -> Result<(), String> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    parse(&existing, &path.display().to_string())
+        .map_err(|e| format!("not saving, config has errors: {e}"))?;
+    let mut doc: toml_edit::DocumentMut = existing
+        .parse()
+        .map_err(|e| format!("not saving, config has errors: {e}"))?;
+    set_list(&mut doc, "favorites", &repos.favorites)?;
+    set_list(&mut doc, "hidden", &repos.hidden)?;
     let dir = path.parent().ok_or("bad config path")?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let body = toml::to_string_pretty(cfg).map_err(|e| e.to_string())?;
     let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, doc.to_string()).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         e.to_string()
     })
+}
+
+/// Make `[repos] <key>` hold `list`: entries the user wrote stay (with their comments and spacing) unless
+/// removed, new ones are appended, and an emptied list (and an emptied bare table) disappears.
+fn set_list(doc: &mut toml_edit::DocumentMut, key: &str, list: &[String]) -> Result<(), String> {
+    use toml_edit::{Array, Item, Table, value};
+    let same = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+    if list.is_empty() && doc.get("repos").and_then(|r| r.get(key)).is_none() {
+        return Ok(()); // nothing there, nothing to write
+    }
+    if doc.get("repos").is_none() {
+        doc.insert("repos", Item::Table(Table::new()));
+    }
+    let table = doc["repos"]
+        .as_table_like_mut()
+        .ok_or("not saving: `repos` in the config is not a table")?;
+    if list.is_empty() {
+        table.remove(key);
+    } else {
+        if table.get(key).is_none() {
+            table.insert(key, value(Array::new()));
+        }
+        let arr = table
+            .get_mut(key)
+            .and_then(Item::as_array_mut)
+            .ok_or_else(|| format!("not saving: `repos.{key}` in the config is not a list"))?;
+        arr.retain(|v| v.as_str().is_some_and(|s| list.iter().any(|x| same(x, s))));
+        let multiline = arr.iter().any(|v| {
+            v.decor()
+                .prefix()
+                .and_then(|p| p.as_str())
+                .is_some_and(|p| p.contains('\n'))
+        });
+        let many = arr.len() + list.len() > 2;
+        for x in list {
+            if !arr.iter().any(|v| v.as_str().is_some_and(|s| same(x, s))) {
+                arr.push(x.as_str());
+                if (multiline || many)
+                    && let Some(v) = arr.iter_mut().last()
+                {
+                    v.decor_mut().set_prefix("\n    ");
+                }
+            }
+        }
+        if multiline || many {
+            arr.set_trailing("\n");
+            arr.set_trailing_comma(true);
+        }
+    }
+    // a `[repos]` left with nothing in it (and no comment of its own) is not worth keeping
+    let bare = doc["repos"].as_table().is_some_and(|t| {
+        t.is_empty()
+            && t.decor()
+                .prefix()
+                .and_then(|p| p.as_str())
+                .is_none_or(|p| p.trim().is_empty())
+    });
+    if bare {
+        doc.remove("repos");
+    }
+    Ok(())
 }
 
 /// Named normal-mode actions whose keys can be remapped under `[keys]`.
@@ -1061,10 +1148,11 @@ pub enum Act {
     Inbox,
     Scope,
     SwitchRepoContext,
+    EditConfig,
 }
 
 impl Act {
-    pub const ALL: [Act; 19] = [
+    pub const ALL: [Act; 20] = [
         Act::Quit,
         Act::Help,
         Act::Refresh,
@@ -1084,6 +1172,7 @@ impl Act {
         Act::Inbox,
         Act::Scope,
         Act::SwitchRepoContext,
+        Act::EditConfig,
     ];
 
     pub fn name(self) -> &'static str {
@@ -1107,6 +1196,7 @@ impl Act {
             Act::Inbox => "inbox",
             Act::Scope => "scope",
             Act::SwitchRepoContext => "switch_repo_context",
+            Act::EditConfig => "edit_config",
         }
     }
 
@@ -1131,6 +1221,7 @@ impl Act {
             Act::Inbox => &["N"],
             Act::Scope => &["s"],
             Act::SwitchRepoContext => &["S"],
+            Act::EditConfig => &["E"],
         }
     }
 }
@@ -1399,42 +1490,237 @@ mod tests {
         assert!(err("[keys]\nactions = []\n").contains("at least one"));
     }
 
+    /// The template with every `#key = value` / `#[table]` line uncommented (notes start with "# ").
+    fn uncommented() -> String {
+        template()
+            .lines()
+            .map(|l| match l.strip_prefix('#') {
+                Some(r) if r.starts_with(|c: char| c.is_ascii_alphabetic() || c == '[') => r,
+                _ => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
-    fn atomic_save_round_trips_and_never_clobbers() {
-        let dir = std::env::temp_dir().join(format!("gh-tui-test-{}", std::process::id()));
+    fn the_template_is_the_default_config_with_every_setting_listed() {
+        // uncommenting every setting line loads, and changes nothing: they are exactly the defaults
+        let c = parse(&uncommented(), "template").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(c, Config::default());
+        // the shipped file is all comments until the user opts in
+        assert_eq!(parse(template(), "template").unwrap(), Config::default());
+        assert!(
+            template()
+                .lines()
+                .all(|l| l.is_empty() || l.starts_with('#')),
+            "no live setting in the template"
+        );
+        // no setting of any table is missing from it
+        let doc: toml::Table = toml::from_str(&uncommented()).unwrap();
+        let keys = |t: &str| -> Vec<String> {
+            toml::Table::try_from(
+                match t {
+                    "api" => toml::Value::try_from(ApiCfg::default()),
+                    "ui" => toml::Value::try_from(UiCfg::default()),
+                    "cache" => toml::Value::try_from(CacheCfg::default()),
+                    _ => toml::Value::try_from(PanelsCfg::default()),
+                }
+                .unwrap(),
+            )
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
+        };
+        for table in ["api", "ui", "cache", "panels"] {
+            for k in keys(table) {
+                // panels.prs / issues / actions / repo have no default value to list: they are notes
+                if table == "panels" && ["prs", "issues", "actions", "repo"].contains(&k.as_str()) {
+                    continue;
+                }
+                assert!(
+                    doc.get(table).and_then(|t| t.get(&k)).is_some(),
+                    "[{table}] {k} is missing from src/config.default.toml"
+                );
+            }
+        }
+        for k in ["ascii", "nerd", "sync_viewed"] {
+            assert!(doc.contains_key(k), "{k} is missing from the template");
+        }
+        // every remappable action and the unusual panel names are mentioned
+        for a in Act::ALL {
+            assert!(
+                template().contains(a.name()),
+                "action {} is not listed",
+                a.name()
+            );
+        }
+    }
+
+    #[test]
+    fn load_checked_reports_one_message_that_names_the_file() {
+        let dir = tmp_dir("checked");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        assert!(load_checked(&path).is_ok(), "no file: the defaults");
+        std::fs::write(&path, "ascii = true\n[keys]\nquit = \"Q\"\n").unwrap();
+        let (c, k) = load_checked(&path).unwrap();
+        assert!(c.ascii && k.labels(Act::Quit) == "Q");
+        // a typo names the file and the line
+        std::fs::write(&path, "ascii = true\nnerdd = true\n").unwrap();
+        let e = load_checked(&path).err().unwrap();
+        assert!(e.contains("config.toml:2") && e.contains("nerdd"), "{e}");
+        // a key that cannot be bound is an error naming the file too
+        std::fs::write(&path, "[keys]\nquit = \"j\"\n").unwrap();
+        let e = load_checked(&path).err().unwrap();
+        assert!(e.contains("config.toml"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("gh-tui-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    fn repos(fav: &[&str], hid: &[&str]) -> ReposCfg {
+        let v = |l: &[&str]| l.iter().map(|s| s.to_string()).collect();
+        ReposCfg {
+            favorites: v(fav),
+            hidden: v(hid),
+        }
+    }
+
+    #[test]
+    fn saving_repos_creates_the_file_atomically_and_never_clobbers() {
+        let dir = tmp_dir("save-new");
         let path = dir.join("nested").join("config.toml");
         assert_eq!(
             load_from(&path).unwrap(),
             Config::default(),
             "missing file = defaults"
         );
-        let mut c = Config {
-            theme: Some("dark".into()),
-            nerd: true,
-            ..Default::default()
-        };
-        c.repos.toggle_fav("o/a");
-        c.repos.toggle_hidden("o/b");
-        c.keys
-            .insert("quit".into(), Keys::Many(vec!["q".into(), "ctrl-q".into()]));
-        save_to(&path, &c).unwrap();
+        let mut r = ReposCfg::default();
+        assert!(r.toggle_fav("o/a") && r.toggle_hidden("o/b"));
+        save_repos(&path, &r).unwrap();
         assert!(
             !path.with_extension("toml.tmp").exists(),
             "temp file renamed away"
         );
-        assert_eq!(load_from(&path).unwrap(), c);
-        assert!(
-            !c.repos.clone().toggle_fav("o/a"),
-            "toggle removes when present"
-        );
+        assert_eq!(load_from(&path).unwrap().repos, r);
+        assert!(!r.clone().toggle_fav("o/a"), "toggle removes when present");
+        // nothing to write, nothing created
+        let none = dir.join("none.toml");
+        save_repos(&none, &ReposCfg::default()).unwrap();
+        assert_eq!(std::fs::read_to_string(&none).unwrap(), "");
+        // a file that no longer parses is left exactly as it is
         std::fs::write(&path, "ascii = [oops\n").unwrap();
-        assert!(save_to(&path, &c).unwrap_err().contains("not saving"));
+        assert!(save_repos(&path, &r).unwrap_err().contains("not saving"));
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "ascii = [oops\n",
             "invalid file left untouched"
         );
+        // so is one that parses but does not load (an unknown key)
+        std::fs::write(&path, "bogus = 1\n").unwrap();
+        assert!(save_repos(&path, &r).unwrap_err().contains("not saving"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "bogus = 1\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_repos_keeps_every_comment_and_every_other_setting_as_written() {
+        let dir = tmp_dir("save-comments");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let src = "\
+# my gh-tui config
+theme = \"light\"   # easier on my eyes
+
+[keys]
+quit = [\"q\", \"ctrl-q\"]  # both
+
+[repos]
+# the ones I look at daily
+favorites = [
+    \"o/a\",   # work
+    \"o/b\",
+]
+hidden = [\"o/noisy\"]
+
+[api]
+max_concurrent = 2   # be gentle
+";
+        std::fs::write(&path, src).unwrap();
+        // favoriting one more and un-hiding the noisy one
+        save_repos(&path, &repos(&["o/a", "o/b", "o/c"], &[])).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        for kept in [
+            "# my gh-tui config",
+            "theme = \"light\"   # easier on my eyes",
+            "quit = [\"q\", \"ctrl-q\"]  # both",
+            "# the ones I look at daily",
+            "\"o/a\",   # work",
+            "max_concurrent = 2   # be gentle",
+        ] {
+            assert!(out.contains(kept), "lost {kept:?}:\n{out}");
+        }
+        assert!(out.contains("\"o/c\""), "{out}");
+        assert!(
+            !out.contains("noisy") && !out.contains("hidden"),
+            "an emptied list goes: {out}"
+        );
+        assert_eq!(
+            load_from(&path).unwrap().repos,
+            repos(&["o/a", "o/b", "o/c"], &[])
+        );
+        // removing an entry drops its line, the rest stays
+        save_repos(&path, &repos(&["o/b", "o/c"], &[])).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !out.contains("o/a") && out.contains("# my gh-tui config"),
+            "{out}"
+        );
+        assert_eq!(load_from(&path).unwrap().repos, repos(&["o/b", "o/c"], &[]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_repos_handles_missing_tables_inline_tables_and_empty_results() {
+        let dir = tmp_dir("save-shapes");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        // no [repos] yet: added at the end, the rest untouched
+        std::fs::write(&path, "# hi\nascii = true\n").unwrap();
+        save_repos(&path, &repos(&["o/a"], &[])).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            out.starts_with("# hi\nascii = true\n") && out.contains("[repos]"),
+            "{out}"
+        );
+        // an inline table
+        std::fs::write(&path, "repos = { favorites = [\"o/a\"] }\n").unwrap();
+        save_repos(&path, &repos(&["o/a", "o/z"], &["o/h"])).unwrap();
+        assert_eq!(
+            load_from(&path).unwrap().repos,
+            repos(&["o/a", "o/z"], &["o/h"])
+        );
+        // an emptied [repos] with no comment of its own disappears; one with a comment stays
+        std::fs::write(&path, "ascii = true\n[repos]\nfavorites = [\"o/a\"]\n").unwrap();
+        save_repos(&path, &ReposCfg::default()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ascii = true\n");
+        std::fs::write(&path, "# mine\n[repos]\nfavorites = [\"o/a\"]\n").unwrap();
+        save_repos(&path, &ReposCfg::default()).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("# mine"));
+        // case-insensitive, like the toggles
+        std::fs::write(&path, "[repos]\nfavorites = [\"O/A\"]\n").unwrap();
+        save_repos(&path, &repos(&["o/a"], &[])).unwrap();
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("\"O/A\""),
+            "kept as written"
+        );
+        save_repos(&path, &repos(&[], &[])).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("O/A"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1455,7 +1741,7 @@ mod tests {
         assert_eq!(tabs, [4, 0, 3, 2, 3]);
         assert!(!c.panels.hide_empty);
         // the inbox key is part of the closed key set
-        assert_eq!(Act::ALL.len(), 19);
+        assert_eq!(Act::ALL.len(), 20);
         assert_eq!(
             Keymap::build(&BTreeMap::new()).unwrap().label(Act::Inbox),
             "N"
@@ -1543,29 +1829,6 @@ mod tests {
     }
 
     #[test]
-    fn panels_round_trip_through_save() {
-        let dir = std::env::temp_dir().join(format!("gh-tui-panels-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("config.toml");
-        let mut c = parse(
-            "[panels]\nshow = [\"repo\", \"prs\"]\nhide_empty = true\n[panels.repo]\ntabs = [\"tags\"]\n",
-            "t",
-        )
-        .unwrap();
-        c.repos.toggle_fav("o/a");
-        save_to(&path, &c).unwrap();
-        assert_eq!(load_from(&path).unwrap(), c);
-        // a default layout is not written back
-        let d = Config {
-            nerd: true,
-            ..Default::default()
-        };
-        save_to(&path, &d).unwrap();
-        assert!(!std::fs::read_to_string(&path).unwrap().contains("panels"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn api_section_has_gentle_defaults_and_validates_ranges() {
         let c = parse("", "t").unwrap();
         assert_eq!(c.api, ApiCfg::default());
@@ -1615,15 +1878,6 @@ mod tests {
                 "{src:?}: {e}"
             );
         }
-        // a non-default section survives the app's own saves; the default one is not written
-        let dir = std::env::temp_dir().join(format!("gh-tui-api-{}", std::process::id()));
-        let path = dir.join("config.toml");
-        let c = parse("[api]\nmax_concurrent = 2\n", "t").unwrap();
-        save_to(&path, &c).unwrap();
-        assert_eq!(load_from(&path).unwrap(), c);
-        save_to(&path, &Config::default()).unwrap();
-        assert!(!std::fs::read_to_string(&path).unwrap().contains("api"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1649,15 +1903,6 @@ mod tests {
         );
         let e = parse("[ui]\nstat = \"auto\"\n", "cfg").unwrap_err();
         assert!(e.starts_with("cfg:2:") && e.contains("stat"), "{e}");
-        // a non-default value survives the app's own saves; the default is not written
-        let dir = std::env::temp_dir().join(format!("gh-tui-ui-{}", std::process::id()));
-        let path = dir.join("config.toml");
-        let c = parse("[ui]\nstart = \"global\"\n", "t").unwrap();
-        save_to(&path, &c).unwrap();
-        assert_eq!(load_from(&path).unwrap(), c);
-        save_to(&path, &Config::default()).unwrap();
-        assert!(!std::fs::read_to_string(&path).unwrap().contains("[ui]"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
